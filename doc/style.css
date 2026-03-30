@@ -1,0 +1,73 @@
+body {
+  max-width: 54em;
+  margin: 2em auto;
+  padding: 0 1em;
+  font-family: "SFMono-Regular", "Consolas", "Liberation Mono", "Menlo", monospace;
+  font-size: 14px;
+  line-height: 1.5;
+  color: #222;
+  background: #fff;
+}
+
+h1 {
+  font-size: 1.2em;
+  text-transform: uppercase;
+  border-bottom: none;
+  margin-top: 1.8em;
+  margin-bottom: 0.3em;
+}
+
+h1:first-of-type {
+  margin-top: 0;
+}
+
+/* pandoc title block */
+header .title {
+  text-align: center;
+  font-size: 1.2em;
+  text-transform: uppercase;
+  margin-bottom: 2em;
+}
+
+p { margin: 0.5em 0; }
+
+/* definition lists (command descriptions) */
+dl { margin: 0.5em 0; }
+dt { font-weight: normal; margin-top: 0.5em; }
+dd { margin-left: 2em; margin-bottom: 0.5em; }
+
+code {
+  font-family: inherit;
+  font-size: 100%;
+}
+
+pre {
+  margin: 0.5em 0;
+  padding: 0 2em;
+  overflow-x: auto;
+}
+
+pre code {
+  font-size: 100%;
+}
+
+table {
+  border-collapse: collapse;
+  margin: 0.5em 0;
+}
+
+th, td {
+  border: none;
+  padding: 0.15em 1em 0.15em 0;
+  text-align: left;
+}
+
+a { color: #0366d6; text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.footer {
+  margin-top: 3em;
+  padding-top: 0.5em;
+  border-top: 1px solid #ccc;
+  font-size: 0.9em;
+}

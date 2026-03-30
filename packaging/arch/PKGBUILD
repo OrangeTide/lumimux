@@ -1,0 +1,33 @@
+# Maintainer: Jon Mayo <jon@example.com>
+pkgname=lumimux
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Terminal multiplexer with GNU Screen keybindings'
+arch=('x86_64' 'aarch64')
+url='https://github.com/jonesMUX/lumimux'
+license=('MIT-0')
+depends=()
+makedepends=('gcc' 'make' 'musl')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+_lumi_cmds=(attach mserver new list version kill detach new-window
+            reload send-input send-keys splash)
+
+build() {
+	cd "$pkgname-$pkgver"
+	make CC=musl-gcc LDFLAGS=-static TARGET_TRIPLET=x86_64-linux-musl RELEASE=1 lumi
+}
+
+check() {
+	cd "$pkgname-$pkgver"
+	make CC=musl-gcc LDFLAGS=-static TARGET_TRIPLET=x86_64-linux-musl run-tests
+}
+
+package() {
+	cd "$pkgname-$pkgver"
+	install -Dm 755 _out/x86_64-linux-musl/bin/lumi "$pkgdir/usr/bin/lumi"
+	for cmd in "${_lumi_cmds[@]}"; do
+		ln -sf lumi "$pkgdir/usr/bin/lumi-$cmd"
+	done
+}

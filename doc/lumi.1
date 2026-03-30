@@ -1,0 +1,224 @@
+.\" lumi.1 : manual page for lumiMUX
+.\" Copyright (c) 2026 Jon Mayo
+.\" Licensed under MIT-0 OR PUBLIC DOMAIN
+.TH LUMI 1 "2026-04-13" "lumiMUX" "User Commands"
+.SH NAME
+lumi \- terminal multiplexer
+.SH SYNOPSIS
+.B lumi
+.I command
+.RI [ options ]
+.RI [ args ]
+.SH DESCRIPTION
+.B lumi
+is a terminal multiplexer with a git-style sub-command architecture.
+Each sub-command can also be invoked directly as
+.BI lumi- command
+(e.g.\&
+.BR lumi-new ).
+.PP
+If no command is given,
+.B lumi
+prints usage information and exits.
+.SH COMMON OPTIONS
+The following options are accepted by most sub-commands:
+.TP
+.BI \-s " name"
+Session name.
+Defaults to
+.B 0
+if not specified.
+.TP
+.BI \-m " mode"
+UI mode:
+.BR screen " (default),"
+.BR turbo ,
+.BR minimal .
+Accepted by
+.B new
+and
+.BR attach .
+.SH COMMANDS
+.SS lumi new
+Create a new session and attach to it.
+.PP
+.B lumi new
+.RB [ \-A ]
+.RB [ \-d ]
+.RB [ "\-m mode" ]
+.RB [ "\-s name" ]
+.RI [ shell ]
+.TP
+.B \-A
+If the session already exists, reattach to it instead of failing.
+.TP
+.B \-d
+Detach mode.
+Create the session and start the server but do not attach.
+.TP
+.BI \-m " mode"
+UI mode passed to
+.BR lumi-attach .
+.TP
+.BI \-s " name"
+Session name (default:
+.BR 0 ).
+.TP
+.I shell
+Shell command to run inside the new session.
+Uses the user's login shell if omitted.
+.SS lumi attach
+Attach to an existing session.
+.PP
+.B lumi attach
+.RB [ "\-m mode" ]
+.RB [ "\-s name" ]
+.RI [ name ]
+.TP
+.BI \-m " mode"
+UI mode:
+.BR screen " (default),"
+.BR turbo ,
+.BR minimal .
+.TP
+.BI \-s " name"
+Session name (default:
+.BR 0 ).
+A positional argument may also be used.
+.SS lumi detach
+Detach a client from its session.
+.PP
+.B lumi detach
+.RB [ "\-s name" ]
+.TP
+.BI \-s " name"
+Session name (default:
+.BR 0 ).
+.SS lumi kill
+Terminate a session.
+.PP
+.B lumi kill
+.RB [ "\-s name" ]
+.TP
+.BI \-s " name"
+Session name (default:
+.BR 0 ).
+.SS lumi list
+List active sessions.
+.PP
+.B lumi list
+.PP
+Takes no options.
+.SS lumi new\-window
+Create a new window in an existing session.
+.PP
+.B lumi new\-window
+.RB [ "\-s name" ]
+.RI [ shell ]
+.TP
+.BI \-s " name"
+Session name (default:
+.BR 0 ).
+.TP
+.I shell
+Shell command to run in the new window.
+.SS lumi attr
+Get, set, delete, or list per-session attributes.
+.PP
+.B lumi attr
+.RB [ "\-s name" ]
+.B get
+.I key
+.br
+.B lumi attr
+.RB [ "\-s name" ]
+.B set
+.I key value
+.br
+.B lumi attr
+.RB [ "\-s name" ]
+.B delete
+.I key
+.br
+.B lumi attr
+.RB [ "\-s name" ]
+.B list
+.TP
+.BI \-s " name"
+Session name.
+Defaults to the
+.B LUMI_SESSION
+environment variable, or
+.B 0
+if unset.
+.SS lumi splash
+Display an ANSI art splash screen.
+.PP
+.B lumi splash
+.RI [ scene ]
+.RI [ name ]
+.TP
+.I scene
+One of
+.BR space ,
+.BR mountain ,
+or
+.BR beach .
+Chosen at random if omitted.
+.TP
+.I name
+Text displayed on the splash screen (default:
+.BR lumiMUX ).
+.SS lumi version
+Print version information.
+.PP
+.B lumi version
+.PP
+Takes no options.
+.SS lumi reload
+Reload server configuration.
+.PP
+.B lumi reload
+.PP
+Not yet implemented.
+.SS lumi send\-keys
+Send keystrokes to a session.
+.PP
+.B lumi send\-keys
+.PP
+Not yet implemented.
+.SS lumi send\-input
+Send raw input to a pane.
+.PP
+.B lumi send\-input
+.PP
+Not yet implemented.
+.SH INTERNAL COMMANDS
+.SS lumi\-mserver
+Single-PTY micro-server process.
+Started automatically by
+.BR "lumi new" " and " "lumi new\-window" ;
+not intended for direct use.
+.PP
+.B lumi\-mserver
+.B \-s
+.I name
+.RI [ shell ]
+.TP
+.BI \-s " name"
+Session name (required).
+.TP
+.I shell
+Shell command to run.
+.SH ENVIRONMENT
+.TP
+.B LUMI_SESSION
+Set inside an attached session to the current session name.
+Prevents recursive attach.
+Used by
+.B lumi attr
+as the default session name when
+.B \-s
+is not given.
+.SH AUTHORS
+Jon Mayo

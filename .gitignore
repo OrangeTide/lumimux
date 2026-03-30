@@ -1,0 +1,7 @@
+/_out
+/_build
+/_site
+/src/libutf8/.unicode-cache
+*.deb
+*.rpm
+/compile_commands.json

@@ -1,0 +1,47 @@
+# lumi.idl -- IPC message definitions for lumimux
+#
+# Structured payloads for the lumi IPC protocol.
+# Raw byte streams (INPUT, OUTPUT) and empty messages
+# (DETACH, KILL, WIN_NEW, OK) are not defined here.
+
+message IpcSize
+    uint16 rows = 1
+    uint16 cols = 2
+end
+
+message IpcWinId
+    uint32 id = 1
+end
+
+message IpcWinEntry
+    uint32 id = 1
+    uint8 flags = 2
+    string title = 3
+end
+
+message IpcWinResize
+    uint32 id = 1
+    uint16 rows = 2
+    uint16 cols = 3
+end
+
+# attribute store messages
+
+message IpcAttrTxnOk
+    uint32 txn_id = 1
+end
+
+message IpcAttrKv
+    uint32 txn_id = 1
+    string key = 2
+    string value = 3
+end
+
+message IpcAttrKey
+    uint32 txn_id = 1
+    string key = 2
+end
+
+message IpcAttrEntries
+    string entries = 1
+end

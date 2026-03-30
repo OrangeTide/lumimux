@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            march: x86-64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Determine version
+        id: version
+        run: echo "tag=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build static binary
+        run: >
+          make CC=musl-gcc LDFLAGS=-static
+          TARGET_TRIPLET=x86_64-linux-musl
+          RELEASE=1 RELEASE_MARCH=${{ matrix.march }}
+          -j$(nproc) lumi
+
+      - name: Run tests
+        run: >
+          make CC=musl-gcc LDFLAGS=-static
+          TARGET_TRIPLET=x86_64-linux-musl run-tests
+
+      - name: Strip binary
+        run: strip _out/x86_64-linux-musl/bin/lumi
+
+      - name: Verify static linkage
+        run: |
+          file _out/x86_64-linux-musl/bin/lumi | grep -q "statically linked"
+          _out/x86_64-linux-musl/bin/lumi version
+
+      - name: Package tarball
+        id: package
+        run: |
+          VER="${{ steps.version.outputs.tag }}"
+          PREFIX="lumi-${VER}-linux-${{ matrix.arch }}"
+          STAGE="${{ runner.temp }}/${PREFIX}"
+          mkdir -p "${STAGE}/bin"
+          cp _out/x86_64-linux-musl/bin/lumi "${STAGE}/bin/"
+          for cmd in attach mserver new list version kill detach \
+                     new-window reload send-input send-keys splash; do
+            ln -sf lumi "${STAGE}/bin/lumi-${cmd}"
+          done
+          tar -C "${{ runner.temp }}" -czf "${PREFIX}.tar.gz" "${PREFIX}"
+          echo "tarball=${PREFIX}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Build .deb
+        id: deb
+        run: |
+          sh packaging/debian/build-deb.sh
+          echo "deb=$(ls lumimux_*.deb)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload bare binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumi-linux-${{ matrix.arch }}
+          path: _out/x86_64-linux-musl/bin/lumi
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarball-linux-${{ matrix.arch }}
+          path: ${{ steps.package.outputs.tarball }}
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-linux-${{ matrix.arch }}
+          path: ${{ steps.deb.outputs.deb }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Rename bare binary
+        run: mv lumi lumi-linux-x86_64
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            lumi-linux-x86_64
+            *.tar.gz
+            *.deb
+          generate_release_notes: true

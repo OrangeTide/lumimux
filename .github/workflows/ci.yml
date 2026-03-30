@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'doc/**'
+      - '*.md'
+      - 'LICENSE*'
+  pull_request:
+    paths-ignore:
+      - 'doc/**'
+      - '*.md'
+      - 'LICENSE*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: make -j$(nproc)
+
+      - name: Unit tests
+        run: make run-tests
+
+      - name: Smoke tests
+        run: tests/smoke.sh
+
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (release)
+        run: make -j$(nproc) RELEASE=1
+
+      - name: Unit tests (release)
+        run: make run-tests RELEASE=1
+
+      - name: Smoke tests (release)
+        run: tests/smoke.sh
+
+  build-static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build (musl static)
+        run: >
+          make CC=musl-gcc LDFLAGS=-static
+          TARGET_TRIPLET=x86_64-linux-musl -j$(nproc) lumi
+
+      - name: Verify static linkage
+        run: |
+          file _out/x86_64-linux-musl/bin/lumi | grep -q "statically linked"
+          _out/x86_64-linux-musl/bin/lumi version
+
+      - name: Unit tests (musl static)
+        run: >
+          make CC=musl-gcc LDFLAGS=-static
+          TARGET_TRIPLET=x86_64-linux-musl run-tests
+
+  gate:
+    if: always()
+    needs: [build, build-release, build-static]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check results
+        run: |
+          if [ "${{ needs.build.result }}" != "success" ] || \
+             [ "${{ needs.build-release.result }}" != "success" ] || \
+             [ "${{ needs.build-static.result }}" != "success" ]; then
+            echo "Required jobs failed"
+            exit 1
+          fi

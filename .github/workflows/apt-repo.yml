@@ -1,0 +1,85 @@
+name: APT Repository
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: apt-repo
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y dpkg-dev gpg pandoc
+
+      - name: Import signing key
+        run: echo "${{ secrets.APT_SIGNING_KEY }}" | gpg --batch --import
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+
+      - name: Download all .deb assets from releases
+        run: |
+          mkdir -p _apt/pool/main
+          gh release list --limit 10 --json tagName -q '.[].tagName' | while read -r tag; do
+            gh release download "$tag" --pattern '*.deb' --dir _apt/pool/main/ || true
+          done
+          ls -la _apt/pool/main/
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Generate Packages index
+        run: |
+          mkdir -p _apt/dists/stable/main/binary-amd64
+          cd _apt
+          dpkg-scanpackages --multiversion pool/ > dists/stable/main/binary-amd64/Packages
+          gzip -k dists/stable/main/binary-amd64/Packages
+
+      - name: Generate Release file
+        run: |
+          cd _apt/dists/stable
+          cat > Release <<RELEASE
+          Origin: lumimux
+          Label: lumimux
+          Suite: stable
+          Codename: stable
+          Architectures: amd64
+          Components: main
+          Description: lumiMUX APT repository
+          RELEASE
+          # Add checksums
+          apt-ftparchive release . >> Release
+
+      - name: Sign Release
+        run: |
+          cd _apt/dists/stable
+          gpg --batch --yes --armor --detach-sign --output Release.gpg Release
+          gpg --batch --yes --armor --clearsign --output InRelease Release
+
+      - name: Export public key
+        run: gpg --armor --export > _apt/pubkey.asc
+
+      - name: Build docs site
+        run: |
+          ci/build-pages.sh
+          cp -r _apt _site/apt
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+      - uses: actions/deploy-pages@v4
+        id: deployment
