@@ -3,6 +3,7 @@
  * Licensed under MIT-0 OR PUBLIC DOMAIN */
 
 #include "render.h"
+#include "tio_write.h"
 #include "vt_state.h"
 #include "vt_buf.h"
 #include "vt_cell.h"
@@ -352,9 +353,6 @@ test_render_cells_full(void)
 
 	ASSERT(len > 0, "no output");
 	ASSERT(strstr(buf, "AB") != NULL, "output missing 'AB'");
-	/* cursor should be at 0,2 (1-based: 1,3) => ESC[1;3H */
-	ASSERT(strstr(buf, "\033[1;3H") != NULL,
-	    "missing cursor position");
 
 	render_free(r);
 	PASS();
@@ -402,6 +400,38 @@ test_render_cells_diff(void)
 	PASS();
 }
 
+static void
+test_render_move_cursor(void)
+{
+	struct render *r;
+	struct capture cap;
+	char buf[8192];
+	size_t len;
+
+	TEST("render_move_cursor emits CUP");
+	r = render_new(24, 80, NULL);
+	ASSERT(r != NULL, "render new failed");
+
+	capture_open(&cap);
+	render_move_cursor(r, cap.wfd, 3, 7);
+	tio_flush(cap.wfd);
+	len = capture_read(&cap, buf, sizeof(buf));
+
+	ASSERT(len > 0, "no output");
+	ASSERT(strstr(buf, "\033[4;8H") != NULL,
+	    "missing CUP ESC[4;8H");
+
+	/* calling again with same position should emit nothing */
+	capture_open(&cap);
+	render_move_cursor(r, cap.wfd, 3, 7);
+	tio_flush(cap.wfd);
+	len = capture_read(&cap, buf, sizeof(buf));
+	ASSERT(len == 0, "duplicate CUP emitted");
+
+	render_free(r);
+	PASS();
+}
+
 /* ---- main ---- */
 
 int
@@ -421,6 +451,7 @@ main(void)
 	test_render_resize();
 	test_render_cells_full();
 	test_render_cells_diff();
+	test_render_move_cursor();
 
 	printf("\n%d tests, %d failures\n", test_count, fail_count);
 	return fail_count ? 1 : 0;

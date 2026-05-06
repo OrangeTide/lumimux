@@ -176,11 +176,11 @@ overlay_erase_all(void)
 void
 render_status_line(int fd, int rows, int cols)
 {
-	static char last_content[256];
+	static char last_content[1024];
 	static int last_row;
 	static int last_cols;
-	char buf[512];
-	char content[256];
+	char buf[1536];
+	char content[1024];
 	int pos = 0;
 	int row;
 	int slen, max;
@@ -217,22 +217,41 @@ render_status_line(int fd, int rows, int cols)
 		pos += cuplen;
 	}
 
-	s = txl_str(txl, TXL_REV);
-	if (s) {
-		slen = (int)strlen(s);
-		memcpy(buf + pos, s, (size_t)slen);
-		pos += slen;
+	{
+		char bg[24];
+		int bglen = txl_setab(txl, bg, sizeof(bg), 0);
+
+		if (bglen > 0 && pos + bglen < (int)sizeof(buf)) {
+			memcpy(buf + pos, bg, (size_t)bglen);
+			pos += bglen;
+		}
 	}
 
 	slen = (int)strlen(content);
-	if (pos + slen < (int)sizeof(buf) - 32) {
+	if (pos + slen < (int)sizeof(buf) - 64) {
 		memcpy(buf + pos, content, (size_t)slen);
 		pos += slen;
 	}
 
-	/* erase to end of line (CSI K) -- clears with current attributes,
-	 * so reverse-video spaces fill the rest of the status line without
-	 * needing to emit individual space characters */
+	s = txl_str(txl, TXL_SGR0);
+	if (s) {
+		slen = (int)strlen(s);
+		if (pos + slen < (int)sizeof(buf)) {
+			memcpy(buf + pos, s, (size_t)slen);
+			pos += slen;
+		}
+	}
+
+	{
+		char bg[24];
+		int bglen = txl_setab(txl, bg, sizeof(bg), 0);
+
+		if (bglen > 0 && pos + bglen < (int)sizeof(buf)) {
+			memcpy(buf + pos, bg, (size_t)bglen);
+			pos += bglen;
+		}
+	}
+
 	if (pos + 3 < (int)sizeof(buf)) {
 		buf[pos++] = '\033';
 		buf[pos++] = '[';

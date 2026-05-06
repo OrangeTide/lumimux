@@ -5,6 +5,8 @@
 #include "status.h"
 #include "status_int.h"
 #include "cfg.h"
+#include "utf8.h"
+#include "rune_width.h"
 #include "xmalloc.h"
 
 #include <ctype.h>
@@ -13,7 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define DEFAULT_FORMAT " ${window}:${title} ${window-list}"
+#define DEFAULT_FORMAT "${window-list}"
 #define ARENA_INIT 256
 #define ARENA_MIN 256
 #define FILL_SENTINEL '\x01'
@@ -639,6 +641,90 @@ expand(struct status *s, const char *fmt, int depth)
 	return result;
 }
 
+/* ---- display-width helpers ---- */
+
+static int
+ansi_display_width(const char *s, int len)
+{
+	int i = 0, w = 0;
+
+	while (i < len) {
+		if (s[i] == '\033') {
+			i++;
+			if (i < len && s[i] == '[') {
+				i++;
+				while (i < len &&
+				    (unsigned char)s[i] < 0x40)
+					i++;
+				if (i < len)
+					i++;
+			}
+		} else if ((unsigned char)s[i] >= 0x80) {
+			uint32_t rune;
+			int clen;
+
+			clen = utf8_decode(&rune,
+			    (const unsigned char *)s + i,
+			    (size_t)(len - i));
+			w += rune_width(rune);
+			i += clen;
+		} else {
+			if (s[i] >= 0x20)
+				w++;
+			i++;
+		}
+	}
+	return w;
+}
+
+static int
+ansi_copy(char *dst, int dstsz, const char *src, int srclen,
+    int *dcols, int max_cols)
+{
+	int si = 0, di = 0;
+
+	while (si < srclen && di + 1 < dstsz) {
+		if (src[si] == '\033') {
+			if (di + 1 >= dstsz)
+				break;
+			dst[di++] = src[si++];
+			if (si < srclen && di + 1 < dstsz &&
+			    src[si] == '[') {
+				dst[di++] = src[si++];
+				while (si < srclen && di + 1 < dstsz &&
+				    (unsigned char)src[si] < 0x40)
+					dst[di++] = src[si++];
+				if (si < srclen && di + 1 < dstsz &&
+				    (unsigned char)src[si] >= 0x40 &&
+				    (unsigned char)src[si] <= 0x7E)
+					dst[di++] = src[si++];
+			}
+		} else if ((unsigned char)src[si] >= 0x80) {
+			uint32_t rune;
+			int clen, rw, j;
+
+			clen = utf8_decode(&rune,
+			    (const unsigned char *)src + si,
+			    (size_t)(srclen - si));
+			rw = rune_width(rune);
+			if (*dcols + rw > max_cols)
+				break;
+			for (j = 0; j < clen && di + 1 < dstsz; j++)
+				dst[di++] = src[si + j];
+			si += clen;
+			*dcols += rw;
+		} else {
+			if (src[si] >= 0x20) {
+				if (*dcols + 1 > max_cols)
+					break;
+				(*dcols)++;
+			}
+			dst[di++] = src[si++];
+		}
+	}
+	return di;
+}
+
 /* ---- public expand ---- */
 
 int
@@ -646,7 +732,7 @@ status_expand(struct status *s, char *buf, size_t bufsz, int cols)
 {
 	char *raw;
 	char *fill_pos;
-	int pos, i;
+	int pos, dcols, i;
 
 	if (!s || !buf || bufsz == 0 || cols <= 0) {
 		if (buf && bufsz > 0)
@@ -661,37 +747,40 @@ status_expand(struct status *s, char *buf, size_t bufsz, int cols)
 	raw = expand(s, s->format, 0);
 
 	pos = 0;
+	dcols = 0;
 	fill_pos = strchr(raw, FILL_SENTINEL);
 
 	if (fill_pos) {
-		int left_len, right_len, pad;
+		int left_bytes, right_bytes;
+		int left_dcols, right_dcols, pad;
 		const char *right;
 
-		left_len = (int)(fill_pos - raw);
+		left_bytes = (int)(fill_pos - raw);
 		right = fill_pos + 1;
-		right_len = (int)strlen(right);
-		pad = cols - left_len - right_len;
+		right_bytes = (int)strlen(right);
+		left_dcols = ansi_display_width(raw, left_bytes);
+		right_dcols = ansi_display_width(right, right_bytes);
+		pad = cols - left_dcols - right_dcols;
 		if (pad < 0)
 			pad = 0;
 
 		/* left part */
-		for (i = 0; i < left_len && pos < cols &&
-		    pos + 1 < (int)bufsz; i++)
-			buf[pos++] = raw[i];
+		pos += ansi_copy(buf + pos, (int)bufsz - pos,
+		    raw, left_bytes, &dcols, cols);
 		/* fill */
-		for (i = 0; i < pad && pos < cols &&
-		    pos + 1 < (int)bufsz; i++)
+		for (i = 0; i < pad && dcols < cols &&
+		    pos + 1 < (int)bufsz; i++) {
 			buf[pos++] = ' ';
+			dcols++;
+		}
 		/* right part */
-		for (i = 0; i < right_len && pos < cols &&
-		    pos + 1 < (int)bufsz; i++)
-			buf[pos++] = right[i];
+		pos += ansi_copy(buf + pos, (int)bufsz - pos,
+		    right, right_bytes, &dcols, cols);
 	} else {
 		int len = (int)strlen(raw);
 
-		for (i = 0; i < len && pos < cols &&
-		    pos + 1 < (int)bufsz; i++)
-			buf[pos++] = raw[i];
+		pos += ansi_copy(buf + pos, (int)bufsz - pos,
+		    raw, len, &dcols, cols);
 	}
 
 	buf[pos] = '\0';

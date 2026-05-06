@@ -4,6 +4,7 @@
 
 #include "daemonize.h"
 
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -11,9 +12,8 @@
 int
 daemonize(void)
 {
-	pid_t pid, sid;
+	pid_t pid;
 
-	/* refuse to run as setuid -- safety check */
 	if (getuid() != geteuid()) {
 		fprintf(stderr, "refusing to daemonize as setuid\n");
 		return -1;
@@ -25,15 +25,24 @@ daemonize(void)
 	if (pid > 0)
 		_exit(0);	/* parent exits */
 
-	sid = setsid();
-	if (sid < 0)
+	if (setsid() < 0)
 		return -1;
 
-	/* redirect stdio to /dev/null */
-	if (!freopen("/dev/null", "r", stdin) ||
-	    !freopen("/dev/null", "w", stdout) ||
-	    !freopen("/dev/null", "w", stderr))
+	/* not a session leader, cannot acquire a controlling terminal */
+	pid = fork();
+	if (pid < 0)
 		return -1;
+	if (pid > 0)
+		_exit(0);	/* first child exits */
+
+	int fd = open("/dev/null", O_RDWR);
+	if (fd < 0)
+		return -1;
+	dup2(fd, STDIN_FILENO);
+	dup2(fd, STDOUT_FILENO);
+	dup2(fd, STDERR_FILENO);
+	if (fd > STDERR_FILENO)
+		close(fd);
 
 	/* ignore job control signals */
 	signal(SIGTSTP, SIG_IGN);

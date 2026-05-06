@@ -588,8 +588,8 @@ test_default_format(void)
 	status_set(s, "window-list", "0*bash");
 
 	status_expand(s, buf, sizeof(buf), 30);
-	/* default " ${window}:${title} ${window-list}" -> " 0:bash 0*bash" */
-	ASSERT(memcmp(buf, " 0:bash 0*bash", 14) == 0,
+	/* default "${window-list}" -> "0*bash" */
+	ASSERT(memcmp(buf, "0*bash", 6) == 0,
 	    "default format expands");
 
 	status_free(s);

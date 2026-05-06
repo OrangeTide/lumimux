@@ -94,4 +94,9 @@ int txl_has_rgb(const struct txl *t);
 /* Return the number of colors the terminal supports. */
 int txl_colors(const struct txl *t);
 
+/* Return non-zero if the terminal supports BCE (background color erase).
+ * When BCE is supported, erase operations (ED, EL) fill with the
+ * current background color rather than the default. */
+int txl_has_bce(const struct txl *t);
+
 #endif /* TXL_H */

@@ -33,4 +33,8 @@ int render_cells_diff(struct render *r, int fd, const struct vt_cell *cells,
     int rows, int cols, int cursor_row, int cursor_col, int cursor_vis,
     const uint8_t *row_dirty);
 
+/* Move the terminal cursor to (row, col) if not already there.
+ * Does not flush -- caller is responsible for flushing when ready. */
+void render_move_cursor(struct render *r, int fd, int row, int col);
+
 #endif /* RENDER_H */

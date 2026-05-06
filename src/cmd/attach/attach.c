@@ -767,7 +767,6 @@ turbo_render(void)
 		    wm_screen(wmgr), wm_rows(wmgr), wm_cols(wmgr),
 		    crow, ccol, cvis, wm_row_dirty(wmgr));
 	}
-	set_cursor_vis(cvis);
 }
 
 /* callback for overlay_pop in turbo mode -- recomposite the full
@@ -776,8 +775,14 @@ turbo_render(void)
 static void
 turbo_repaint(void)
 {
+	int crow, ccol, cvis;
+
 	turbo_need_full = 1;
 	turbo_render();
+	turbo_cursor(&crow, &ccol, &cvis);
+	render_move_cursor(renderer, STDOUT_FILENO, crow, ccol);
+	set_cursor_vis(cvis);
+	tio_flush(STDOUT_FILENO);
 }
 
 /* ---- tiled mode helpers ---- */
@@ -805,14 +810,19 @@ tiled_render(void)
 		    tile_cols(tilemgr), crow, ccol, cvis,
 		    tile_row_dirty(tilemgr));
 	}
-	set_cursor_vis(cvis);
 }
 
 static void
 tiled_repaint(void)
 {
+	int crow, ccol, cvis;
+
 	tile_need_full = 1;
 	tiled_render();
+	tile_cursor(tilemgr, &crow, &ccol, &cvis);
+	render_move_cursor(renderer, STDOUT_FILENO, crow, ccol);
+	set_cursor_vis(cvis);
+	tio_flush(STDOUT_FILENO);
 }
 
 /* ---- scrollback viewer ---- */
@@ -994,6 +1004,8 @@ scrollback_status(void)
 static void
 flush_render(void)
 {
+	int did_render = 0;
+
 	if (!need_render && !need_status)
 		return;
 
@@ -1004,9 +1016,8 @@ flush_render(void)
 			turbo_render();
 		else
 			tiled_render();
-		if (scrollback_mode)
-			set_cursor_vis(0);
 		need_render = 0;
+		did_render = 1;
 	}
 
 	/* sync terminal modes from focused VT */
@@ -1026,6 +1037,20 @@ flush_render(void)
 
 	if (overlay_visible)
 		overlay_render();
+
+	if (did_render) {
+		int crow = 0, ccol = 0, cvis = 0;
+
+		if (!scrollback_mode) {
+			if (client_mode == CLIENT_MODE_TURBO)
+				turbo_cursor(&crow, &ccol, &cvis);
+			else if (tilemgr)
+				tile_cursor(tilemgr, &crow, &ccol, &cvis);
+		}
+		render_move_cursor(renderer, STDOUT_FILENO, crow, ccol);
+		set_cursor_vis(scrollback_mode ? 0 : cvis);
+		tio_flush(STDOUT_FILENO);
+	}
 }
 
 /* resize callback: resize each pane's VT + tell mserver */
@@ -1104,6 +1129,35 @@ turbo_sync_size(uint32_t id)
 		    win->h, win->w);
 }
 
+/* send OSC 2 to set the host terminal's title bar */
+static void
+sync_host_title(const char *title)
+{
+	char buf[256];
+	int len;
+
+	if (title && title[0])
+		len = snprintf(buf, sizeof(buf),
+		    "\033]2;lumi - %s:%s\033\\",
+		    session_name ? session_name : "", title);
+	else
+		len = snprintf(buf, sizeof(buf),
+		    "\033]2;lumi - %s\033\\",
+		    session_name ? session_name : "");
+	if (len > 0 && len < (int)sizeof(buf)) {
+		tio_write(STDOUT_FILENO, buf, (size_t)len);
+		tio_flush(STDOUT_FILENO);
+	}
+}
+
+/* reset host terminal title (empty OSC 2 restores default) */
+static void
+reset_host_title(void)
+{
+	tio_write(STDOUT_FILENO, "\033]2;\033\\", 6);
+	tio_flush(STDOUT_FILENO);
+}
+
 /* sync the keybinds title context from the focused window's title.
  * called after focus changes so state-dependent bindings activate. */
 static void
@@ -1113,10 +1167,12 @@ sync_keybinds_title(void)
 
 	if (!watching) {
 		keys_set_title(keybinds, NULL);
+		sync_host_title(NULL);
 		return;
 	}
 	mc = mconn_find_by_pid((pid_t)watched_id);
 	keys_set_title(keybinds, mc ? mc->title : NULL);
+	sync_host_title(mc ? mc->title : NULL);
 }
 
 /* sync wm windows with cwin list: add/remove wm windows to match */
@@ -1129,7 +1185,7 @@ turbo_sync_windows(void)
 
 	/* add wm windows for cwins that don't have one */
 	for (i = 0; i < n; i++) {
-		uint32_t id = win_list_id_at(i);
+		uint32_t id = win_list_pid_at(i);
 		struct client_window *cw = cwin_find(id);
 
 		if (!cw)
@@ -1179,7 +1235,7 @@ turbo_sync_windows(void)
 		if (!win)
 			continue;
 		for (j = 0; j < n; j++) {
-			if (win_list_id_at(j) == win->id) {
+			if (win_list_pid_at(j) == win->id) {
 				found = 1;
 				break;
 			}
@@ -1190,7 +1246,7 @@ turbo_sync_windows(void)
 
 	/* update titles */
 	for (i = 0; i < n; i++) {
-		uint32_t id = win_list_id_at(i);
+		uint32_t id = win_list_pid_at(i);
 		struct wm_window *win = wm_find(wmgr, id);
 
 		if (win)
@@ -1522,7 +1578,7 @@ mconn_sync_winlist(void)
 		    (cw && cw->dead) ? " [dead]" : "",
 		    (cw && cw->scroll_lock) ? " [scroll-lock]" : "",
 		    (cw && cw->input_lock) ? " [input-lock]" : "");
-		win_list_add((uint32_t)mconns[i].pid, label,
+		win_list_add((uint32_t)i, (uint32_t)mconns[i].pid, label,
 		    watching && (uint32_t)mconns[i].pid == watched_id);
 	}
 	win_list_format_status();
@@ -1661,8 +1717,13 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 	case KEYS_ACTION_SELECT_7:
 	case KEYS_ACTION_SELECT_8:
 	case KEYS_ACTION_SELECT_9:
-		micro_select_window(
-		    (uint32_t)(action - KEYS_ACTION_SELECT_0));
+		{
+			int idx = (int)(action - KEYS_ACTION_SELECT_0);
+
+			if (idx < mconn_count)
+				micro_select_window(
+				    (uint32_t)mconns[idx].pid);
+		}
 		break;
 	case KEYS_ACTION_KILL_WINDOW:
 		{
@@ -2896,6 +2957,11 @@ remove_window(struct iox_loop *lp, uint32_t pid)
 	if (mconn_count == 0) {
 		if (client_mode == CLIENT_MODE_TURBO)
 			wm_remove(wmgr, pid);
+		else if (tilemgr)
+			tile_set_window(tilemgr, pid, 0, NULL);
+		vt = NULL;
+		need_render = 0;
+		need_status = 0;
 		iox_loop_stop(lp);
 		return;
 	}
@@ -3634,6 +3700,7 @@ cmd_attach_main(int argc, char **argv)
 	reset_terminal_modes();
 	set_cursor_vis(1);
 	disable_mouse();
+	reset_host_title();
 
 	{
 		const char *clr = txl_str(txl, TXL_CLEAR);

@@ -3,7 +3,7 @@
 lu_status_DIR := $(dir $(lastword $(MAKEFILE_LIST)))
 lu_status_SRCS = status.c status_func.c
 lu_status_CPPFLAGS = -I$(lu_cfg_DIR)
-lu_status_LIBS = lu_core
+lu_status_LIBS = lu_core lu_utf8
 lu_status_EXPORTED_CPPFLAGS = -I$(lu_status_DIR)
 LIBRARIES += lu_status
 

@@ -18,9 +18,14 @@
 
 struct win_info {
 	uint32_t id;
+	uint32_t pid;
 	int active;
 	char title[128];
 };
+
+#define ACTIVE_MARKER "\xe2\x9c\xb1"	/* U+2731 HEAVY ASTERISK ✱ */
+#define TAB_LEFT "\xe2\x96\x9f"		/* U+259F ▟ */
+#define TAB_RIGHT "\xe2\x96\x99"	/* U+2599 ▙ */
 
 static struct win_info win_list[WIN_INFO_MAX];
 static int win_count;
@@ -39,7 +44,7 @@ win_list_clear(void)
 }
 
 void
-win_list_add(uint32_t id, const char *title, int active)
+win_list_add(uint32_t id, uint32_t pid, const char *title, int active)
 {
 	struct win_info *wi;
 
@@ -47,6 +52,7 @@ win_list_add(uint32_t id, const char *title, int active)
 		return;
 	wi = &win_list[win_count++];
 	wi->id = id;
+	wi->pid = pid;
 	wi->active = active;
 	if (title) {
 		size_t len = utf8_trunc(title, sizeof(wi->title));
@@ -94,31 +100,70 @@ win_list_title_at(int index)
 	return win_list[index].title;
 }
 
+uint32_t
+win_list_pid_at(int index)
+{
+	if (index < 0 || index >= win_count)
+		return 0;
+	return win_list[index].pid;
+}
+
 void
 win_list_format_status(void)
 {
-	char buf[256];
+	char buf[1024];
 	int pos = 0;
-	int i;
+	int i, n, remain;
 
 	for (i = 0; i < win_count; i++) {
 		struct win_info *wi = &win_list[i];
-		int n;
 
-		if (pos > 0 && pos < (int)sizeof(buf) - 1)
-			buf[pos++] = ' ';
+		remain = (int)sizeof(buf) - pos;
+		if (remain <= 1)
+			break;
 
-		if (wi->title[0])
-			n = snprintf(buf + pos, sizeof(buf) - (size_t)pos,
-			    "%u%c%s", wi->id,
-			    wi->active ? '*' : ' ',
-			    wi->title);
-		else
-			n = snprintf(buf + pos, sizeof(buf) - (size_t)pos,
-			    "%u%c", wi->id,
-			    wi->active ? '*' : ' ');
+		if (pos > 0) {
+			n = snprintf(buf + pos, (size_t)remain,
+			    "\033[40m ");
+			if (n > 0 && n < remain)
+				pos += n;
+			remain = (int)sizeof(buf) - pos;
+			if (remain <= 1)
+				break;
+		}
 
-		if (n < 0 || pos + n >= (int)sizeof(buf))
+		if (wi->active) {
+			if (wi->title[0])
+				n = snprintf(buf + pos, (size_t)remain,
+				    "\033[37;40m" TAB_LEFT
+				    "\033[30;47m%u"
+				    "\033[33;47m" ACTIVE_MARKER
+				    "\033[30;47m%s"
+				    "\033[37;40m" TAB_RIGHT,
+				    wi->id, wi->title);
+			else
+				n = snprintf(buf + pos, (size_t)remain,
+				    "\033[37;40m" TAB_LEFT
+				    "\033[30;47m%u"
+				    "\033[33;47m" ACTIVE_MARKER
+				    "\033[37;40m" TAB_RIGHT,
+				    wi->id);
+		} else {
+			if (wi->title[0])
+				n = snprintf(buf + pos, (size_t)remain,
+				    "\033[90;40m" TAB_LEFT
+				    "\033[37;100m%u %s"
+				    "\033[90;40m" TAB_RIGHT,
+				    wi->id, wi->title);
+			else
+				n = snprintf(buf + pos, (size_t)remain,
+				    "\033[90;40m" TAB_LEFT
+				    "\033[37;100m%u"
+				    "\033[90;40m" TAB_RIGHT,
+				    wi->id);
+		}
+
+		if (n < 0 || n >= remain)
 			break;
 		pos += n;
 	}
@@ -247,12 +292,11 @@ picker_hide(int back_to_menu)
 static void
 picker_select(void)
 {
-	uint32_t id;
-
 	if (picker_sel >= 0 && picker_sel < picker_count) {
-		id = picker_items[picker_sel].id;
+		uint32_t pid = picker_items[picker_sel].pid;
+
 		picker_hide(0);
-		micro_select_window(id);
+		micro_select_window(pid);
 	} else {
 		picker_hide(0);
 	}

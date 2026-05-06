@@ -29,6 +29,8 @@ struct render {
 	uint16_t	cur_attrs;
 	struct vt_color	cur_fg;
 	struct vt_color	cur_bg;
+
+	int		has_bce;	/* terminal supports BCE */
 };
 
 static struct vt_cell *
@@ -344,6 +346,68 @@ cell_eq(const struct vt_cell *a, const struct vt_cell *b)
 	    color_eq(&a->bg, &b->bg);
 }
 
+static int
+emit_el(int fd)
+{
+	return emit_cstr(fd, "\033[K");
+}
+
+/*
+ * Find the start of a trailing run of space cells with uniform
+ * background color suitable for EL (erase line) optimization.
+ * Returns the starting column, or cols if no useful run exists.
+ * The run must have non-default bg and be at least 3 cells wide.
+ */
+static int
+find_trail_el(const struct vt_cell *row_cells, int cols,
+    struct vt_color *out_bg)
+{
+	int k;
+	struct vt_color bg;
+	int found = 0;
+
+	for (k = cols - 1; k >= 0; k--) {
+		const struct vt_cell *c = &row_cells[k];
+
+		if ((c->codepoint != ' ' && c->codepoint != 0) ||
+		    c->attrs != 0)
+			break;
+
+		if (!found) {
+			bg = c->bg;
+			found = 1;
+		} else if (!color_eq(&c->bg, &bg)) {
+			break;
+		}
+	}
+
+	k++;
+
+	if (!found || bg.type == VT_COLOR_DEFAULT || cols - k < 3)
+		return cols;
+
+	*out_bg = bg;
+	return k;
+}
+
+/* update shadow cells to match EL result: space, no attrs, default fg */
+static void
+shadow_set_el(struct render *r, int row, int col_start, int col_end,
+    const struct vt_color *bg)
+{
+	int col;
+
+	for (col = col_start; col < col_end; col++) {
+		struct vt_cell *s = shadow_cell(r, row, col);
+
+		s->codepoint = ' ';
+		s->width = 1;
+		s->attrs = 0;
+		s->fg.type = VT_COLOR_DEFAULT;
+		s->bg = *bg;
+	}
+}
+
 /*
  * Does this cell look the same as a cleared terminal cell?
  * After ED (erase display), every position is a default-attribute
@@ -371,6 +435,7 @@ render_new(int rows, int cols, struct txl *txl)
 	r->txl = txl;
 	r->shadow = xmalloc((size_t)(rows * cols) * sizeof(r->shadow[0]));
 	shadow_clear(r);
+	r->has_bce = txl ? txl_has_bce(txl) : 1;
 	return r;
 }
 
@@ -541,8 +606,17 @@ render_cells_full(struct render *r, int fd, const struct vt_cell *cells,
 	r->cur_col = 0;
 
 	for (row = 0; row < rrows; row++) {
-		for (col = 0; col < rcols; col++) {
-			const struct vt_cell *c = &cells[row * cols + col];
+		const struct vt_cell *rowp = &cells[row * cols];
+		struct vt_color trail_bg;
+		int trail_start;
+		int emit_end;
+
+		trail_start = r->has_bce ?
+		    find_trail_el(rowp, rcols, &trail_bg) : rcols;
+		emit_end = trail_start < rcols ? trail_start : rcols;
+
+		for (col = 0; col < emit_end; col++) {
+			const struct vt_cell *c = &rowp[col];
 			struct vt_cell *s = shadow_cell(r, row, col);
 
 			/* ED already put a default space here */
@@ -557,11 +631,20 @@ render_cells_full(struct render *r, int fd, const struct vt_cell *cells,
 			emit_cell(r, fd, c);
 			*s = *c;
 		}
-	}
 
-	emit_cup(r, fd, cursor_row, cursor_col);
-	r->cur_row = cursor_row;
-	r->cur_col = cursor_col;
+		if (trail_start < rcols) {
+			static const struct vt_color dfg = { VT_COLOR_DEFAULT, };
+
+			emit_sgr(r, fd, 0, &dfg, &trail_bg);
+			if (r->cur_row != row || r->cur_col != trail_start) {
+				emit_cup(r, fd, row, trail_start);
+				r->cur_row = row;
+			}
+			emit_el(fd);
+			shadow_set_el(r, row, trail_start, rcols, &trail_bg);
+			r->cur_col = trail_start;
+		}
+	}
 
 	emit_reset_sgr(r, fd);
 	r->cur_attrs = 0;
@@ -589,24 +672,49 @@ render_cells_diff(struct render *r, int fd, const struct vt_cell *cells,
 	int row, col;
 	int rrows, rcols;
 	int any_change = 0;
+	int opened = 0;
 
 	rrows = rows < r->rows ? rows : r->rows;
 	rcols = cols < r->cols ? cols : r->cols;
 
-	emit_cstr(fd, SYNC_BEGIN);
-
 	for (row = 0; row < rrows; row++) {
 		int first_change, last_change;
+		const struct vt_cell *rowp = &cells[row * cols];
+		struct vt_color trail_bg;
+		int trail_start;
+		int use_el = 0;
+		int scan_end;
 
 		/* skip rows the compositor says are clean */
 		if (row_dirty && !row_dirty[row])
 			continue;
 
-		/* find range of changed cells in this row */
+		/* check for trailing blank run usable with EL */
+		trail_start = r->has_bce ?
+		    find_trail_el(rowp, rcols, &trail_bg) : rcols;
+
+		if (trail_start < rcols) {
+			int k;
+
+			for (k = trail_start; k < rcols; k++) {
+				struct vt_cell *s = shadow_cell(r, row, k);
+
+				if (s->codepoint != ' ' || s->attrs != 0 ||
+				    s->fg.type != VT_COLOR_DEFAULT ||
+				    !color_eq(&s->bg, &trail_bg)) {
+					use_el = 1;
+					break;
+				}
+			}
+		}
+
+		scan_end = use_el ? trail_start : rcols;
+
+		/* find range of changed cells before trailing run */
 		first_change = -1;
 		last_change = -1;
-		for (col = 0; col < rcols; col++) {
-			const struct vt_cell *c = &cells[row * cols + col];
+		for (col = 0; col < scan_end; col++) {
+			const struct vt_cell *c = &rowp[col];
 			struct vt_cell *s = shadow_cell(r, row, col);
 
 			if (!cell_eq(c, s)) {
@@ -616,71 +724,101 @@ render_cells_diff(struct render *r, int fd, const struct vt_cell *cells,
 			}
 		}
 
-		if (first_change < 0)
+		if (first_change < 0 && !use_el)
 			continue; /* row is dirty but no actual changes */
 
-		/* position cursor at first change */
-		if (r->cur_row != row || r->cur_col != first_change) {
-			emit_cup(r, fd, row, first_change);
-			r->cur_row = row;
-			r->cur_col = first_change;
+		if (!opened) {
+			emit_cstr(fd, SYNC_BEGIN);
+			opened = 1;
 		}
 
-		/* emit cells from first_change to last_change,
-		 * overdriving small gaps of unchanged cells */
-		for (col = first_change; col <= last_change; col++) {
-			const struct vt_cell *c = &cells[row * cols + col];
-			struct vt_cell *s = shadow_cell(r, row, col);
+		if (first_change >= 0) {
+			/* position cursor at first change */
+			if (r->cur_row != row ||
+			    r->cur_col != first_change) {
+				emit_cup(r, fd, row, first_change);
+				r->cur_row = row;
+				r->cur_col = first_change;
+			}
 
-			if (cell_eq(c, s)) {
-				/* check if gap to next change is small
-				 * enough to overdraw */
-				int gap_end;
+			/* emit cells from first_change to last_change,
+			 * overdriving small gaps of unchanged cells */
+			for (col = first_change; col <= last_change; col++) {
+				const struct vt_cell *c = &rowp[col];
+				struct vt_cell *s =
+				    shadow_cell(r, row, col);
 
-				for (gap_end = col + 1; gap_end <= last_change;
-				    gap_end++) {
-					if (!cell_eq(
-					    &cells[row * cols + gap_end],
-					    shadow_cell(r, row, gap_end)))
-						break;
-				}
+				if (cell_eq(c, s)) {
+					int gap_end;
 
-				if (gap_end <= last_change &&
-				    gap_end - col <= OVERDRAW_MAX) {
-					/* overdraw the gap */
-					emit_cell(r, fd, c);
+					for (gap_end = col + 1;
+					    gap_end <= last_change;
+					    gap_end++) {
+						if (!cell_eq(
+						    &rowp[gap_end],
+						    shadow_cell(r, row,
+						    gap_end)))
+							break;
+					}
+
+					if (gap_end <= last_change &&
+					    gap_end - col <= OVERDRAW_MAX) {
+						emit_cell(r, fd, c);
+						continue;
+					}
+
+					col = gap_end - 1;
 					continue;
 				}
 
-				/* gap too large -- skip ahead */
-				col = gap_end - 1;
-				continue;
-			}
+				if (r->cur_row != row ||
+				    r->cur_col != col) {
+					emit_cup(r, fd, row, col);
+					r->cur_row = row;
+					r->cur_col = col;
+				}
 
-			if (r->cur_row != row || r->cur_col != col) {
-				emit_cup(r, fd, row, col);
+				emit_cell(r, fd, c);
+				*s = *c;
+				any_change = 1;
+			}
+		}
+
+		if (use_el) {
+			static const struct vt_color dfg =
+			    { VT_COLOR_DEFAULT, };
+
+			emit_sgr(r, fd, 0, &dfg, &trail_bg);
+			if (r->cur_row != row ||
+			    r->cur_col != trail_start) {
+				emit_cup(r, fd, row, trail_start);
 				r->cur_row = row;
-				r->cur_col = col;
 			}
-
-			emit_cell(r, fd, c);
-			*s = *c;
+			emit_el(fd);
+			shadow_set_el(r, row, trail_start, rcols,
+			    &trail_bg);
+			r->cur_col = trail_start;
 			any_change = 1;
 		}
 	}
 
-	if (any_change || r->cur_row != cursor_row ||
-	    r->cur_col != cursor_col) {
-		emit_cup(r, fd, cursor_row, cursor_col);
-		r->cur_row = cursor_row;
-		r->cur_col = cursor_col;
-	}
+	if (!opened)
+		return 0;
 
 	emit_reset_sgr(r, fd);
 	r->cur_attrs = 0;
 	r->cur_fg.type = VT_COLOR_DEFAULT;
 	r->cur_bg.type = VT_COLOR_DEFAULT;
-
 	emit_cstr(fd, SYNC_END);
 	return tio_flush(fd);
+}
+
+void
+render_move_cursor(struct render *r, int fd, int row, int col)
+{
+	if (r->cur_row == row && r->cur_col == col)
+		return;
+	emit_cup(r, fd, row, col);
+	r->cur_row = row;
+	r->cur_col = col;
 }

@@ -68,6 +68,7 @@ struct txl {
 	char		*setab_str;	/* raw setab capability */
 	int		 ncolors;	/* max colors, 0 if unknown */
 	int		 has_rgb;	/* truecolor support */
+	int		 has_bce;	/* background color erase */
 };
 
 /* Check environment for truecolor hints. */
@@ -129,6 +130,7 @@ txl_new(const char *term)
 		t->ncolors = 256;	/* assume modern terminal */
 
 	t->has_rgb = detect_rgb(t->ti);
+	t->has_bce = t->ti ? ti_getbooli(t->ti, ti_bce) : 1;
 
 	return t;
 }
@@ -336,4 +338,10 @@ int
 txl_colors(const struct txl *t)
 {
 	return t->ncolors;
+}
+
+int
+txl_has_bce(const struct txl *t)
+{
+	return t->has_bce;
 }
