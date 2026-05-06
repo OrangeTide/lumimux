@@ -3,12 +3,9 @@
  * Licensed under MIT-0 OR PUBLIC DOMAIN */
 
 #include "multicall.h"
+#include "version.h"
 
 #include <stdio.h>
-
-#ifndef LUMI_VERSION
-#define LUMI_VERSION "0.1.0"
-#endif
 
 int
 cmd_version_main(int argc, char **argv)

@@ -4,8 +4,14 @@
 
 - [x] Unit tests for libutf8 (encode/decode round-trips, width lookups).
       48-test suite covers decode, encode, runelen, and width lookups.
-- [ ] Smoke test -- build all binaries, run `lumi version`, check exit codes.
+- [x] Smoke test -- build all binaries, run `lumi version`, check exit codes.
       Use as a merge request gate and release blocker.
+      12-test suite in tests/smoke.sh, CI-gated in .github/workflows/ci.yml.
+- [x] Display cursor position for unfocused windows. either using a terminal extension for multi-cursor (kitty?) or a simple invert of the attribute.
+      Reverse video toggle on unfocused cursor cells during wm_composite().
+      Works on all terminals. Test in test_wm.c.
+- [x] display the terminal size while resizing turbo windows.
+      "WxH" overlay centered in content area during WM_DRAG_RESIZING.
 
 ## Completed (Phase 5-6)
 
@@ -121,29 +127,32 @@
 
 ## Phase 11: Advanced Features
 
-- [ ] State-dependent bindings: match on window title (e.g. `^bash.*`),
+- [x] State-dependent bindings: match on window title (e.g. `^bash.*`),
       toggle states (on/off with only the relevant action available).
-- [ ] SIXEL pass-through demo.
+      Binding layers with title_re regex and toggle predicates in libkeys.
+      Config via [bind "name"] sections with match-title and toggle.
+      attach.c syncs title on focus change via sync_keybinds_title().
+      8+ tests in test_keys.c. Documented in doc/lumi.1.
+- [x] SIXEL pass-through demo.
+      DCS passthrough in attach.c writes raw ESC P ... ESC \ to stdout
+      when single pane is focused. DCS accumulation in vt_parse.c with
+      16MB buffer. 4 DCS tests in test_vt.c.
 - [ ] Networked client connections over QUIC reliable stream.
       Swap Unix socket for QUIC transport in libipc -- existing TLV message
       protocol works unchanged. Gets encrypted roaming (survives IP/network
       changes), TLS 1.3, 0-RTT reconnect. Server listens on both Unix socket
       (local) and QUIC (remote). Auth via pre-shared key or SSH key challenge.
-- [ ] Speculative local echo prediction.
-      Feed input into client's local vt_state speculatively, mark unconfirmed
-      cells in renderer (dim/underline), confirm or roll back when server
-      responds. Leverages the existing thick-client VT + render pipeline.
-- [ ] Multi-session. one client can access multiple local and remote sessions.
-      Default colors for window frames can be per-session (hinted from the
-      session, but also can be set by the client any time, which updates the
-      session hint if write access permitted)
-
-## Research / Exploratory
-
-- [ ] Investigate coroutine-style state machines for libvt parser
-      (see `/home/jon/jondev/code/ot.h` fake threading macros).
-- [ ] Investigate built-in container support. Daemon-less / root-less
-      like podman.
+- [x] Speculative local echo prediction.
+      predict.c ring buffer with predict_key/predict_confirm/predict_reset.
+      Gated by can_predict() (skips alt screen, hidden cursor, insert mode,
+      echo off). attach.c wires predict_key on input, predict_confirm before
+      vt_parse_feed, predict_set_echo on PTY flags. Renderer dims predicted
+      cells via VT_ATTR_DIM. 12-test suite in test_predict.c.
+- [x] Multi-session. one client can access multiple local and remote sessions.
+      Session picker (Ctrl-A U) lists all sessions with server counts,
+      switches between sessions by tearing down current connections and
+      reconnecting. Layout saved/restored per session. Per-session default
+      colors deferred to follow-up.
 
 ## Done
 

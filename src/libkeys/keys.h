@@ -48,6 +48,7 @@ enum keys_action {
 	KEYS_ACTION_MAXIMIZE,
 	KEYS_ACTION_SCROLL_LOCK,
 	KEYS_ACTION_INPUT_LOCK,
+	KEYS_ACTION_SESSION_LIST,
 };
 
 /* state of the prefix key state machine */

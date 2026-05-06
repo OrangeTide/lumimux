@@ -312,6 +312,10 @@ emit_cell(struct render *r, int fd, const struct vt_cell *c)
 	{
 		uint16_t a = c->attrs & ~VT_ATTR_PREDICTED;
 
+		/* dim predicted (unconfirmed) cells for visual feedback */
+		if (c->attrs & VT_ATTR_PREDICTED)
+			a |= VT_ATTR_DIM;
+
 		if (emit_sgr(r, fd, a, &c->fg, &c->bg) < 0)
 			return -1;
 	}

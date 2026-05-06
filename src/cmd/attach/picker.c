@@ -5,7 +5,7 @@
 #include "picker.h"
 #include "attach_ui.h"
 
-
+#include "utf8.h"
 #include "tui_list.h"
 #include "tkbd.h"
 
@@ -48,10 +48,13 @@ win_list_add(uint32_t id, const char *title, int active)
 	wi = &win_list[win_count++];
 	wi->id = id;
 	wi->active = active;
-	if (title)
-		snprintf(wi->title, sizeof(wi->title), "%s", title);
-	else
+	if (title) {
+		size_t len = utf8_trunc(title, sizeof(wi->title));
+		memcpy(wi->title, title, len);
+		wi->title[len] = '\0';
+	} else {
 		wi->title[0] = '\0';
+	}
 }
 
 int
@@ -137,7 +140,7 @@ picker_row_cb(struct tui_pad *p, int row, int col, int width,
 	struct vt_color kfg = selected ? th->sel_key_fg : th->key_fg;
 	uint16_t attrs = selected ? VT_ATTR_BOLD : 0;
 	char idstr[12];
-	int idlen, tlen, j, c;
+	int idlen, j, c;
 
 	(void)width;
 
@@ -155,15 +158,8 @@ picker_row_cb(struct tui_pad *p, int row, int col, int width,
 	    attrs, TUI_OPAQUE);
 
 	tui_pad_put(p, row, c++, ' ', fg, bg, attrs, TUI_OPAQUE);
-	tlen = (int)strlen(wi->title);
-	if (tlen > width - (c - col) - 1)
-		tlen = width - (c - col) - 1;
-	if (tlen > 0) {
-		for (j = 0; j < tlen; j++)
-			tui_pad_put(p, row, c++,
-			    (uint32_t)(unsigned char)wi->title[j],
-			    fg, bg, attrs, TUI_OPAQUE);
-	}
+	c = tui_pad_puts(p, row, c, wi->title, fg, bg, attrs,
+	    TUI_OPAQUE);
 
 	while (c < col + width - 1)
 		tui_pad_put(p, row, c++, ' ', fg, bg, attrs, TUI_OPAQUE);

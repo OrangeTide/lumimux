@@ -6,6 +6,7 @@
 #include "multicall.h"
 #include "prefix_menu.h"
 #include "picker.h"
+#include "session_picker.h"
 #include "apps_menu.h"
 #include "color_picker.h"
 #include "selection.h"
@@ -18,6 +19,8 @@
 #include "ipc.h"
 #include "ipc_msg.h"
 #include "lumi_msg.h"
+#include "proxy_msg.h"
+#include "byte_order.h"
 #include "sessdir.h"
 #include "sessdir_layout.h"
 #include "sessdir_state.h"
@@ -28,6 +31,7 @@
 #include "vt_ops.h"
 #include "render.h"
 #include "rune_width.h"
+#include "utf8.h"
 #include "tui_term.h"
 #include "predict.h"
 #include "cfg.h"
@@ -44,6 +48,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static struct render *renderer;
@@ -63,7 +69,65 @@ struct mconn {
 static struct mconn mconns[CLIENT_WIN_MAX];
 static int mconn_count;
 static int sessdir_watch_fd = -1;
-static const char *session_name;	/* set in main for micro mode */
+static char *session_name;	/* set in main for micro mode (allocated) */
+
+/* ---- remote proxy state ---- */
+
+static int is_remote;
+static int rproxy_fd = -1;
+static pid_t rproxy_pid;
+
+/* Returns 1 if name is remote (scp-style), 0 if local.
+ * On remote: *user may be NULL, *host and *rsession are set.
+ * Pointers into the original string -- caller must not free them. */
+static int
+parse_session_name(const char *name, const char **user,
+    const char **host, const char **rsession)
+{
+	const char *colon, *at;
+
+	*user = NULL;
+	*host = NULL;
+	*rsession = NULL;
+
+	/* leading / or . -> local path, not remote */
+	if (name[0] == '/' || name[0] == '.')
+		return 0;
+
+	colon = strchr(name, ':');
+	if (!colon)
+		return 0;
+
+	at = strchr(name, '@');
+	if (at && at < colon) {
+		/* user@host:session */
+		static char ubuf[128], hbuf[256];
+		size_t ulen = (size_t)(at - name);
+		size_t hlen = (size_t)(colon - at - 1);
+
+		if (ulen >= sizeof(ubuf) || hlen >= sizeof(hbuf))
+			return 0;
+		memcpy(ubuf, name, ulen);
+		ubuf[ulen] = '\0';
+		memcpy(hbuf, at + 1, hlen);
+		hbuf[hlen] = '\0';
+		*user = ubuf;
+		*host = hbuf;
+	} else {
+		/* host:session */
+		static char hbuf[256];
+		size_t hlen = (size_t)(colon - name);
+
+		if (hlen >= sizeof(hbuf))
+			return 0;
+		memcpy(hbuf, name, hlen);
+		hbuf[hlen] = '\0';
+		*host = hbuf;
+	}
+
+	*rsession = colon[1] ? colon + 1 : "0";
+	return 1;
+}
 
 /* ---- tiled mode state ---- */
 
@@ -112,6 +176,11 @@ mconn_find_by_pid(pid_t pid)
 static void on_mserver_read(struct iox_loop *lp, int fd,
     unsigned events, void *arg);
 static int turbo_focused_id(uint32_t *out_id);
+static int mconn_ipc_send(struct mconn *mc, uint32_t type,
+    const void *payload, uint32_t len);
+static int mconn_ipc_send_empty(struct mconn *mc, uint32_t type);
+static int mconn_ipc_send_size(struct mconn *mc, uint32_t type,
+    int rows, int cols);
 
 static struct mconn *
 mconn_add(struct iox_loop *lp, pid_t pid, int fd, const char *title)
@@ -123,10 +192,13 @@ mconn_add(struct iox_loop *lp, pid_t pid, int fd, const char *title)
 	mc = &mconns[mconn_count++];
 	mc->fd = fd;
 	mc->pid = pid;
-	if (title)
-		snprintf(mc->title, sizeof(mc->title), "%s", title);
-	else
+	if (title) {
+		size_t len = utf8_trunc(title, sizeof(mc->title));
+		memcpy(mc->title, title, len);
+		mc->title[len] = '\0';
+	} else {
 		mc->title[0] = '\0';
+	}
 	if (lp)
 		iox_fd_add(lp, fd, IOX_READ, on_mserver_read, mc);
 	return mc;
@@ -156,20 +228,20 @@ mconn_disconnect_all(struct iox_loop *lp)
 	int i;
 
 	for (i = 0; i < mconn_count; i++) {
+		mconn_ipc_send_empty(&mconns[i], IPC_MSG_DETACH);
 		if (mconns[i].fd >= 0) {
 			if (lp)
 				iox_fd_remove(lp, mconns[i].fd);
-			ipc_msg_send_empty(mconns[i].fd, IPC_MSG_DETACH);
 			ipc_close(mconns[i].fd);
 		}
 	}
 	mconn_count = 0;
 }
 
-/* get the fd for the focused/active mserver connection.
- * returns -1 if no connection is active. */
-int
-mconn_focused_fd(void)
+/* get the focused/active mserver connection.
+ * returns NULL if no connection is active. */
+static struct mconn *
+mconn_focused(void)
 {
 	uint32_t id;
 	struct mconn *mc;
@@ -178,27 +250,66 @@ mconn_focused_fd(void)
 		if (turbo_focused_id(&id)) {
 			mc = mconn_find_by_pid((pid_t)id);
 			if (mc)
-				return mc->fd;
+				return mc;
 		}
 	}
 
 	if (tilemgr) {
 		id = tile_focused_id(tilemgr);
-		if (id) {
-			mc = mconn_find_by_pid((pid_t)id);
-			if (mc)
-				return mc->fd;
-		}
-		return -1;	/* tiled: no fallback to watched_id */
+		if (id)
+			return mconn_find_by_pid((pid_t)id);
+		return NULL;	/* tiled: no fallback to watched_id */
 	}
 
 	/* screen mode fallback via watched_id */
-	if (watching) {
-		mc = mconn_find_by_pid((pid_t)watched_id);
-		if (mc)
-			return mc->fd;
-	}
-	return -1;
+	if (watching)
+		return mconn_find_by_pid((pid_t)watched_id);
+	return NULL;
+}
+
+/* get the fd for the focused/active mserver connection.
+ * returns -1 if no connection is active. */
+int
+mconn_focused_fd(void)
+{
+	struct mconn *mc = mconn_focused();
+
+	return mc ? mc->fd : -1;
+}
+
+/* send IPC message to a specific mserver, routing through proxy
+ * envelope when connected to a remote session */
+static int
+mconn_ipc_send(struct mconn *mc, uint32_t type,
+    const void *payload, uint32_t len)
+{
+	if (is_remote)
+		return proxy_msg_send(rproxy_fd, (uint32_t)mc->pid,
+		    type, payload, len);
+	if (mc->fd < 0)
+		return -1;
+	return ipc_msg_send(mc->fd, type, payload, len);
+}
+
+static int
+mconn_ipc_send_empty(struct mconn *mc, uint32_t type)
+{
+	return mconn_ipc_send(mc, type, NULL, 0);
+}
+
+static int
+mconn_ipc_send_size(struct mconn *mc, uint32_t type, int rows, int cols)
+{
+	struct ipc_size sz;
+	uint8_t buf[16];
+	int n;
+
+	sz.rows = (uint16_t)rows;
+	sz.cols = (uint16_t)cols;
+	n = ipc_size_encode(&sz, buf, sizeof(buf));
+	if (n < 0)
+		return -1;
+	return mconn_ipc_send(mc, type, buf, (uint32_t)n);
 }
 
 /* send WIN_RESIZE to all connected mservers */
@@ -208,7 +319,7 @@ micro_resize_all(int rows, int cols)
 	int i;
 
 	for (i = 0; i < mconn_count; i++)
-		ipc_msg_send_size(mconns[i].fd, IPC_MSG_WIN_RESIZE,
+		mconn_ipc_send_size(&mconns[i], IPC_MSG_WIN_RESIZE,
 		    rows, cols);
 }
 
@@ -228,6 +339,12 @@ micro_spawn_window(const char *name)
 		_exit(multicall_exec_cmd("mserver", 3, child_argv));
 	}
 	/* parent: mserver will register in sessdir, picked up by watch */
+}
+
+const char *
+micro_current_session(void)
+{
+	return session_name;
 }
 
 /* forward declarations for functions defined after turbo section */
@@ -926,7 +1043,7 @@ tiled_resize_pane_cb(uint32_t window_id, int w, int h, void *arg)
 
 	mc = mconn_find_by_pid((pid_t)window_id);
 	if (mc)
-		ipc_msg_send_size(mc->fd, IPC_MSG_WIN_RESIZE, h, w);
+		mconn_ipc_send_size(mc, IPC_MSG_WIN_RESIZE, h, w);
 }
 
 /* sync watched_id / watching / vt globals from tilemgr's focused pane.
@@ -983,7 +1100,7 @@ turbo_sync_size(uint32_t id)
 		vt_state_resize(cw->vt, win->h, win->w);
 	mc = mconn_find_by_pid((pid_t)id);
 	if (mc)
-		ipc_msg_send_size(mc->fd, IPC_MSG_WIN_RESIZE,
+		mconn_ipc_send_size(mc, IPC_MSG_WIN_RESIZE,
 		    win->h, win->w);
 }
 
@@ -1040,7 +1157,7 @@ turbo_sync_windows(void)
 
 				smc = mconn_find_by_pid((pid_t)id);
 				if (smc)
-					ipc_msg_send_size(smc->fd,
+					mconn_ipc_send_size(smc,
 					    IPC_MSG_WIN_RESIZE, h, w);
 			}
 
@@ -1136,7 +1253,7 @@ turbo_apply_layout(const char *session)
 
 				smc = mconn_find_by_pid((pid_t)win->id);
 				if (smc)
-					ipc_msg_send_size(smc->fd,
+					mconn_ipc_send_size(smc,
 					    IPC_MSG_WIN_RESIZE,
 					    win->h, win->w);
 			}
@@ -1393,8 +1510,10 @@ mconn_sync_winlist(void)
 		title = sessdir_read_file(session_name, mconns[i].pid,
 		    "title");
 		if (title) {
-			snprintf(mconns[i].title, sizeof(mconns[i].title),
-			    "%s", title);
+			size_t len = utf8_trunc(title,
+			    sizeof(mconns[i].title));
+			memcpy(mconns[i].title, title, len);
+			mconns[i].title[len] = '\0';
 			free(title);
 		}
 		cw = cwin_find((uint32_t)mconns[i].pid);
@@ -1515,11 +1634,11 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 	case KEYS_ACTION_SEND_PREFIX:
 		prefix = keys_get_prefix(keybinds);
 		{
-			int fd = mconn_focused_fd();
+			struct mconn *mc = mconn_focused();
 			struct client_window *cw = cwin_focused();
 
-			if (fd >= 0 && !(cw && cw->input_lock))
-				ipc_msg_send(fd, IPC_MSG_INPUT,
+			if (mc && !(cw && cw->input_lock))
+				mconn_ipc_send(mc, IPC_MSG_INPUT,
 				    &prefix, 1);
 		}
 		break;
@@ -1547,10 +1666,10 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 		break;
 	case KEYS_ACTION_KILL_WINDOW:
 		{
-			int fd = mconn_focused_fd();
+			struct mconn *mc = mconn_focused();
 
-			if (fd >= 0) {
-				ipc_msg_send_empty(fd, IPC_MSG_KILL);
+			if (mc) {
+				mconn_ipc_send_empty(mc, IPC_MSG_KILL);
 			} else {
 				/* dead window: remove directly */
 				struct client_window *cw;
@@ -1695,17 +1814,17 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 	case KEYS_ACTION_SCROLL_LOCK:
 		{
 			struct client_window *cw;
-			int fd;
+			struct mconn *mc;
 
 			cw = cwin_focused();
 			if (!cw || cw->dead)
 				break;
 			cw->scroll_lock = !cw->scroll_lock;
-			fd = mconn_focused_fd();
-			if (fd >= 0) {
+			mc = mconn_focused();
+			if (mc) {
 				uint8_t pause = cw->scroll_lock ? 1 : 0;
 
-				ipc_msg_send(fd, IPC_MSG_FLOW_CTRL,
+				mconn_ipc_send(mc, IPC_MSG_FLOW_CTRL,
 				    &pause, 1);
 			}
 			if (client_mode == CLIENT_MODE_TURBO) {
@@ -1756,6 +1875,10 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 			need_status = 1;
 		}
 		break;
+	case KEYS_ACTION_SESSION_LIST:
+		if (client_mode != CLIENT_MODE_MINIMAL)
+			session_picker_show();
+		break;
 	default:
 		break;
 	}
@@ -1785,10 +1908,10 @@ color_picker_get_theme(uint32_t id)
 static void
 sel_forward_press(void)
 {
-	int mfd = mconn_focused_fd();
+	struct mconn *mc = mconn_focused();
 
-	if (sel_press_seq.len > 0 && mfd >= 0)
-		ipc_msg_send(mfd, IPC_MSG_INPUT,
+	if (sel_press_seq.len > 0 && mc)
+		mconn_ipc_send(mc, IPC_MSG_INPUT,
 		    sel_press_seq.data, (uint32_t)sel_press_seq.len);
 }
 
@@ -1798,19 +1921,19 @@ sel_paste(void)
 {
 	const char *buf;
 	size_t len;
-	int mfd;
+	struct mconn *mc;
 
 	buf = sel_copy_buf();
 	len = sel_copy_len();
 	if (len == 0)
 		return;
-	mfd = mconn_focused_fd();
-	if (mfd < 0)
+	mc = mconn_focused();
+	if (!mc)
 		return;
 
-	ipc_msg_send(mfd, IPC_MSG_INPUT, "\033[200~", 6);
-	ipc_msg_send(mfd, IPC_MSG_INPUT, buf, (uint32_t)len);
-	ipc_msg_send(mfd, IPC_MSG_INPUT, "\033[201~", 6);
+	mconn_ipc_send(mc, IPC_MSG_INPUT, "\033[200~", 6);
+	mconn_ipc_send(mc, IPC_MSG_INPUT, buf, (uint32_t)len);
+	mconn_ipc_send(mc, IPC_MSG_INPUT, "\033[201~", 6);
 }
 
 static void
@@ -1865,8 +1988,8 @@ handle_mouse_turbo(struct iox_loop *loop, const struct tkbd_seq *seq)
 						dmc = mconn_find_by_pid(
 						    (pid_t)did);
 						if (dmc)
-							ipc_msg_send_size(
-							    dmc->fd,
+							mconn_ipc_send_size(
+							    dmc,
 							    IPC_MSG_WIN_RESIZE,
 							    win->h, win->w);
 					}
@@ -1935,8 +2058,8 @@ handle_mouse_turbo(struct iox_loop *loop, const struct tkbd_seq *seq)
 			struct mconn *cmc;
 
 			cmc = mconn_find_by_pid((pid_t)id);
-			if (cmc && cmc->fd >= 0) {
-				ipc_msg_send_empty(cmc->fd,
+			if (cmc) {
+				mconn_ipc_send_empty(cmc,
 				    IPC_MSG_KILL);
 			} else {
 				/* dead window: remove directly */
@@ -2031,10 +2154,10 @@ handle_mouse_turbo(struct iox_loop *loop, const struct tkbd_seq *seq)
 			sel_forward_press();
 			/* also forward the release */
 			{
-				int mfd = mconn_focused_fd();
+				struct mconn *mc = mconn_focused();
 
-				if (seq->len > 0 && mfd >= 0)
-					ipc_msg_send(mfd, IPC_MSG_INPUT,
+				if (seq->len > 0 && mc)
+					mconn_ipc_send(mc, IPC_MSG_INPUT,
 					    seq->data,
 					    (uint32_t)seq->len);
 			}
@@ -2110,8 +2233,8 @@ handle_mouse_turbo(struct iox_loop *loop, const struct tkbd_seq *seq)
 						rmc = mconn_find_by_pid(
 						    (pid_t)id);
 						if (rmc)
-							ipc_msg_send_size(
-							    rmc->fd,
+							mconn_ipc_send_size(
+							    rmc,
 							    IPC_MSG_WIN_RESIZE,
 							    win->h, win->w);
 					}
@@ -2185,10 +2308,10 @@ handle_mouse(struct iox_loop *loop, const struct tkbd_seq *seq)
 			sel_pending = 0;
 			sel_forward_press();
 			{
-				int mfd = mconn_focused_fd();
+				struct mconn *mc = mconn_focused();
 
-				if (seq->len > 0 && mfd >= 0)
-					ipc_msg_send(mfd, IPC_MSG_INPUT,
+				if (seq->len > 0 && mc)
+					mconn_ipc_send(mc, IPC_MSG_INPUT,
 					    seq->data,
 					    (uint32_t)seq->len);
 			}
@@ -2244,6 +2367,11 @@ dispatch_input(struct iox_loop *loop, const struct tkbd_seq *seq)
 
 	if (apps_menu_visible) {
 		apps_menu_input(seq);
+		return;
+	}
+
+	if (session_picker_visible) {
+		session_picker_input(loop, seq);
 		return;
 	}
 
@@ -2386,20 +2514,20 @@ dispatch_input(struct iox_loop *loop, const struct tkbd_seq *seq)
 
 	/* unhandled input -> forward raw sequence to PTY */
 	if (seq->len > 0) {
-		int target_fd = mconn_focused_fd();
+		struct mconn *mc = mconn_focused();
 		struct client_window *fcw = cwin_focused();
 
 		/* input lock: discard keystrokes for this window */
 		if (fcw && fcw->input_lock)
 			return;
 
-		if (target_fd >= 0)
-			ipc_msg_send(target_fd, IPC_MSG_INPUT,
+		if (mc)
+			mconn_ipc_send(mc, IPC_MSG_INPUT,
 			    seq->data, (uint32_t)seq->len);
 
 		/* speculative local echo for printable characters.
 		 * skip for dead windows (no PTY to echo back). */
-		if (target_fd >= 0 &&
+		if (mc &&
 		    seq->ch >= 0x20 && seq->ch != 0x7F) {
 			struct client_window *cw = cwin_focused();
 
@@ -2538,6 +2666,218 @@ mconn_discover(struct iox_loop *lp)
 	}
 
 	return added;
+}
+
+/* ---- remote proxy helpers ---- */
+
+static int
+start_proxy(const char *user, const char *host, const char *rsession)
+{
+	int sv[2];
+	pid_t pid;
+	char dest[384];
+
+	if (user)
+		snprintf(dest, sizeof(dest), "%s@%s", user, host);
+	else
+		snprintf(dest, sizeof(dest), "%s", host);
+
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0)
+		return -1;
+
+	pid = fork();
+	if (pid < 0) {
+		close(sv[0]);
+		close(sv[1]);
+		return -1;
+	}
+
+	if (pid == 0) {
+		/* child: wire sv[1] to stdin/stdout, exec ssh */
+		close(sv[0]);
+		dup2(sv[1], STDIN_FILENO);
+		dup2(sv[1], STDOUT_FILENO);
+		if (sv[1] > STDERR_FILENO)
+			close(sv[1]);
+		execlp("ssh", "ssh", "-T", "-o", "BatchMode=yes",
+		    dest, "lumi", "proxy", "-s", rsession, NULL);
+		_exit(127);
+	}
+
+	/* parent */
+	close(sv[1]);
+	rproxy_pid = pid;
+	rproxy_fd = sv[0];
+	return sv[0];
+}
+
+static void
+on_proxy_read(struct iox_loop *lp, int fd, unsigned events, void *arg)
+{
+	uint32_t window_id, type, len;
+	char buf[4096];
+	int rc;
+
+	(void)events;
+	(void)arg;
+
+	rc = proxy_msg_recv(fd, &window_id, &type, buf, sizeof(buf), &len);
+	if (rc != 0) {
+		/* proxy died or pipe closed */
+		iox_loop_stop(lp);
+		return;
+	}
+
+	if (window_id == 0) {
+		/* proxy control messages */
+		const uint8_t *p = (const uint8_t *)buf;
+
+		switch (type) {
+		case IPC_MSG_PROXY_WIN_ADDED:
+			if (len >= 9) {
+				uint32_t wid;
+				uint16_t rows, cols;
+				uint8_t tlen;
+				char title[128];
+
+				memcpy(&wid, p, 4);
+				wid = BE32(wid);
+				memcpy(&rows, p + 4, 2);
+				rows = BE16(rows);
+				memcpy(&cols, p + 6, 2);
+				cols = BE16(cols);
+				tlen = p[8];
+				if (tlen > sizeof(title) - 1)
+					tlen = sizeof(title) - 1;
+				if (9 + tlen <= len) {
+					memcpy(title, p + 9, tlen);
+					title[tlen] = '\0';
+					mconn_add(NULL, (pid_t)wid, -1, title);
+					cwin_add_sized(wid, rows, cols);
+					mconn_sync_winlist();
+					if (client_mode == CLIENT_MODE_TURBO)
+						turbo_sync_windows();
+					need_render = 1;
+					need_status = 1;
+				}
+			}
+			break;
+
+		case IPC_MSG_PROXY_WIN_REMOVED:
+			if (len >= 4) {
+				uint32_t wid;
+
+				memcpy(&wid, p, 4);
+				wid = BE32(wid);
+				remove_window(lp, wid);
+			}
+			break;
+
+		default:
+			break;
+		}
+		return;
+	}
+
+	/* per-window message: route to existing handlers */
+	{
+		struct mconn *mc = mconn_find_by_pid((pid_t)window_id);
+
+		if (!mc)
+			return;
+
+		switch (type) {
+		case IPC_MSG_OUTPUT:
+			{
+				struct client_window *cw;
+
+				cw = cwin_find(window_id);
+				if (!cw)
+					break;
+				predict_confirm(cw->pred, cw->vt, buf, len);
+				vt_parse_feed(cw->parser, buf, len);
+				need_render = 1;
+				need_status = 1;
+			}
+			break;
+
+		case IPC_MSG_PTY_FLAGS:
+			if (len >= 1) {
+				struct client_window *cw;
+				uint8_t flags = (uint8_t)buf[0];
+
+				cw = cwin_find(window_id);
+				if (cw)
+					predict_set_echo(cw->pred,
+					    flags & IPC_PTY_ECHO);
+			}
+			break;
+
+		case IPC_MSG_DETACH:
+			iox_loop_stop(lp);
+			break;
+
+		default:
+			break;
+		}
+	}
+}
+
+static int
+mconn_discover_remote(struct iox_loop *lp)
+{
+	uint32_t window_id, type, len;
+	uint8_t buf[4096];
+	const uint8_t *p;
+	uint16_t count;
+	int rc, i;
+
+	rc = proxy_msg_recv(rproxy_fd, &window_id, &type,
+	    buf, sizeof(buf), &len);
+	if (rc != 0 || type != IPC_MSG_PROXY_READY || len < 2)
+		return -1;
+
+	p = buf;
+	memcpy(&count, p, 2);
+	count = BE16(count);
+	p += 2;
+	len -= 2;
+
+	for (i = 0; i < count; i++) {
+		uint32_t wid;
+		uint16_t rows, cols;
+		uint8_t tlen;
+		char title[128];
+		size_t need;
+
+		if (len < 9)
+			break;
+		memcpy(&wid, p, 4);
+		wid = BE32(wid);
+		memcpy(&rows, p + 4, 2);
+		rows = BE16(rows);
+		memcpy(&cols, p + 6, 2);
+		cols = BE16(cols);
+		tlen = p[8];
+		need = 9 + tlen;
+		if (need > len)
+			break;
+		if (tlen > sizeof(title) - 1)
+			tlen = sizeof(title) - 1;
+		memcpy(title, p + 9, tlen);
+		title[tlen] = '\0';
+
+		mconn_add(NULL, (pid_t)wid, -1, title);
+		cwin_add_sized(wid, rows, cols);
+
+		p += need;
+		len -= (uint32_t)need;
+	}
+
+	/* register proxy fd for incoming messages */
+	iox_fd_add(lp, rproxy_fd, IOX_READ, on_proxy_read, NULL);
+
+	return mconn_count;
 }
 
 /* remove a window completely: free VT state, drop mconn, remove from
@@ -2687,6 +3027,103 @@ on_mserver_read(struct iox_loop *lp, int fd, unsigned events, void *arg)
 	}
 }
 
+/* ---- session switching ---- */
+
+static void on_sessdir_watch(struct iox_loop *lp, int fd,
+    unsigned events, void *arg);
+
+void
+micro_switch_session(struct iox_loop *loop, const char *name)
+{
+	if (session_name && strcmp(session_name, name) == 0)
+		return;
+
+	/* save current layout */
+	if (client_mode == CLIENT_MODE_TURBO)
+		turbo_save_layout(session_name);
+	else if (tilemgr)
+		screen_save_layout(session_name);
+
+	/* tear down current connections */
+	mconn_disconnect_all(loop);
+	cwin_free_all();
+
+	/* stop watching old session directory */
+	if (sessdir_watch_fd >= 0) {
+		iox_fd_remove(loop, sessdir_watch_fd);
+		sessdir_watch_stop(sessdir_watch_fd);
+		sessdir_watch_fd = -1;
+	}
+
+	/* free layout state */
+	if (client_mode == CLIENT_MODE_TURBO) {
+		wm_free(wmgr);
+		wmgr = wm_new(content_rows, content_cols);
+		turbo_need_full = 1;
+	} else {
+		tile_free(tilemgr);
+		tilemgr = NULL;
+	}
+
+	/* switch session name */
+	free(session_name);
+	session_name = strdup(name);
+
+	/* connect to new session's servers */
+	mconn_discover(loop);
+	mconn_sync_winlist();
+
+	/* if empty session, spawn a window and re-discover */
+	if (mconn_count == 0) {
+		micro_spawn_window(session_name);
+		/* brief pause for mserver to register */
+		usleep(100000);
+		mconn_discover(loop);
+		mconn_sync_winlist();
+	}
+
+	if (mconn_count == 0)
+		return;	/* still empty -- nothing we can do */
+
+	/* set initial focus */
+	watched_id = (uint32_t)mconns[0].pid;
+	watching = 1;
+	{
+		struct client_window *cw;
+
+		cw = cwin_find(watched_id);
+		if (cw)
+			vt = cw->vt;
+	}
+
+	/* reinitialize layout */
+	if (client_mode == CLIENT_MODE_TURBO) {
+		turbo_sync_windows();
+		turbo_apply_layout(session_name);
+		wm_focus(wmgr, watched_id);
+		turbo_need_full = 1;
+	} else {
+		if (screen_apply_layout(session_name) < 0) {
+			tilemgr = tile_new(content_rows, content_cols);
+			tile_set_window(tilemgr, 0, watched_id, vt);
+			tile_focus(tilemgr, watched_id);
+		}
+		overlay_repaint_fn = tiled_repaint;
+		tile_each_pane(tilemgr, tiled_resize_pane_cb, NULL);
+		tile_need_full = 1;
+	}
+
+	/* watch new session directory */
+	sessdir_watch_fd = sessdir_watch_start(session_name);
+	if (sessdir_watch_fd >= 0)
+		iox_fd_add(loop, sessdir_watch_fd, IOX_READ,
+		    on_sessdir_watch, NULL);
+
+	need_render = 1;
+	need_status = 1;
+	sync_keybinds_title();
+}
+
 static void
 on_sessdir_watch(struct iox_loop *lp, int fd, unsigned events, void *arg)
 {
@@ -2720,7 +3157,7 @@ on_sessdir_watch(struct iox_loop *lp, int fd, unsigned events, void *arg)
 				continue;
 			vt_state_resize(cw->vt,
 			    content_rows, content_cols);
-			ipc_msg_send_size(mconns[i].fd,
+			mconn_ipc_send_size(&mconns[i],
 			    IPC_MSG_WIN_RESIZE,
 			    content_rows, content_cols);
 		}
@@ -2896,9 +3333,12 @@ get_terminal_size(int *rows, int *cols)
 static void
 usage(void)
 {
-	fprintf(stderr, "usage: lumi-attach [-m mode] [-s name]\n");
 	fprintf(stderr,
-	    "  -m mode   UI mode: screen (default), turbo, minimal\n");
+	    "usage: lumi-attach [-f window] [-m mode] [-s name]\n");
+	fprintf(stderr,
+	    "  -f window   focus this window (by PID) after startup\n"
+	    "  -m mode     UI mode: screen (default), turbo, minimal\n"
+	    "  -s name     session name (default: 0)\n");
 }
 
 int
@@ -2907,6 +3347,7 @@ cmd_attach_main(int argc, char **argv)
 	struct iox_loop *loop;
 	const char *name = "0";
 	const char *mode_str = NULL;
+	uint32_t focus_window = 0;
 	int rows, cols;
 	int opt;
 
@@ -2917,8 +3358,11 @@ cmd_attach_main(int argc, char **argv)
 		return 1;
 	}
 
-	while ((opt = getopt(argc, argv, "m:s:")) != -1) {
+	while ((opt = getopt(argc, argv, "f:m:s:")) != -1) {
 		switch (opt) {
+		case 'f':
+			focus_window = (uint32_t)strtoul(optarg, NULL, 10);
+			break;
 		case 'm':
 			mode_str = optarg;
 			break;
@@ -2955,7 +3399,23 @@ cmd_attach_main(int argc, char **argv)
 	get_terminal_size(&rows, &cols);
 	update_content_size(rows, cols);
 
-	session_name = name;
+	{
+		const char *ruser, *rhost, *rsess;
+
+		if (parse_session_name(name, &ruser, &rhost, &rsess)) {
+			is_remote = 1;
+			session_name = strdup(rsess);
+			if (start_proxy(ruser, rhost, rsess) < 0) {
+				fprintf(stderr,
+				    "lumi-attach: failed to start proxy "
+				    "to %s\n", name);
+				free(session_name);
+				return 1;
+			}
+		} else {
+			session_name = strdup(name);
+		}
+	}
 
 	{
 		struct cfg *cfg;
@@ -3073,9 +3533,11 @@ cmd_attach_main(int argc, char **argv)
 	iox_fd_add(loop, STDIN_FILENO, IOX_READ, on_stdin_read, NULL);
 
 	{
-		/* discover mservers, connect, receive replay at each
-		 * server's current VT size */
-		mconn_discover(loop);
+		/* discover mservers: remote via proxy, local via sessdir */
+		if (is_remote)
+			mconn_discover_remote(loop);
+		else
+			mconn_discover(loop);
 		mconn_sync_winlist();
 
 		if (mconn_count == 0) {
@@ -3121,12 +3583,19 @@ cmd_attach_main(int argc, char **argv)
 		need_render = 1;
 		need_status = 1;
 
-		/* watch sessdir for new/removed mservers */
-		sessdir_watch_fd = sessdir_watch_start(name);
-		if (sessdir_watch_fd >= 0)
-			iox_fd_add(loop, sessdir_watch_fd, IOX_READ,
-			    on_sessdir_watch, NULL);
+		/* watch sessdir for new/removed mservers (local only;
+		 * remote proxy handles its own watch) */
+		if (!is_remote) {
+			sessdir_watch_fd = sessdir_watch_start(name);
+			if (sessdir_watch_fd >= 0)
+				iox_fd_add(loop, sessdir_watch_fd, IOX_READ,
+				    on_sessdir_watch, NULL);
+		}
 	}
+
+	/* focus a specific window if requested */
+	if (focus_window)
+		micro_select_window(focus_window);
 
 	iox_signal_add(loop, SIGWINCH, on_sigwinch, NULL);
 	iox_signal_add(loop, SIGTERM, on_shutdown_signal, NULL);
@@ -3152,6 +3621,15 @@ cmd_attach_main(int argc, char **argv)
 		screen_save_layout(name);
 
 	mconn_disconnect_all(NULL);
+
+	/* clean up remote proxy */
+	if (is_remote && rproxy_fd >= 0) {
+		close(rproxy_fd);
+		rproxy_fd = -1;
+		if (rproxy_pid > 0)
+			waitpid(rproxy_pid, NULL, 0);
+	}
+
 	iox_loop_free(loop);
 	reset_terminal_modes();
 	set_cursor_vis(1);
@@ -3182,6 +3660,7 @@ cmd_attach_main(int argc, char **argv)
 	keys_free(keybinds);
 	status_free(statusbar);
 	status_free(scrollback_sb);
+	free(session_name);
 
 	return 0;
 }

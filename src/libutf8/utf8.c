@@ -104,6 +104,26 @@ utf8_encode(unsigned char *buf, uint32_t rune)
 	return 0;
 }
 
+size_t
+utf8_trunc(const char *s, size_t maxbytes)
+{
+	const unsigned char *p = (const unsigned char *)s;
+	size_t safe = 0;
+	uint32_t cp;
+	int n;
+
+	if (maxbytes == 0)
+		return 0;
+	maxbytes--;	/* reserve space for NUL */
+	while (safe < maxbytes && p[safe]) {
+		n = utf8_decode(&cp, p + safe, maxbytes - safe);
+		if (n <= 0 || cp == UTF8_RUNE_ERROR)
+			break;
+		safe += (size_t)n;
+	}
+	return safe;
+}
+
 int
 utf8_runelen(uint32_t rune)
 {

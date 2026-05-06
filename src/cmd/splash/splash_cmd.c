@@ -11,10 +11,6 @@
 #include <termios.h>
 #include <unistd.h>
 
-#ifndef LUMI_VERSION
-#define LUMI_VERSION "0.0.1-dev"
-#endif
-
 static const char *progname = "lumi-splash";
 
 static void

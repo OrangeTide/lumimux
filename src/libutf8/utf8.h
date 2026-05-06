@@ -39,4 +39,12 @@ int utf8_encode(unsigned char *buf, uint32_t rune);
  */
 int utf8_runelen(uint32_t rune);
 
+/** Truncate a UTF-8 string to fit in maxbytes (including NUL).
+ *
+ * Returns the safe truncation length -- the largest byte count
+ * <= maxbytes-1 that does not split a multibyte sequence.
+ * The caller must NUL-terminate the result.
+ */
+size_t utf8_trunc(const char *s, size_t maxbytes);
+
 #endif /* UTF8_H */

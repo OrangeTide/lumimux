@@ -52,7 +52,7 @@ struct tui_theme {
 	const char	*sep_fill;
 	const char	*sep_r;
 
-	/* colors */
+	/* colors -- dialog / overlay widgets */
 	struct vt_color	border_fg;
 	struct vt_color	border_bg;
 	struct vt_color	title_fg;
@@ -62,6 +62,20 @@ struct tui_theme {
 	struct vt_color	sel_bg;
 	struct vt_color	key_fg;
 	struct vt_color	sel_key_fg;
+
+	/* colors -- window manager frame */
+	struct vt_color	focus_fg;
+	struct vt_color	focus_bg;
+	struct vt_color	unfocus_fg;
+	struct vt_color	unfocus_bg;
+	struct vt_color	title_focus_fg;
+	struct vt_color	title_idle_fg;
+	struct vt_color	close_fg;
+	struct vt_color	tool_fg;
+	struct vt_color	status_focus_fg;
+	struct vt_color	status_idle_fg;
+	struct vt_color	indicator_fg;
+	struct vt_color	drag_fg;
 
 	/* shadow */
 	enum tui_shadow_style shadow;

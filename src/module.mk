@@ -6,7 +6,7 @@ lumi_SRCS = multicall.c \
 	cmd/attach/picker.c cmd/attach/apps_menu.c cmd/attach/theme_cfg.c \
 	cmd/attach/app_calc.c cmd/attach/app_cal.c cmd/attach/app_emoji.c \
 	cmd/attach/app_dict.c cmd/attach/predict.c cmd/attach/color_picker.c \
-	cmd/attach/selection.c \
+	cmd/attach/session_picker.c cmd/attach/selection.c \
 	cmd/attr/attr.c \
 	cmd/mserver/mserver.c \
 	cmd/new/new.c \
@@ -15,6 +15,7 @@ lumi_SRCS = multicall.c \
 	cmd/kill/kill.c \
 	cmd/detach/detach.c \
 	cmd/new-window/new_window.c \
+	cmd/proxy/proxy.c \
 	cmd/reload/reload.c \
 	cmd/send-input/send_input.c \
 	cmd/send-keys/send_keys.c \
@@ -27,17 +28,20 @@ lumi_CPPFLAGS = -I$(lumi_DIR)
 EXECUTABLES += lumi
 
 LUMI_CMDS = attach attr mserver new list version kill detach new-window \
-	reload send-input send-keys splash
+	proxy reload send-input send-keys splash
 
-.PHONY: symlinks
+.PHONY: symlinks clean-symlinks
 symlinks: lumi
 	@for cmd in $(LUMI_CMDS); do \
 		ln -sf lumi $(BINDIR)/lumi-$$cmd; \
 	done
+clean-symlinks:
+	for cmd in $(LUMI_CMDS); do $(RM) $(BINDIR)/lumi-$$cmd; done
+clean: clean-symlinks
 
 SUBDIRS = libcore libutf8 libiox libpty libvt libtio librender libtxl \
 	libtermlib libipc libattr libsessdir libsession libkeys libcfg \
 	libstatus libsplash libtui libtui_term libwm libtile \
 	cmd/attr cmd/mserver cmd/attach cmd/new cmd/list \
-	cmd/version cmd/kill cmd/detach cmd/send-keys \
+	cmd/proxy cmd/version cmd/kill cmd/detach cmd/send-keys \
 	cmd/send-input cmd/new-window cmd/reload cmd/splash

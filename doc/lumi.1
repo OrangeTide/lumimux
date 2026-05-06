@@ -45,6 +45,7 @@ Create a new session and attach to it.
 .B lumi new
 .RB [ \-A ]
 .RB [ \-d ]
+.RB [ "\-f window" ]
 .RB [ "\-m mode" ]
 .RB [ "\-s name" ]
 .RI [ shell ]
@@ -55,6 +56,11 @@ If the session already exists, reattach to it instead of failing.
 .B \-d
 Detach mode.
 Create the session and start the server but do not attach.
+.TP
+.BI \-f " window"
+Focus the given window (by server PID) after startup.
+Passed through to
+.BR lumi-attach .
 .TP
 .BI \-m " mode"
 UI mode passed to
@@ -71,9 +77,13 @@ Uses the user's login shell if omitted.
 Attach to an existing session.
 .PP
 .B lumi attach
+.RB [ "\-f window" ]
 .RB [ "\-m mode" ]
 .RB [ "\-s name" ]
 .RI [ name ]
+.TP
+.BI \-f " window"
+Focus the given window (by server PID) after startup.
 .TP
 .BI \-m " mode"
 UI mode:
@@ -85,6 +95,29 @@ UI mode:
 Session name (default:
 .BR 0 ).
 A positional argument may also be used.
+.PP
+Remote sessions may be specified using scp-style syntax:
+.PP
+.RS 4
+.RI [ user @ ] host : session
+.RE
+.PP
+When a remote session name is given,
+.B lumi attach
+launches
+.B lumi proxy
+on the remote host via
+.BR ssh (1)
+and tunnels all window I/O over the SSH connection.
+If the session part is omitted (e.g.\&
+.IR host: ),
+it defaults to
+.BR 0 .
+Names beginning with
+.B /
+or
+.B .
+are always treated as local.
 .SS lumi detach
 Detach a client from its session.
 .PP
@@ -210,6 +243,234 @@ Session name (required).
 .TP
 .I shell
 Shell command to run.
+.SS lumi proxy
+Multiplexing proxy for remote session tunneling.
+Launched automatically by
+.B lumi attach
+for remote sessions; not intended for direct use.
+The proxy connects to all micro-servers in the specified session,
+multiplexes their I/O onto a single pipe (stdin/stdout),
+and watches for new or removed windows.
+.PP
+.B lumi proxy
+.B \-s
+.I session
+.TP
+.BI \-s " session"
+Session name (required).
+.SH KEY BINDINGS
+All key bindings use a prefix key (default:
+.BR Ctrl\-A )
+followed by a second key.
+Press the prefix key twice to send a literal
+.B Ctrl\-A
+to the terminal.
+.PP
+.TS
+l l.
+Key	Action
+_
+c, C	Create new window
+k, K	Kill current window
+n, Space, Ctrl\-Space, Ctrl\-N	Next window
+p, Ctrl\-P	Previous window
+0\-9	Select window by number
+d, D	Detach from session
+w, "	Window list
+s	Toggle status bar
+q	Applications menu
+[, Escape	Enter scrollback mode
+h	Split pane horizontally
+v	Split pane vertically
+Tab	Next pane
+X	Close pane
+r	Resize pane
+m	Minimize window (turbo mode)
+f	Maximize window (turbo mode)
+P	Window color picker (turbo mode)
+S	Toggle scroll lock
+I	Toggle input lock
+U	Session picker
+.TE
+.SH CONFIGURATION
+The configuration file is loaded from:
+.PP
+.RS 4
+.I $XDG_CONFIG_HOME/lumi/lumi.conf
+.RE
+.PP
+or, if
+.B XDG_CONFIG_HOME
+is not set:
+.PP
+.RS 4
+.I $HOME/.config/lumi/lumi.conf
+.RE
+.PP
+The file is optional; a missing file is silently ignored.
+.SS Format
+The file uses a git-config-style INI format.
+Section headers are enclosed in brackets.
+Keys and values are separated by
+.BR = .
+Lines starting with
+.B #
+or
+.B ;
+are comments.
+Inline comments (after a value) are also supported.
+Double-quoted values preserve literal
+.B #
+characters.
+.PP
+Dotted shorthand may be used outside a section block:
+.PP
+.RS 4
+.nf
+status.position = bottom
+.fi
+.RE
+.PP
+is equivalent to:
+.PP
+.RS 4
+.nf
+[status]
+position = bottom
+.fi
+.RE
+.SS Keys
+.TP
+.B keys.prefix
+Change the prefix key.
+Accepts
+.BR C\- \fIx\fR
+notation or a named key (see
+.B Key Names
+below).
+Default:
+.BR C\-a .
+.TP
+.B status.format
+Status bar format string.
+Supports variable expansion and built-in functions.
+.TP
+.B status.position
+Status bar position:
+.BR top " or " bottom .
+Default:
+.BR top .
+.TP
+.B status.shell_allow
+Comma-separated
+.BR fnmatch (3)
+patterns for shell commands allowed in status bar
+.B $(shell ...)
+expansions.
+.TP
+.B ui.theme
+Name of the theme to use for turbo mode window decorations.
+.SS Bindings
+Key bindings are declared in a
+.B [bind]
+section.
+Each entry maps a key name to an action name.
+.PP
+.RS 4
+.nf
+[bind]
+b = prev\-window
+.fi
+.RE
+.PP
+To unbind a key, set its action to
+.BR none .
+.PP
+Named binding layers activate based on predicates and are
+declared with a subsection name:
+.PP
+.RS 4
+.nf
+[bind "vi"]
+match\-title = ^vim
+j = next\-window
+k = prev\-window
+.fi
+.RE
+.PP
+Layer directives:
+.TP
+.B match\-title
+POSIX extended regular expression matched against the window title.
+The layer activates when the focused window title matches.
+.TP
+.B toggle
+Named toggle.
+The layer activates when the toggle is enabled.
+.SS Key Names
+Key names used in
+.B keys.prefix
+and
+.B [bind]
+entries:
+.TP
+.BI C\- x
+Control key.
+.I x
+may be
+.BR a \- z ,
+.BR A \- Z ,
+or
+.BR @ \- _ .
+.TP
+.B space
+Space character.
+.TP
+.B tab
+Tab key.
+.TP
+.BR escape ", " esc
+Escape key.
+.TP
+.B backspace
+Backspace (DEL, 0x7f).
+.TP
+.B quote
+Double-quote character.
+.TP
+.I c
+Any single ASCII character (e.g.\&
+.BR a ", " 0 ", " [ ).
+.SS Action Names
+.TS
+l l.
+Action	Description
+_
+send\-prefix	Send literal prefix key
+new\-window	Create new window
+next\-window	Next window
+prev\-window	Previous window
+select\-0 \- select\-9	Select window by number
+kill\-window	Kill current window
+detach	Detach from session
+window\-list	Show window list
+status\-toggle	Toggle status bar
+apps\-menu	Applications menu
+split\-h	Split horizontally
+split\-v	Split vertically
+next\-pane	Next pane
+prev\-pane	Previous pane
+close\-pane	Close pane
+resize\-pane	Resize pane
+scrollback	Enter scrollback mode
+window\-colors	Window color picker
+minimize	Minimize window
+maximize	Maximize window
+scroll\-lock	Toggle scroll lock
+input\-lock	Toggle input lock
+session\-list	Session picker
+none	Unbind key
+.TE
 .SH ENVIRONMENT
 .TP
 .B LUMI_SESSION
@@ -220,5 +481,14 @@ Used by
 as the default session name when
 .B \-s
 is not given.
+.TP
+.B LUMI_LIBEXEC_PATH
+Override the search path for
+.BI lumi- command
+executables.
+.TP
+.B LUMI_DEBUG
+Set to a file path to enable debug tracing.
+Diagnostic output is appended to the specified file.
 .SH AUTHORS
 Jon Mayo

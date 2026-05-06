@@ -13,6 +13,7 @@ int cmd_list_main(int argc, char **argv);
 int cmd_mserver_main(int argc, char **argv);
 int cmd_new_main(int argc, char **argv);
 int cmd_new_window_main(int argc, char **argv);
+int cmd_proxy_main(int argc, char **argv);
 int cmd_reload_main(int argc, char **argv);
 int cmd_send_input_main(int argc, char **argv);
 int cmd_send_keys_main(int argc, char **argv);

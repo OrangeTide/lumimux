@@ -160,8 +160,13 @@ emit_esc(struct vt_parse *p, int final)
 static void
 emit_osc(struct vt_parse *p)
 {
-	if (p->ops->osc)
+	if (p->ops->osc) {
+		/* trim trailing bytes of a truncated UTF-8 sequence */
+		p->osc_buf[p->osc_len] = '\0';
+		p->osc_len = (int)utf8_trunc(p->osc_buf,
+		    (size_t)p->osc_len + 1);
 		p->ops->osc(p->ctx, p->osc_buf, (size_t)p->osc_len);
+	}
 }
 
 static void

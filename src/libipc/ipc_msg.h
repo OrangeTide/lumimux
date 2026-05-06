@@ -56,6 +56,11 @@
 #define IPC_MSG_ATTR_ENTRIES	0x0323	/* server -> client: k=v entries */
 #define IPC_MSG_ATTR_OK		0x0324	/* server -> client: success */
 
+/* 0x04xx: proxy control (window_id = 0 in proxy envelope) */
+#define IPC_MSG_PROXY_READY	0x0400	/* proxy -> client: initial window list */
+#define IPC_MSG_PROXY_WIN_ADDED	0x0401	/* proxy -> client: new window */
+#define IPC_MSG_PROXY_WIN_REMOVED 0x0402 /* proxy -> client: window died */
+
 /* send a complete message (header + payload). blocks until sent.
  * returns 0 on success, -1 on error. */
 int ipc_msg_send(int fd, uint32_t type, const void *payload, uint32_t len);

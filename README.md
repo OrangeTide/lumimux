@@ -68,8 +68,8 @@ lumi kill -s work
 
 | Command | Description |
 |---------|-------------|
-| `lumi new [-Ad] [-n name] [shell]` | Create a session and attach (`-d` detached, `-A` reattach) |
-| `lumi attach [-s name]` | Attach to an existing session |
+| `lumi new [-Ad] [-f window] [-m mode] [-s name] [shell]` | Create a session and attach (`-d` detached, `-A` reattach) |
+| `lumi attach [-f window] [-m mode] [-s name]` | Attach to an existing session |
 | `lumi detach [-s name]` | Detach a client from its session |
 | `lumi list` | List active sessions |
 | `lumi kill [-s name]` | Terminate a session |
@@ -120,11 +120,35 @@ format, and library dependency graph.
 This is pre-release software under active development.
 
 - Single client per session -- a new attach disconnects the previous one.
-- No vertical splits or copy/paste yet.
 
+## Credits and Inspiration
+
+lumimux draws ideas and inspiration from several projects:
+
+- [GNU Screen][3] -- the original terminal multiplexer. lumimux uses
+  Screen-compatible default keybindings (Ctrl-A prefix) and nomenclature.
+- [tmux][4] -- modern multiplexer whose client-server model and layout
+  persistence informed lumimux's architecture.
+- [dtach][5] -- minimal detach/attach tool. Its single-purpose design
+  influenced the micro-server approach (one process per PTY).
+- [mosh][6] -- mobile shell with speculative local echo and roaming.
+  Inspired lumimux's predictive echo and planned QUIC transport.
+- [DESQview][7] -- Quarterdeck's DOS multitasker. Its guided keystroke
+  menus inspired the prefix-key popup that shows available actions.
+- [Turbo Vision][8] -- Borland's text-mode UI framework. Its overlapping
+  window manager inspired lumimux's turbo attach mode with mouse-driven
+  move, resize, minimize, and maximize.
+- [tvterm][9] -- Terminal emulator built around Turbo Vision (by magiblot)
 ## License
 
 MIT-0 OR Public Domain.
 
 [1]: https://github.com/OrangeTide/makefile
 [2]: doc/DEV.md
+[3]: https://www.gnu.org/software/screen/
+[4]: https://github.com/tmux/tmux
+[5]: https://github.com/crigler/dtach
+[6]: https://mosh.org/
+[7]: https://en.wikipedia.org/wiki/DESQview
+[8]: https://en.wikipedia.org/wiki/Turbo_Vision
+[9]: https://github.com/magiblot/tvterm

@@ -15,7 +15,7 @@
 
 /* ---- themable element descriptors ---- */
 
-#define ELEM_COUNT 7
+#define ELEM_COUNT 12
 
 struct color_elem {
 	const char	*label;
@@ -23,13 +23,18 @@ struct color_elem {
 };
 
 static const struct color_elem elements[ELEM_COUNT] = {
-	{ "Border fg",   offsetof(struct tui_theme, border_fg)  },
-	{ "Border bg",   offsetof(struct tui_theme, border_bg)  },
-	{ "Title fg",    offsetof(struct tui_theme, title_fg)   },
-	{ "Content fg",  offsetof(struct tui_theme, content_fg) },
-	{ "Content bg",  offsetof(struct tui_theme, content_bg) },
-	{ "Select fg",   offsetof(struct tui_theme, sel_fg)     },
-	{ "Select bg",   offsetof(struct tui_theme, sel_bg)     },
+	{ "Border Focused fg",   offsetof(struct tui_theme, focus_fg)          },
+	{ "Border Focused bg",   offsetof(struct tui_theme, focus_bg)          },
+	{ "Border Idle fg",      offsetof(struct tui_theme, unfocus_fg)        },
+	{ "Border Idle bg",      offsetof(struct tui_theme, unfocus_bg)        },
+	{ "Title Focused fg",    offsetof(struct tui_theme, title_focus_fg)    },
+	{ "Title Idle fg",       offsetof(struct tui_theme, title_idle_fg)     },
+	{ "Close Button fg",     offsetof(struct tui_theme, close_fg)          },
+	{ "Tool Button fg",      offsetof(struct tui_theme, tool_fg)           },
+	{ "Status Focused fg",   offsetof(struct tui_theme, status_focus_fg)   },
+	{ "Status Idle fg",      offsetof(struct tui_theme, status_idle_fg)    },
+	{ "Focus Indicator fg",  offsetof(struct tui_theme, indicator_fg)      },
+	{ "Drag Corner fg",      offsetof(struct tui_theme, drag_fg)           },
 };
 
 /* ---- persistent per-window theme storage ---- */

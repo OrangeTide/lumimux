@@ -682,6 +682,55 @@ test_scroll_pos_from_row(void)
 	PASS();
 }
 
+static void
+test_unfocused_cursor(void)
+{
+	struct wm *wm;
+	struct vt_state *vt1, *vt2;
+	const struct vt_cell *scr;
+	const struct tui_theme *theme;
+	int cur_row, cur_col;
+
+	TEST("unfocused window cursor shown with reverse video");
+	wm = wm_new(30, 80);
+	vt1 = vt_state_new(5, 20, 0);
+	vt2 = vt_state_new(5, 20, 0);
+	theme = tui_theme_default();
+
+	/* two windows: win 1 focused, win 2 unfocused */
+	wm_add(wm, 1, vt1, 2, 2, 20, 5);
+	wm_add(wm, 2, vt2, 30, 2, 20, 5);
+	wm_focus(wm, 1);
+
+	/* ensure cursor visible on both */
+	vt1->modes |= VT_MODE_CURSOR_VIS;
+	vt2->modes |= VT_MODE_CURSOR_VIS;
+
+	/* place cursors at known positions */
+	vt1->cursor_row = 0;
+	vt1->cursor_col = 0;
+	vt2->cursor_row = 1;
+	vt2->cursor_col = 3;
+
+	wm_composite(wm, theme);
+	scr = wm_screen(wm);
+
+	/* focused window cursor cell should NOT have reverse added */
+	ASSERT(!(scr[2 * 80 + 2].attrs & VT_ATTR_REVERSE),
+	    "focused cursor cell should not be reversed");
+
+	/* unfocused window cursor cell should have reverse */
+	cur_row = 2 + vt2->cursor_row; /* win y + cursor row */
+	cur_col = 30 + vt2->cursor_col; /* win x + cursor col */
+	ASSERT(scr[cur_row * 80 + cur_col].attrs & VT_ATTR_REVERSE,
+	    "unfocused cursor cell should have REVERSE attr");
+
+	vt_state_free(vt1);
+	vt_state_free(vt2);
+	wm_free(wm);
+	PASS();
+}
+
 int
 main(void)
 {
@@ -709,6 +758,7 @@ main(void)
 	test_scrollbar_visible();
 	test_scrollbar_drag();
 	test_scroll_pos_from_row();
+	test_unfocused_cursor();
 
 	printf("test_wm: %d tests, %d failures\n", test_count, fail_count);
 	return fail_count > 0 ? 1 : 0;

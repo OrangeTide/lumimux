@@ -32,6 +32,9 @@ jobs:
       - name: Unit tests
         run: make run-tests
 
+      - name: Create symlinks
+        run: make symlinks
+
       - name: Smoke tests
         run: tests/smoke.sh
 
@@ -45,6 +48,9 @@ jobs:
 
       - name: Unit tests (release)
         run: make run-tests RELEASE=1
+
+      - name: Create symlinks (release)
+        run: make symlinks RELEASE=1
 
       - name: Smoke tests (release)
         run: tests/smoke.sh

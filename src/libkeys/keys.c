@@ -203,9 +203,15 @@ keys_default(struct keys *k)
 	lay->bindings['m'] = KEYS_ACTION_MINIMIZE;
 	lay->bindings['f'] = KEYS_ACTION_MAXIMIZE;
 
+	/* per-window customization */
+	lay->bindings['P'] = KEYS_ACTION_WINDOW_COLORS;
+
 	/* per-window locks */
 	lay->bindings['S'] = KEYS_ACTION_SCROLL_LOCK;
 	lay->bindings['I'] = KEYS_ACTION_INPUT_LOCK;
+
+	/* session management */
+	lay->bindings['U'] = KEYS_ACTION_SESSION_LIST;
 }
 
 void
@@ -435,6 +441,7 @@ static const struct {
 	{ "maximize",		KEYS_ACTION_MAXIMIZE },
 	{ "scroll-lock",	KEYS_ACTION_SCROLL_LOCK },
 	{ "input-lock",		KEYS_ACTION_INPUT_LOCK },
+	{ "session-list",	KEYS_ACTION_SESSION_LIST },
 	{ "none",		KEYS_ACTION_NONE },
 };
 

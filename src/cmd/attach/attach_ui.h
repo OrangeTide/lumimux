@@ -47,6 +47,7 @@ extern int menu_visible;
 extern int picker_visible;
 extern int apps_menu_visible;
 extern int color_picker_visible;
+extern int session_picker_visible;
 extern const struct app *active_app;
 extern struct app_ctx app_context;
 
@@ -64,6 +65,8 @@ void render_status_line(int fd, int rows, int cols);
 
 int mconn_focused_fd(void);
 void micro_select_window(uint32_t id);
+const char *micro_current_session(void);
+void micro_switch_session(struct iox_loop *loop, const char *name);
 void dispatch_action(struct iox_loop *loop, enum keys_action action);
 
 /* per-window theme helpers (implemented in attach.c, used by color_picker) */

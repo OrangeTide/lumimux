@@ -9,6 +9,7 @@
 #include "rune_width.h"
 #include "utf8.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -279,9 +280,7 @@ wm_set_title(struct wm *wm, uint32_t id, const char *title)
 
 	if (!win)
 		return;
-	len = strlen(title);
-	if (len >= WM_TITLE_MAX)
-		len = WM_TITLE_MAX - 1;
+	len = utf8_trunc(title, WM_TITLE_MAX);
 	memcpy(win->title, title, len);
 	win->title[len] = '\0';
 }
@@ -445,10 +444,8 @@ draw_frame(struct wm *wm, const struct wm_window *win,
     const struct tui_theme *theme)
 {
 	int fx, fy, fw, fh, r, c;
-	struct vt_color bfg = win->focused ?
-	    theme->title_fg : theme->border_fg;
-	struct vt_color bbg = theme->border_bg;
-	uint16_t battrs = win->focused ? VT_ATTR_BOLD : 0;
+	struct vt_color bfg = win->focused ? theme->focus_fg : theme->unfocus_fg;
+	struct vt_color bbg = win->focused ? theme->focus_bg : theme->unfocus_bg;
 
 	/* frame bounds */
 	fx = win->x - 1;
@@ -458,12 +455,12 @@ draw_frame(struct wm *wm, const struct wm_window *win,
 
 	/* top border */
 	screen_puts(wm, fy, fx, theme->border[TUI_BORDER_TL],
-	    bfg, bbg, battrs, 1);
+	    bfg, bbg, 0, 1);
 	for (c = fx + 1; c < fx + fw - 1; c++)
 		screen_puts(wm, fy, c, theme->border[TUI_BORDER_T],
-		    bfg, bbg, battrs, 1);
+		    bfg, bbg, 0, 1);
 	screen_puts(wm, fy, fx + fw - 1, theme->border[TUI_BORDER_TR],
-	    bfg, bbg, battrs, 1);
+	    bfg, bbg, 0, 1);
 
 	/* count status icons to reserve space on title bar */
 	{
@@ -481,24 +478,36 @@ draw_frame(struct wm *wm, const struct wm_window *win,
 		/* show all three buttons if there's room, else just close */
 		nbtns = (fw >= 12) ? 9 : 3;
 
-		/* title */
-		if (win->title[0]) {
-			int tlen = (int)strlen(win->title);
-			/* borders + brackets + buttons + icon slots */
-			int avail = fw - nbtns - 1 - nicons;
-			int start;
+		/* focus indicator + title */
+		{
+			int start = fx + 1;
 
-			if (avail < 0)
-				avail = 0;
-			if (tlen > avail)
-				tlen = avail;
-			start = fx + 1;
-			screen_puts(wm, fy, start, theme->title_l,
-			    theme->title_fg, bbg, VT_ATTR_BOLD, 1);
-			screen_puts(wm, fy, start + 1, win->title,
-			    theme->title_fg, bbg, VT_ATTR_BOLD, tlen);
-			screen_puts(wm, fy, start + 1 + tlen, theme->title_r,
-			    theme->title_fg, bbg, VT_ATTR_BOLD, 1);
+			/* focus indicator: ☼ for focused, space for unfocused */
+			screen_put(wm, fy, start,
+			    win->focused ? 0x263C : ' ',  /* ☼ */
+			    theme->indicator_fg, bbg, VT_ATTR_BOLD);
+			start++;
+
+			if (win->title[0]) {
+				struct vt_color tfg = win->focused ?
+				    theme->title_focus_fg :
+				    theme->title_idle_fg;
+				int tlen = (int)strlen(win->title);
+				/* indicator + brackets + buttons + icon slots */
+				int avail = fw - nbtns - 2 - nicons;
+
+				if (avail < 0)
+					avail = 0;
+				if (tlen > avail)
+					tlen = avail;
+				screen_puts(wm, fy, start, theme->title_l,
+				    tfg, bbg, VT_ATTR_BOLD, 1);
+				screen_puts(wm, fy, start + 1, win->title,
+				    tfg, bbg, VT_ATTR_BOLD, tlen);
+				screen_puts(wm, fy, start + 1 + tlen,
+				    theme->title_r,
+				    tfg, bbg, VT_ATTR_BOLD, 1);
+			}
 		}
 
 		/* buttons on top-right: [_][+][x] or just [x] */
@@ -506,30 +515,30 @@ draw_frame(struct wm *wm, const struct wm_window *win,
 			int mx = fx + fw - 10;
 
 			/* minimize [_] */
-			screen_put(wm, fy, mx, '[', bfg, bbg, battrs);
+			screen_put(wm, fy, mx, '[', bfg, bbg, VT_ATTR_BOLD);
 			screen_put(wm, fy, mx + 1, '_',
-			    theme->title_fg, bbg, VT_ATTR_BOLD);
-			screen_put(wm, fy, mx + 2, ']', bfg, bbg, battrs);
+			    theme->tool_fg, bbg, VT_ATTR_BOLD);
+			screen_put(wm, fy, mx + 2, ']', bfg, bbg, VT_ATTR_BOLD);
 
 			/* maximize [+] or restore [=] */
-			screen_put(wm, fy, mx + 3, '[', bfg, bbg, battrs);
+			screen_put(wm, fy, mx + 3, '[', bfg, bbg, VT_ATTR_BOLD);
 			screen_put(wm, fy, mx + 4,
 			    win->maximized ? '=' : '+',
-			    theme->title_fg, bbg, VT_ATTR_BOLD);
-			screen_put(wm, fy, mx + 5, ']', bfg, bbg, battrs);
+			    theme->tool_fg, bbg, VT_ATTR_BOLD);
+			screen_put(wm, fy, mx + 5, ']', bfg, bbg, VT_ATTR_BOLD);
 
 			/* close [x] */
-			screen_put(wm, fy, mx + 6, '[', bfg, bbg, battrs);
+			screen_put(wm, fy, mx + 6, '[', bfg, bbg, VT_ATTR_BOLD);
 			screen_put(wm, fy, mx + 7, 'x',
-			    theme->sel_fg, bbg, VT_ATTR_BOLD);
-			screen_put(wm, fy, mx + 8, ']', bfg, bbg, battrs);
+			    theme->close_fg, bbg, VT_ATTR_BOLD);
+			screen_put(wm, fy, mx + 8, ']', bfg, bbg, VT_ATTR_BOLD);
 		} else if (fw >= 6) {
 			int cx = fx + fw - 4;
 
-			screen_put(wm, fy, cx, '[', bfg, bbg, battrs);
+			screen_put(wm, fy, cx, '[', bfg, bbg, VT_ATTR_BOLD);
 			screen_put(wm, fy, cx + 1, 'x',
-			    theme->sel_fg, bbg, VT_ATTR_BOLD);
-			screen_put(wm, fy, cx + 2, ']', bfg, bbg, battrs);
+			    theme->close_fg, bbg, VT_ATTR_BOLD);
+			screen_put(wm, fy, cx + 2, ']', bfg, bbg, VT_ATTR_BOLD);
 		}
 
 		/* status icons right before buttons */
@@ -537,20 +546,32 @@ draw_frame(struct wm *wm, const struct wm_window *win,
 		if (icol < fx + 1)
 			icol = fx + 1;
 		if (win->flags & WM_WIN_DEAD) {
+			struct vt_color sfg = win->focused ?
+			    theme->status_focus_fg :
+			    theme->status_idle_fg;
+
 			screen_puts(wm, fy, icol, theme->icon_dead,
-			    theme->sel_fg, bbg, VT_ATTR_BOLD, 1);
+			    sfg, bbg, VT_ATTR_BOLD, 1);
 			icol++;
 		}
 		if (win->flags & WM_WIN_SCROLL_LOCK) {
+			struct vt_color sfg = win->focused ?
+			    theme->status_focus_fg :
+			    theme->status_idle_fg;
+
 			screen_puts(wm, fy, icol,
 			    theme->icon_scroll_lock,
-			    theme->title_fg, bbg, VT_ATTR_BOLD, 1);
+			    sfg, bbg, VT_ATTR_BOLD, 1);
 			icol++;
 		}
 		if (win->flags & WM_WIN_INPUT_LOCK) {
+			struct vt_color sfg = win->focused ?
+			    theme->status_focus_fg :
+			    theme->status_idle_fg;
+
 			screen_puts(wm, fy, icol,
 			    theme->icon_input_lock,
-			    theme->title_fg, bbg, VT_ATTR_BOLD, 1);
+			    sfg, bbg, VT_ATTR_BOLD, 1);
 			icol++;
 		}
 	}
@@ -558,9 +579,9 @@ draw_frame(struct wm *wm, const struct wm_window *win,
 	/* side borders */
 	for (r = fy + 1; r < fy + fh - 1; r++) {
 		screen_puts(wm, r, fx, theme->border[TUI_BORDER_L],
-		    bfg, bbg, battrs, 1);
+		    bfg, bbg, 0, 1);
 		screen_puts(wm, r, fx + fw - 1, theme->border[TUI_BORDER_R],
-		    bfg, bbg, battrs, 1);
+		    bfg, bbg, 0, 1);
 	}
 
 	/* scrollbar overlays right border when active */
@@ -574,7 +595,8 @@ draw_frame(struct wm *wm, const struct wm_window *win,
 		int thumb_cells, thumb_start;
 		float len = win->scroll_len;
 		float pos = win->scroll_pos;
-		struct vt_color tfg = theme->title_fg;
+		struct vt_color tfg = win->focused ?
+		    theme->title_focus_fg : theme->title_idle_fg;
 		struct vt_color sbg = bbg;
 
 		if (has_arrows) {
@@ -623,12 +645,12 @@ draw_frame(struct wm *wm, const struct wm_window *win,
 
 	/* bottom border */
 	screen_puts(wm, fy + fh - 1, fx, theme->border[TUI_BORDER_BL],
-	    bfg, bbg, battrs, 1);
+	    bfg, bbg, 0, 1);
 	for (c = fx + 1; c < fx + fw - 1; c++)
 		screen_puts(wm, fy + fh - 1, c, theme->border[TUI_BORDER_B],
-		    bfg, bbg, battrs, 1);
+		    bfg, bbg, 0, 1);
 	screen_puts(wm, fy + fh - 1, fx + fw - 1,
-	    theme->border[TUI_BORDER_BR], bfg, bbg, battrs, 1);
+	    theme->border[TUI_BORDER_BR], bfg, bbg, 0, 1);
 }
 
 static void
@@ -698,6 +720,41 @@ wm_composite(struct wm *wm, const struct tui_theme *theme)
 		draw_shadow(wm, win, wt);
 		draw_frame(wm, win, wt);
 		draw_content(wm, win);
+
+		/* show cursor position in unfocused windows via
+		 * reverse video so the user can see where each
+		 * window's cursor sits without switching focus */
+		if (!win->focused && win->vt &&
+		    (win->vt->modes & VT_MODE_CURSOR_VIS)) {
+			struct vt_cell *cell;
+
+			cell = screen_cell(wm,
+			    win->y + win->vt->cursor_row,
+			    win->x + win->vt->cursor_col);
+			if (cell)
+				cell->attrs ^= VT_ATTR_REVERSE;
+		}
+	}
+
+	/* overlay "WxH" size indicator centered in the window being resized */
+	if (wm->drag == WM_DRAG_RESIZING) {
+		struct wm_window *dw = wm_find(wm, wm->drag_id);
+
+		if (dw && dw->w >= 5 && dw->h >= 1) {
+			char label[32];
+			int len, lx, ly;
+			struct vt_color fg = { VT_COLOR_INDEXED, { .index = 15 } };
+			struct vt_color bg = { VT_COLOR_INDEXED, { .index = 0 } };
+
+			len = snprintf(label, sizeof(label), "%dx%d",
+			    dw->w, dw->h);
+			if (len > dw->w)
+				len = dw->w;
+			lx = dw->x + (dw->w - len) / 2;
+			ly = dw->y + dw->h / 2;
+			screen_puts(wm, ly, lx, label,
+			    fg, bg, VT_ATTR_BOLD, len);
+		}
 	}
 }
 
