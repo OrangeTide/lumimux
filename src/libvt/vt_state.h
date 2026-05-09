@@ -19,7 +19,7 @@ enum vt_target {
 	VT_TARGET_COUNT,
 };
 
-/* terminal mode flags (DECSET/DECRST) */
+/* terminal mode flags (DECSET/DECRST and ESC-based modes) */
 #define VT_MODE_AUTOWRAP	(1u << 0)
 #define VT_MODE_CURSOR_VIS	(1u << 1)
 #define VT_MODE_ORIGIN		(1u << 2)
@@ -27,6 +27,7 @@ enum vt_target {
 #define VT_MODE_ALTSCREEN	(1u << 4)
 #define VT_MODE_BRACKETPASTE	(1u << 5)
 #define VT_MODE_DECCKM		(1u << 6)
+#define VT_MODE_DECKPAM		(1u << 7)
 
 /* saved cursor state (DECSC/DECRC) */
 struct vt_saved_cursor {
@@ -70,6 +71,10 @@ struct vt_state {
 
 	/* reply fd for DSR/DA responses (-1 = disabled) */
 	int		reply_fd;
+
+	/* keyboard enhancement protocols */
+	int		kitty_kbd_flags;	/* CSI > flags u (0 = off) */
+	int		modify_other_keys;	/* CSI > 4 ; Pm m (0 = off) */
 
 	/* window title set by OSC 0/2 */
 	char		*title;

@@ -6,7 +6,9 @@
 #include "tio_write.h"
 #include "utf8.h"
 
+#include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 /* ---- selection state ---- */
@@ -16,6 +18,7 @@ static int sel_visible;			/* selection shown (after release) */
 static uint32_t sel_win_id;
 static int sel_sr, sel_sc;		/* start (anchor) */
 static int sel_er, sel_ec;		/* end (current drag point) */
+static int sel_col_min, sel_col_max;	/* window content column bounds */
 
 /* ---- clipboard buffer ---- */
 
@@ -70,10 +73,59 @@ sel_normalize(int *r0, int *c0, int *r1, int *c1)
 	}
 }
 
+/* ---- clipboard tool fallback ---- */
+
+static void
+clipboard_tool_copy(const char *text, size_t len)
+{
+	int pfd[2];
+	pid_t pid;
+
+	if (len == 0)
+		return;
+	if (pipe(pfd) < 0)
+		return;
+
+	pid = fork();
+	if (pid < 0) {
+		close(pfd[0]);
+		close(pfd[1]);
+		return;
+	}
+
+	if (pid == 0) {
+		/* double-fork so the parent can reap immediately */
+		pid_t pid2 = fork();
+
+		if (pid2 != 0)
+			_exit(0);
+
+		close(pfd[1]);
+		dup2(pfd[0], STDIN_FILENO);
+		close(pfd[0]);
+		close(STDOUT_FILENO);
+		close(STDERR_FILENO);
+
+		if (getenv("WAYLAND_DISPLAY"))
+			execlp("wl-copy", "wl-copy", (char *)NULL);
+		execlp("xclip", "xclip", "-selection", "clipboard",
+		    (char *)NULL);
+		execlp("xsel", "xsel", "--clipboard", "--input",
+		    (char *)NULL);
+		execlp("pbcopy", "pbcopy", (char *)NULL);
+		_exit(1);
+	}
+
+	close(pfd[0]);
+	write(pfd[1], text, len);
+	close(pfd[1]);
+	waitpid(pid, NULL, 0);
+}
+
 /* ---- public API ---- */
 
 void
-sel_begin(uint32_t win_id, int row, int col)
+sel_begin(uint32_t win_id, int row, int col, int win_x, int win_w)
 {
 	sel_dragging = 1;
 	sel_visible = 0;
@@ -82,6 +134,8 @@ sel_begin(uint32_t win_id, int row, int col)
 	sel_sc = col;
 	sel_er = row;
 	sel_ec = col;
+	sel_col_min = win_x;
+	sel_col_max = win_x + win_w - 1;
 }
 
 void
@@ -106,8 +160,8 @@ sel_finish(const struct vt_cell *screen, int rows, int cols)
 
 	pos = 0;
 	for (r = r0; r <= r1 && r < rows; r++) {
-		start = (r == r0) ? c0 : 0;
-		end = (r == r1) ? c1 : cols - 1;
+		start = (r == r0) ? c0 : sel_col_min;
+		end = (r == r1) ? c1 : sel_col_max;
 		if (start < 0)
 			start = 0;
 		if (end >= cols)
@@ -174,6 +228,8 @@ sel_finish(const struct vt_cell *screen, int rows, int cols)
 		tio_write(STDOUT_FILENO, trl, sizeof(trl) - 1);
 		tio_flush(STDOUT_FILENO);
 	}
+
+	clipboard_tool_copy(copy_buf, copy_len);
 }
 
 void
@@ -203,8 +259,8 @@ sel_highlight(struct vt_cell *screen, int rows, int cols)
 	for (r = r0; r <= r1 && r < rows; r++) {
 		if (r < 0)
 			continue;
-		start = (r == r0) ? c0 : 0;
-		end = (r == r1) ? c1 : cols - 1;
+		start = (r == r0) ? c0 : sel_col_min;
+		end = (r == r1) ? c1 : sel_col_max;
 		if (start < 0)
 			start = 0;
 		if (end >= cols)
@@ -224,4 +280,10 @@ size_t
 sel_copy_len(void)
 {
 	return copy_len;
+}
+
+void
+sel_clipboard_sync(void)
+{
+	clipboard_tool_copy(copy_buf, copy_len);
 }

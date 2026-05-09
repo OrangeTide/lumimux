@@ -526,8 +526,28 @@ op_csi(void *ctx, const int *params, int nparam, int intermed, int final)
 		return;
 	}
 
+	/* keyboard enhancement protocol sequences */
+	if (intermed == '>' && final == 'u') {
+		/* CSI > flags u -- kitty keyboard protocol push */
+		st->kitty_kbd_flags = param_or(params, nparam, 0, 0);
+		return;
+	}
+	if (intermed == '<' && final == 'u') {
+		/* CSI < u -- kitty keyboard protocol pop */
+		st->kitty_kbd_flags = 0;
+		return;
+	}
+	if (intermed == '>' && final == 'm') {
+		n = param_or(params, nparam, 0, 0);
+		if (n == 4) {
+			/* CSI > 4 ; Pm m -- xterm modifyOtherKeys */
+			st->modify_other_keys = param_or(params, nparam, 1, 0);
+		}
+		return;
+	}
+
 	/* ignore sequences with any private modifier or intermediate byte
-	 * that we don't handle (CSI > ..., CSI = ..., CSI ! p, etc.) */
+	 * that we don't handle (CSI = ..., CSI ! p, etc.) */
 	if (intermed != 0)
 		return;
 
@@ -778,6 +798,12 @@ op_esc(void *ctx, int intermed, int final)
 				    st->scroll_bot, -1);
 			}
 			break;
+		case '=':	/* DECKPAM -- application keypad mode */
+			st->modes |= VT_MODE_DECKPAM;
+			break;
+		case '>':	/* DECKPNM -- normal keypad mode */
+			st->modes &= ~VT_MODE_DECKPAM;
+			break;
 		case 'c':	/* RIS -- full reset */
 			if (st->modes & VT_MODE_ALTSCREEN)
 				vt_state_altscreen_leave(st);
@@ -792,6 +818,8 @@ op_esc(void *ctx, int intermed, int final)
 			st->scroll_bot = vt_buf_rows(st->buf);
 			st->cursor_row = 0;
 			st->cursor_col = 0;
+			st->kitty_kbd_flags = 0;
+			st->modify_other_keys = 0;
 			vt_state_tab_reset(st);
 			csi_erase_display(st, 2);
 			break;

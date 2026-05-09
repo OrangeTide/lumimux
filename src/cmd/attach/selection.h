@@ -11,8 +11,9 @@
 #include <stdint.h>
 
 /* start a new selection at screen coordinate (row, col).
- * win_id identifies the window (used for context, 0 for tiled mode). */
-void sel_begin(uint32_t win_id, int row, int col);
+ * win_id identifies the window (used for context, 0 for tiled mode).
+ * win_x/win_w set the content column bounds (0, screen_cols for fullscreen). */
+void sel_begin(uint32_t win_id, int row, int col, int win_x, int win_w);
 
 /* extend the selection to (row, col) during drag. */
 void sel_update(int row, int col);
@@ -34,5 +35,8 @@ void sel_highlight(struct vt_cell *screen, int rows, int cols);
 /* return pointer and length of the last copied text (for paste). */
 const char *sel_copy_buf(void);
 size_t sel_copy_len(void);
+
+/* re-send internal clipboard to system clipboard via external tools. */
+void sel_clipboard_sync(void);
 
 #endif /* SELECTION_H */

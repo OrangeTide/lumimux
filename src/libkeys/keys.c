@@ -212,6 +212,10 @@ keys_default(struct keys *k)
 
 	/* session management */
 	lay->bindings['U'] = KEYS_ACTION_SESSION_LIST;
+
+	/* clipboard */
+	lay->bindings[']'] = KEYS_ACTION_PASTE;
+	lay->bindings['y'] = KEYS_ACTION_CLIPBOARD_SYNC;
 }
 
 void
@@ -442,6 +446,8 @@ static const struct {
 	{ "scroll-lock",	KEYS_ACTION_SCROLL_LOCK },
 	{ "input-lock",		KEYS_ACTION_INPUT_LOCK },
 	{ "session-list",	KEYS_ACTION_SESSION_LIST },
+	{ "paste",		KEYS_ACTION_PASTE },
+	{ "clipboard-sync",	KEYS_ACTION_CLIPBOARD_SYNC },
 	{ "none",		KEYS_ACTION_NONE },
 };
 

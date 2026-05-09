@@ -125,9 +125,27 @@ sim_dispatch_input(const struct tkbd_seq *seq)
 		return;
 	}
 
-	/* prefix key state machine */
-	if (seq->ch < 256) {
-		action = keys_feed(keybinds, (uint8_t)seq->ch);
+	/* prefix key state machine -- synthesize C0 byte from key+modifier */
+	uint32_t feed_ch = seq->ch;
+
+	if (feed_ch >= 256 && (seq->mod & TKBD_MOD_CTRL)) {
+		if (seq->key >= TKBD_KEY_A && seq->key <= TKBD_KEY_Z)
+			feed_ch = seq->key & 0x1F;
+		else if (seq->key >= TKBD_KEY_BACKSLASH &&
+		    seq->key <= TKBD_KEY_UNDERSCORE)
+			feed_ch = seq->key & 0x1F;
+		else if (seq->key == TKBD_KEY_AT ||
+		    seq->key == TKBD_KEY_SPACE)
+			feed_ch = 0x00;
+	} else if (feed_ch >= 256) {
+		if (seq->key >= TKBD_KEY_A && seq->key <= TKBD_KEY_Z)
+			feed_ch = seq->key + 0x20;
+		else if (seq->key >= 0x20 && seq->key <= 0x7E)
+			feed_ch = seq->key;
+	}
+
+	if (feed_ch < 256) {
+		action = keys_feed(keybinds, (uint8_t)feed_ch);
 
 		if (action == KEYS_ACTION_CONSUMED)
 			return;
@@ -345,6 +363,43 @@ test_fast_ctrl_a_ctrl_n(void)
 	PASS();
 }
 
+static void
+test_kitty_ctrl_a_space(void)
+{
+	TEST("kitty CSI 97;5u + space -> NEXT_WINDOW");
+	reset_state();
+	/* CSI 97;5u = Ctrl-A in kitty keyboard protocol */
+	sim_read_batch("\x1b[97;5u ", 8);
+	ASSERT(action_count == 1, "expected 1 action");
+	ASSERT(action_log[0] == KEYS_ACTION_NEXT_WINDOW, "expected NEXT_WINDOW");
+	ASSERT(forward_count == 0, "no bytes forwarded");
+	PASS();
+}
+
+static void
+test_kitty_ctrl_a_ctrl_a(void)
+{
+	TEST("kitty CSI 97;5u twice -> SEND_PREFIX");
+	reset_state();
+	sim_read_batch("\x1b[97;5u\x1b[97;5u", 14);
+	ASSERT(action_count == 1, "expected 1 action");
+	ASSERT(action_log[0] == KEYS_ACTION_SEND_PREFIX, "expected SEND_PREFIX");
+	ASSERT(forward_count == 0, "no bytes forwarded");
+	PASS();
+}
+
+static void
+test_kitty_ctrl_a_n(void)
+{
+	TEST("kitty CSI 97;5u + n -> NEXT_WINDOW");
+	reset_state();
+	sim_read_batch("\x1b[97;5un", 8);
+	ASSERT(action_count == 1, "expected 1 action");
+	ASSERT(action_log[0] == KEYS_ACTION_NEXT_WINDOW, "expected NEXT_WINDOW");
+	ASSERT(forward_count == 0, "no bytes forwarded");
+	PASS();
+}
+
 int
 main(void)
 {
@@ -367,6 +422,9 @@ main(void)
 	test_no_forward_on_prefix_space();
 	test_fast_ctrl_a_ctrl_space();
 	test_fast_ctrl_a_ctrl_n();
+	test_kitty_ctrl_a_space();
+	test_kitty_ctrl_a_ctrl_a();
+	test_kitty_ctrl_a_n();
 
 	keys_free(keybinds);
 

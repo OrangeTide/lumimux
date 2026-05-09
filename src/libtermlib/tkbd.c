@@ -533,9 +533,65 @@ static int parse_special_seq(struct tkbd_seq *seq, const char *buf, int len)
 		else if (parms[0])
 			seq->mod = parms[0] - 1;
 
-	} else if (seqtype == 'O' && finalbyte >= 'P' && finalbyte <= 'S') {
-		// \E[OP-\E[OS = F1-F4
-		seq->key = TKBD_KEY_F1 + finalbyte - 'P';
+	} else if (seqtype == 'O' && finalbyte >= 'A' && finalbyte <= 'S') {
+		// SS3 key table: arrows, home, end, keypad enter, F1-F4
+		static const uint16_t ss3_key_table[] = {
+			TKBD_KEY_UP,		// A
+			TKBD_KEY_DOWN,		// B
+			TKBD_KEY_RIGHT,		// C
+			TKBD_KEY_LEFT,		// D
+			TKBD_KEY_UNKNOWN,	// E (KP_Begin)
+			TKBD_KEY_END,		// F
+			TKBD_KEY_UNKNOWN,	// G
+			TKBD_KEY_HOME,		// H
+			TKBD_KEY_UNKNOWN,	// I
+			TKBD_KEY_UNKNOWN,	// J
+			TKBD_KEY_UNKNOWN,	// K
+			TKBD_KEY_UNKNOWN,	// L
+			TKBD_KEY_ENTER,		// M (KP_Enter)
+			TKBD_KEY_UNKNOWN,	// N
+			TKBD_KEY_UNKNOWN,	// O
+			TKBD_KEY_F1,		// P
+			TKBD_KEY_F2,		// Q
+			TKBD_KEY_F3,		// R
+			TKBD_KEY_F4,		// S
+		};
+		seq->key = ss3_key_table[finalbyte - 'A'];
+
+		// modifier parameter (e.g. ESC O 2 P = Shift+F1)
+		if (parmdata[0]) {
+			int parms[1] = {0};
+			parse_seq_params(parms, ARRAYLEN(parms), parmdata);
+			if (parms[0])
+				seq->mod = parms[0] - 1;
+		}
+
+	} else if (seqtype == '[' && finalbyte == 'u') {
+		// CSI keycode ; modifiers u -- kitty keyboard protocol
+		int parms[2] = {0};
+		parse_seq_params(parms, ARRAYLEN(parms), parmdata);
+
+		switch (parms[0]) {
+		case 8:		seq->key = TKBD_KEY_BACKSPACE; break;
+		case 9:		seq->key = TKBD_KEY_TAB; break;
+		case 13:	seq->key = TKBD_KEY_ENTER; break;
+		case 27:	seq->key = TKBD_KEY_ESC; break;
+		case 32:	seq->key = TKBD_KEY_SPACE; break;
+		case 127:	seq->key = TKBD_KEY_BACKSPACE2; break;
+		default:
+			if (parms[0] >= 'a' && parms[0] <= 'z')
+				seq->key = TKBD_KEY_A + (parms[0] - 'a');
+			else if (parms[0] >= '0' && parms[0] <= '9')
+				seq->key = parms[0];
+			else if (parms[0] >= 0x20 && parms[0] <= 0x7E)
+				seq->key = parms[0];
+			else
+				seq->key = TKBD_KEY_UNKNOWN;
+			break;
+		}
+
+		if (parms[1])
+			seq->mod = parms[1] - 1;
 
 	} else {
 		// we dont have a mapping for this key but we know we received a
@@ -702,8 +758,8 @@ static int parse_mouse_seq(struct tkbd_seq *seq, const char *buf, int len)
 		if ((n1&32) != 0)
 			seq->mod |= TKBD_MOD_MOTION;
 
-		seq->x = (uint8_t)n2 - 1;
-		seq->y = (uint8_t)n3 - 1;
+		seq->x = n2 - 1;
+		seq->y = n3 - 1;
 
 		return mi + 1;
 	}

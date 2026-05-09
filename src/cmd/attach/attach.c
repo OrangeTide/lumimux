@@ -560,9 +560,11 @@ static int cascade_x = 2, cascade_y = 2;
 
 /* ---- terminal mode forwarding ---- */
 
-#define FORWARD_MODES (VT_MODE_DECCKM | VT_MODE_BRACKETPASTE)
+#define FORWARD_MODES (VT_MODE_DECCKM | VT_MODE_BRACKETPASTE | VT_MODE_DECKPAM)
 static unsigned synced_modes;
 static int synced_cursor_shape;
+static int synced_kitty_kbd;
+static int synced_modify_other_keys;
 
 static void
 emit_mode(int mode, int on)
@@ -601,6 +603,11 @@ sync_terminal_modes(unsigned new_modes)
 		emit_mode(1, new_modes & VT_MODE_DECCKM);
 	if (changed & VT_MODE_BRACKETPASTE)
 		emit_mode(2004, new_modes & VT_MODE_BRACKETPASTE);
+	if (changed & VT_MODE_DECKPAM) {
+		const char *s = (new_modes & VT_MODE_DECKPAM) ?
+		    "\033=" : "\033>";
+		tio_write(STDOUT_FILENO, s, 2);
+	}
 	tio_flush(STDOUT_FILENO);
 	synced_modes = new_modes & FORWARD_MODES;
 }
@@ -616,15 +623,64 @@ sync_cursor_shape(int shape)
 }
 
 static void
+sync_keyboard_proto(struct vt_state *st)
+{
+	int flags = st->kitty_kbd_flags;
+	int mok = st->modify_other_keys;
+	char buf[32];
+	int n;
+	int dirty = 0;
+
+	if (flags != synced_kitty_kbd) {
+		if (flags) {
+			n = snprintf(buf, sizeof(buf),
+			    "\033[>%du", flags);
+		} else {
+			n = snprintf(buf, sizeof(buf), "\033[<u");
+		}
+		tio_write(STDOUT_FILENO, buf, n);
+		synced_kitty_kbd = flags;
+		dirty = 1;
+	}
+
+	if (mok != synced_modify_other_keys) {
+		n = snprintf(buf, sizeof(buf),
+		    "\033[>4;%dm", mok);
+		tio_write(STDOUT_FILENO, buf, n);
+		synced_modify_other_keys = mok;
+		dirty = 1;
+	}
+
+	if (dirty)
+		tio_flush(STDOUT_FILENO);
+}
+
+static void
 reset_terminal_modes(void)
 {
+	int dirty = synced_modes || synced_cursor_shape;
+
 	if (synced_modes & VT_MODE_DECCKM)
 		emit_mode(1, 0);
 	if (synced_modes & VT_MODE_BRACKETPASTE)
 		emit_mode(2004, 0);
+	if (synced_modes & VT_MODE_DECKPAM) {
+		tio_write(STDOUT_FILENO, "\033>", 2);
+		dirty = 1;
+	}
 	if (synced_cursor_shape != 0)
 		emit_cursor_shape(0);
-	if (synced_modes || synced_cursor_shape)
+	if (synced_kitty_kbd) {
+		tio_write(STDOUT_FILENO, "\033[<u", 4);
+		synced_kitty_kbd = 0;
+		dirty = 1;
+	}
+	if (synced_modify_other_keys) {
+		tio_write(STDOUT_FILENO, "\033[>4;0m", 7);
+		synced_modify_other_keys = 0;
+		dirty = 1;
+	}
+	if (dirty)
 		tio_flush(STDOUT_FILENO);
 	synced_modes = 0;
 	synced_cursor_shape = 0;
@@ -1024,6 +1080,7 @@ flush_render(void)
 	if (vt && !scrollback_mode) {
 		sync_terminal_modes(vt->modes);
 		sync_cursor_shape(vt->cursor_shape);
+		sync_keyboard_proto(vt);
 	}
 
 	if (need_status && status_visible) {
@@ -1681,6 +1738,8 @@ micro_select_window(uint32_t id)
 
 /* ---- action dispatch ---- */
 
+static void sel_paste(void);
+
 void
 dispatch_action(struct iox_loop *loop, enum keys_action action)
 {
@@ -1940,6 +1999,12 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 		if (client_mode != CLIENT_MODE_MINIMAL)
 			session_picker_show();
 		break;
+	case KEYS_ACTION_PASTE:
+		sel_paste();
+		break;
+	case KEYS_ACTION_CLIPBOARD_SYNC:
+		sel_clipboard_sync();
+		break;
 	default:
 		break;
 	}
@@ -2014,8 +2079,24 @@ handle_mouse_turbo(struct iox_loop *loop, const struct tkbd_seq *seq)
 	if (seq->mod & TKBD_MOD_MOTION) {
 		/* text selection: deferred press -> begin drag */
 		if (sel_pending) {
-			sel_begin(sel_press_id, sel_press_row,
-			    sel_press_col);
+			struct wm_window *sw;
+
+			sw = wm_find(wmgr, sel_press_id);
+			if (sw) {
+				if (row < sw->y)
+					row = sw->y;
+				else if (row >= sw->y + sw->h)
+					row = sw->y + sw->h - 1;
+				if (col < sw->x)
+					col = sw->x;
+				else if (col >= sw->x + sw->w)
+					col = sw->x + sw->w - 1;
+				sel_begin(sel_press_id, sel_press_row,
+				    sel_press_col, sw->x, sw->w);
+			} else {
+				sel_begin(sel_press_id, sel_press_row,
+				    sel_press_col, 0, wm_cols(wmgr));
+			}
 			sel_update(row, col);
 			sel_pending = 0;
 			turbo_need_full = 1;
@@ -2023,6 +2104,19 @@ handle_mouse_turbo(struct iox_loop *loop, const struct tkbd_seq *seq)
 			return;
 		}
 		if (sel_active()) {
+			struct wm_window *sw;
+
+			sw = wm_find(wmgr, sel_press_id);
+			if (sw) {
+				if (row < sw->y)
+					row = sw->y;
+				else if (row >= sw->y + sw->h)
+					row = sw->y + sw->h - 1;
+				if (col < sw->x)
+					col = sw->x;
+				else if (col >= sw->x + sw->w)
+					col = sw->x + sw->w - 1;
+			}
 			sel_update(row, col);
 			turbo_need_full = 1;
 			need_render = 1;
@@ -2327,7 +2421,8 @@ handle_mouse(struct iox_loop *loop, const struct tkbd_seq *seq)
 	/* text selection in tiled/screen mode */
 	if (seq->mod & TKBD_MOD_MOTION) {
 		if (sel_pending) {
-			sel_begin(0, sel_press_row, sel_press_col);
+			sel_begin(0, sel_press_row, sel_press_col,
+			    0, wm_cols(wmgr));
 			sel_update(row, col);
 			sel_pending = 0;
 			tile_need_full = 1;
@@ -2556,9 +2651,29 @@ dispatch_input(struct iox_loop *loop, const struct tkbd_seq *seq)
 		return;
 	}
 
-	/* prefix key state machine (byte-based) */
-	if (seq->ch < 256) {
-		action = keys_feed(keybinds, (uint8_t)seq->ch);
+	/* prefix key state machine (byte-based).
+	 * kitty/SS3 sequences deliver key+modifier without a C0 byte;
+	 * synthesize the control byte that keys_feed expects. */
+	uint32_t feed_ch = seq->ch;
+
+	if (feed_ch >= 256 && (seq->mod & TKBD_MOD_CTRL)) {
+		if (seq->key >= TKBD_KEY_A && seq->key <= TKBD_KEY_Z)
+			feed_ch = seq->key & 0x1F;
+		else if (seq->key >= TKBD_KEY_BACKSLASH &&
+		    seq->key <= TKBD_KEY_UNDERSCORE)
+			feed_ch = seq->key & 0x1F;
+		else if (seq->key == TKBD_KEY_AT ||
+		    seq->key == TKBD_KEY_SPACE)
+			feed_ch = 0x00;
+	} else if (feed_ch >= 256) {
+		if (seq->key >= TKBD_KEY_A && seq->key <= TKBD_KEY_Z)
+			feed_ch = seq->key + 0x20;
+		else if (seq->key >= 0x20 && seq->key <= 0x7E)
+			feed_ch = seq->key;
+	}
+
+	if (feed_ch < 256) {
+		action = keys_feed(keybinds, (uint8_t)feed_ch);
 
 		if (action == KEYS_ACTION_CONSUMED) {
 			/* prefix key received -- the main loop uses a

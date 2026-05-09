@@ -49,6 +49,8 @@ enum keys_action {
 	KEYS_ACTION_SCROLL_LOCK,
 	KEYS_ACTION_INPUT_LOCK,
 	KEYS_ACTION_SESSION_LIST,
+	KEYS_ACTION_PASTE,
+	KEYS_ACTION_CLIPBOARD_SYNC,
 };
 
 /* state of the prefix key state machine */
