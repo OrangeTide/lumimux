@@ -51,6 +51,7 @@ enum keys_action {
 	KEYS_ACTION_SESSION_LIST,
 	KEYS_ACTION_PASTE,
 	KEYS_ACTION_CLIPBOARD_SYNC,
+	KEYS_ACTION_TOGGLE_MODE,
 };
 
 /* state of the prefix key state machine */

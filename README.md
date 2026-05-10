@@ -8,6 +8,7 @@ lumimux is a rewrite of GNU Screen with a git-style sub-command architecture.
 `/usr/lib/lumi-core:~/.local/lib/lumi-core`.
 
 Default keybindings are identical to GNU Screen (Ctrl-A prefix).
+Terminal control code handling is data-driven rather than hard-coded.
 
 ## Building
 
@@ -36,7 +37,7 @@ export LUMI_LIBEXEC_PATH=_out/x86_64-linux-gnu/bin
 alias lumi=_out/x86_64-linux-gnu/bin/lumi
 
 # create a session named "work" and attach
-lumi new -n work
+lumi new -s work
 
 # inside the session:
 #   Ctrl-A c       create a new window
@@ -47,6 +48,9 @@ lumi new -n work
 #   Ctrl-A d       detach (session keeps running)
 #   Ctrl-A w       window picker
 #   Ctrl-A s       toggle status line
+#   Ctrl-A [       scrollback mode (mouse wheel, Page Up/Down)
+#   Ctrl-A t       toggle between turbo and screen modes
+#   Ctrl-A U       session picker
 #   Ctrl-A Ctrl-A  send literal Ctrl-A
 #
 #   Pressing Ctrl-A shows a guided menu of all available actions.
@@ -55,7 +59,10 @@ lumi new -n work
 lumi attach work
 
 # or create-or-reattach in one command
-lumi new -A -n work
+lumi new -A -s work
+
+# attach to a remote session over SSH
+lumi attach user@host:work
 
 # list active sessions
 lumi list
@@ -64,19 +71,49 @@ lumi list
 lumi kill -s work
 ```
 
+## Features
+
+- **Three UI modes:** screen (GNU Screen-like), turbo (overlapping windows
+  with mouse-driven move/resize/minimize/maximize), and minimal (bare
+  passthrough).
+- **Tiled splits:** horizontal and vertical pane splits in screen mode.
+- **Remote sessions:** attach to sessions on remote hosts over SSH
+  (`lumi attach user@host:session`).
+- **Multi-session switching:** jump between sessions with the session
+  picker (Ctrl-A U).
+- **Scrollback:** browse history with keyboard or mouse wheel; mouse drag
+  to select and copy text.
+- **Configurable key bindings:** remap keys, define state-dependent binding
+  layers that activate by window title regex or toggle state.
+- **DCS pass-through:** SIXEL graphics forwarded to the outer terminal.
+- **Speculative local echo:** predicted characters rendered immediately,
+  confirmed or rolled back on server response.
+- **Kitty keyboard protocol:** prefix key recognized in both traditional
+  and kitty CSI u encodings.
+- **Layout persistence:** window positions and sizes saved on detach and
+  restored on reattach.
+- **Per-window customization:** color picker, scroll lock, input lock.
+- **Themes:** 9 built-in themes; user-defined themes via config file.
+- **Config-driven:** gitconfig-style `lumi.conf` for key bindings, status
+  line format, menu colors, and UI theme.
+- **Single static binary:** 330 KB stripped musl build with no runtime
+  dependencies.
+
 ## Commands
 
 | Command | Description |
 |---------|-------------|
 | `lumi new [-Ad] [-f window] [-m mode] [-s name] [shell]` | Create a session and attach (`-d` detached, `-A` reattach) |
-| `lumi attach [-f window] [-m mode] [-s name]` | Attach to an existing session |
+| `lumi attach [-f window] [-m mode] [-s name] [name]` | Attach to a local or remote session |
 | `lumi detach [-s name]` | Detach a client from its session |
 | `lumi list` | List active sessions |
 | `lumi kill [-s name]` | Terminate a session |
-| `lumi new-window [-s name]` | Create a window in a running session |
+| `lumi new-window [-s name] [shell]` | Create a window in a running session |
+| `lumi attr [-s name] get\|set\|delete\|list [key] [value]` | Manage per-session attributes |
 | `lumi version` | Print version information |
 
 The default session name is `0` when not specified.
+Remote sessions use scp-style syntax: `[user@]host:session`.
 
 ## Installation
 
@@ -117,9 +154,9 @@ format, and library dependency graph.
 
 ## Known Issues
 
-This is pre-release software under active development.
-
 - Single client per session -- a new attach disconnects the previous one.
+- QUIC networked connections are not yet implemented (Unix sockets and SSH
+  tunneling only).
 
 ## Credits and Inspiration
 

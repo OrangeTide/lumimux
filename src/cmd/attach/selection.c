@@ -3,6 +3,7 @@
  * Licensed under MIT-0 OR PUBLIC DOMAIN */
 
 #include "selection.h"
+#include "lu_umask.h"
 #include "tio_write.h"
 #include "utf8.h"
 
@@ -105,6 +106,7 @@ clipboard_tool_copy(const char *text, size_t len)
 		close(pfd[0]);
 		close(STDOUT_FILENO);
 		close(STDERR_FILENO);
+		lu_umask_restore();
 
 		if (getenv("WAYLAND_DISPLAY"))
 			execlp("wl-copy", "wl-copy", (char *)NULL);

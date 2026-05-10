@@ -154,6 +154,32 @@
       reconnecting. Layout saved/restored per session. Per-session default
       colors deferred to follow-up.
 
+## Post-release polish
+
+- [x] Bracketed paste forwarding. Outer terminal paste boundaries
+      intercepted and forwarded to the focused window when the child
+      application has enabled DECSET 2004.
+- [x] Kitty keyboard protocol. Prefix key (Ctrl-A) recognized in
+      kitty CSI u encoding (CSI 97;5u). 3 tests in test_input.c.
+- [x] Keyboard enhancement protocol forwarding. XTPUSHSGR and kitty
+      progressive enhancement flags set by child applications forwarded
+      from micro-server to the outer terminal.
+- [x] Host terminal title. Window title changes (OSC 0/2) propagated
+      to the outer terminal immediately. Title updates on focus change.
+- [x] Restrictive umask. umask(077) set at startup so runtime directory
+      and Unix domain sockets are owner-only. Original umask restored
+      for child shell processes.
+- [x] Mouse wheel scrollback. Mouse wheel events scroll through history
+      in scrollback mode.
+- [x] Selection constrained to window bounds. Selection highlight and
+      text extraction clamped to the visible window column range.
+- [x] Clipboard tool fallback. System clipboard sync tries xclip,
+      xsel, and wl-copy in order.
+- [x] Runtime mode toggle. Ctrl-A t switches between turbo and screen
+      layout modes without detaching.
+- [x] Double-buffered dirty tracking. Tile and WM compositors use
+      dirty flags to skip unchanged regions.
+
 ## Done
 
 - [x] Plan file with architecture and phased implementation.

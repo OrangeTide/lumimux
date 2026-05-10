@@ -3,6 +3,7 @@
  * Licensed under MIT-0 OR PUBLIC DOMAIN */
 
 #include "multicall.h"
+#include "lu_umask.h"
 #include "path.h"
 
 #include <libgen.h>
@@ -145,6 +146,8 @@ main(int argc, char **argv)
 	char *base, *copy;
 	const char *cmd;
 	int (*fn)(int, char **);
+
+	lu_umask_save();
 
 	/* symlink dispatch: check if argv[0] is "lumi-<cmd>" */
 	copy = strdup(argv[0] ? argv[0] : "lumi");

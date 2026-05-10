@@ -213,6 +213,9 @@ keys_default(struct keys *k)
 	/* session management */
 	lay->bindings['U'] = KEYS_ACTION_SESSION_LIST;
 
+	/* layout mode toggle */
+	lay->bindings['t'] = KEYS_ACTION_TOGGLE_MODE;
+
 	/* clipboard */
 	lay->bindings[']'] = KEYS_ACTION_PASTE;
 	lay->bindings['y'] = KEYS_ACTION_CLIPBOARD_SYNC;
@@ -448,6 +451,7 @@ static const struct {
 	{ "session-list",	KEYS_ACTION_SESSION_LIST },
 	{ "paste",		KEYS_ACTION_PASTE },
 	{ "clipboard-sync",	KEYS_ACTION_CLIPBOARD_SYNC },
+	{ "toggle-mode",	KEYS_ACTION_TOGGLE_MODE },
 	{ "none",		KEYS_ACTION_NONE },
 };
 

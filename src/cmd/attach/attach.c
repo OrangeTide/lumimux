@@ -4,6 +4,7 @@
 
 #include "attach_ui.h"
 #include "multicall.h"
+#include "lu_umask.h"
 #include "prefix_menu.h"
 #include "picker.h"
 #include "session_picker.h"
@@ -356,6 +357,15 @@ static void remove_window(struct iox_loop *lp, uint32_t pid);
 
 #define SCROLLBACK_LINES 2000
 
+/* per-window layout snapshot: which arrangement algorithm placed this
+ * window and where.  used to decide whether a compositor should recapture
+ * the window (layout.mode != active mode) or restore it in place. */
+struct win_layout {
+	enum client_mode mode;
+	int		x, y, w, h;
+	int		valid;		/* nonzero if populated */
+};
+
 struct client_window {
 	uint32_t	id;
 	struct vt_state	*vt;
@@ -365,6 +375,8 @@ struct client_window {
 	int		dead;		/* child process has exited */
 	int		scroll_lock;	/* output frozen */
 	int		input_lock;	/* keystrokes discarded */
+	struct win_layout layout;	/* current mode's placement */
+	struct win_layout prev_layout;	/* saved from previous mode */
 };
 
 static struct client_window cwins[CLIENT_WIN_MAX];
@@ -560,7 +572,7 @@ static int cascade_x = 2, cascade_y = 2;
 
 /* ---- terminal mode forwarding ---- */
 
-#define FORWARD_MODES (VT_MODE_DECCKM | VT_MODE_BRACKETPASTE | VT_MODE_DECKPAM)
+#define FORWARD_MODES (VT_MODE_DECCKM | VT_MODE_DECKPAM)
 static unsigned synced_modes;
 static int synced_cursor_shape;
 static int synced_kitty_kbd;
@@ -601,8 +613,6 @@ sync_terminal_modes(unsigned new_modes)
 
 	if (changed & VT_MODE_DECCKM)
 		emit_mode(1, new_modes & VT_MODE_DECCKM);
-	if (changed & VT_MODE_BRACKETPASTE)
-		emit_mode(2004, new_modes & VT_MODE_BRACKETPASTE);
 	if (changed & VT_MODE_DECKPAM) {
 		const char *s = (new_modes & VT_MODE_DECKPAM) ?
 		    "\033=" : "\033>";
@@ -662,8 +672,6 @@ reset_terminal_modes(void)
 
 	if (synced_modes & VT_MODE_DECCKM)
 		emit_mode(1, 0);
-	if (synced_modes & VT_MODE_BRACKETPASTE)
-		emit_mode(2004, 0);
 	if (synced_modes & VT_MODE_DECKPAM) {
 		tio_write(STDOUT_FILENO, "\033>", 2);
 		dirty = 1;
@@ -953,6 +961,11 @@ scrollback_leave(void)
 	scrollback_mode = 0;
 	scrollback_offset = 0;
 	scrollback_win_id = 0;
+
+	tile_need_full = 1;
+	turbo_need_full = 1;
+	need_render = 1;
+	need_status = 1;
 }
 
 /*
@@ -1230,6 +1243,36 @@ sync_keybinds_title(void)
 	mc = mconn_find_by_pid((pid_t)watched_id);
 	keys_set_title(keybinds, mc ? mc->title : NULL);
 	sync_host_title(mc ? mc->title : NULL);
+}
+
+/* propagate VT title changes to mconn + wm_window immediately,
+ * avoiding the round-trip through the sessdir filesystem. */
+static void
+sync_vt_title(uint32_t win_id, struct vt_state *st)
+{
+	struct mconn *mc;
+	const char *vt_title;
+	size_t len;
+
+	if (!st)
+		return;
+	vt_title = vt_state_title(st);
+	if (!vt_title)
+		vt_title = "";
+
+	mc = mconn_find_by_pid((pid_t)win_id);
+	if (!mc || strcmp(mc->title, vt_title) == 0)
+		return;
+
+	len = utf8_trunc(vt_title, sizeof(mc->title));
+	memcpy(mc->title, vt_title, len);
+	mc->title[len] = '\0';
+
+	if (client_mode == CLIENT_MODE_TURBO && wmgr)
+		wm_set_title(wmgr, win_id, vt_title);
+
+	if (watching && win_id == watched_id)
+		sync_keybinds_title();
 }
 
 /* sync wm windows with cwin list: add/remove wm windows to match */
@@ -1587,6 +1630,170 @@ screen_save_layout(const char *session)
 	sessdir_tree_free(layout.root);
 }
 
+/* ---- per-window layout snapshot / restore ---- */
+
+/* save each window's current turbo geometry into its win_layout */
+static void
+snapshot_turbo_layouts(void)
+{
+	int i;
+
+	for (i = 0; i < cwin_count; i++) {
+		struct wm_window *win;
+
+		win = wm_find(wmgr, cwins[i].id);
+		if (!win)
+			continue;
+		cwins[i].layout.mode = CLIENT_MODE_TURBO;
+		cwins[i].layout.x = win->x;
+		cwins[i].layout.y = win->y;
+		cwins[i].layout.w = win->w;
+		cwins[i].layout.h = win->h;
+		cwins[i].layout.valid = 1;
+	}
+}
+
+/* save each window's current tile pane geometry into its win_layout */
+static void
+snapshot_screen_layouts(void)
+{
+	int i;
+
+	for (i = 0; i < cwin_count; i++) {
+		int x, y, w, h;
+
+		if (tile_pane_geometry(tilemgr, cwins[i].id,
+		    &x, &y, &w, &h) < 0)
+			continue;
+		cwins[i].layout.mode = CLIENT_MODE_SCREEN;
+		cwins[i].layout.x = x;
+		cwins[i].layout.y = y;
+		cwins[i].layout.w = w;
+		cwins[i].layout.h = h;
+		cwins[i].layout.valid = 1;
+	}
+}
+
+/* swap layout <-> prev_layout for all windows */
+static void
+swap_layouts(void)
+{
+	int i;
+
+	for (i = 0; i < cwin_count; i++) {
+		struct win_layout tmp;
+
+		tmp = cwins[i].layout;
+		cwins[i].layout = cwins[i].prev_layout;
+		cwins[i].prev_layout = tmp;
+	}
+}
+
+/* restore a window's turbo position from its layout if it was
+ * previously placed by turbo.  returns 1 if restored, 0 if not. */
+static int
+restore_turbo_win(struct client_window *cw)
+{
+	struct wm_window *win;
+
+	if (!cw->layout.valid || cw->layout.mode != CLIENT_MODE_TURBO)
+		return 0;
+
+	win = wm_find(wmgr, cw->id);
+	if (!win)
+		return 0;
+
+	wm_move(wmgr, cw->id, cw->layout.x, cw->layout.y);
+	win->w = cw->layout.w;
+	win->h = cw->layout.h;
+	vt_state_resize(cw->vt, win->h, win->w);
+	{
+		struct mconn *mc;
+
+		mc = mconn_find_by_pid((pid_t)cw->id);
+		if (mc)
+			mconn_ipc_send_size(mc, IPC_MSG_WIN_RESIZE,
+			    win->h, win->w);
+	}
+	return 1;
+}
+
+/* toggle between turbo and screen modes at runtime */
+static void
+mode_toggle(void)
+{
+	if (client_mode == CLIENT_MODE_MINIMAL)
+		return;
+
+	if (client_mode == CLIENT_MODE_TURBO) {
+		snapshot_turbo_layouts();
+		turbo_save_layout(session_name);
+		swap_layouts();
+
+		client_mode = CLIENT_MODE_SCREEN;
+
+		if (!tilemgr) {
+			if (screen_apply_layout(session_name) < 0) {
+				tilemgr = tile_new(content_rows,
+				    content_cols);
+				tile_set_window(tilemgr, 0,
+				    watched_id, vt);
+				tile_focus(tilemgr, watched_id);
+			}
+		} else {
+			/* tile tree exists from a previous toggle;
+			 * assign windows not already in the tree */
+			int i;
+
+			for (i = 0; i < cwin_count; i++) {
+				if (tile_pane_geometry(tilemgr,
+				    cwins[i].id,
+				    NULL, NULL, NULL, NULL) == 0)
+					continue;
+				tile_set_window(tilemgr, 0,
+				    cwins[i].id, cwins[i].vt);
+			}
+		}
+
+		tile_resize(tilemgr, content_rows, content_cols);
+		overlay_repaint_fn = tiled_repaint;
+		tile_each_pane(tilemgr, tiled_resize_pane_cb, NULL);
+		tile_focus(tilemgr, watched_id);
+		tile_sync_focus();
+		tile_need_full = 1;
+	} else {
+		snapshot_screen_layouts();
+		if (tilemgr)
+			screen_save_layout(session_name);
+		swap_layouts();
+
+		client_mode = CLIENT_MODE_TURBO;
+
+		if (!wmgr)
+			wmgr = wm_new(content_rows, content_cols);
+		else
+			wm_resize(wmgr, content_rows, content_cols);
+
+		turbo_sync_windows();
+
+		/* restore previously saved turbo positions */
+		{
+			int i;
+
+			for (i = 0; i < cwin_count; i++)
+				restore_turbo_win(&cwins[i]);
+		}
+
+		overlay_repaint_fn = turbo_repaint;
+		wm_focus(wmgr, watched_id);
+		turbo_sync_focus();
+		turbo_need_full = 1;
+	}
+
+	need_render = 1;
+	need_status = 1;
+}
+
 /* find the focused wm_window's ID, return via out_id.
  * returns 1 if found, 0 if no focused window. */
 static int
@@ -1820,11 +2027,17 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 				render_resize(renderer, content_rows,
 				    content_cols);
 
-				tile_resize(tilemgr,
-				    content_rows, content_cols);
-				tile_each_pane(tilemgr,
-				    tiled_resize_pane_cb, NULL);
-				tile_need_full = 1;
+				if (client_mode == CLIENT_MODE_TURBO) {
+					wm_resize(wmgr, content_rows,
+					    content_cols);
+					turbo_need_full = 1;
+				} else {
+					tile_resize(tilemgr,
+					    content_rows, content_cols);
+					tile_each_pane(tilemgr,
+					    tiled_resize_pane_cb, NULL);
+					tile_need_full = 1;
+				}
 				need_render = 1;
 				need_status = 1;
 			}
@@ -1893,7 +2106,8 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 			resize_mode = 1;
 		break;
 	case KEYS_ACTION_SCROLLBACK:
-		scrollback_enter();
+		if (!scrollback_mode)
+			scrollback_enter();
 		need_render = 1;
 		need_status = 1;
 		break;
@@ -2005,6 +2219,9 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 	case KEYS_ACTION_CLIPBOARD_SYNC:
 		sel_clipboard_sync();
 		break;
+	case KEYS_ACTION_TOGGLE_MODE:
+		mode_toggle();
+		break;
 	default:
 		break;
 	}
@@ -2041,7 +2258,16 @@ sel_forward_press(void)
 		    sel_press_seq.data, (uint32_t)sel_press_seq.len);
 }
 
-/* paste last copied text into focused PTY as bracketed paste */
+static int
+focused_wants_bracketed_paste(void)
+{
+	struct client_window *cw = cwin_focused();
+
+	return cw && cw->vt && (cw->vt->modes & VT_MODE_BRACKETPASTE);
+}
+
+/* paste last copied text into focused PTY, wrapping with bracketed
+ * paste only when the child has requested it */
 static void
 sel_paste(void)
 {
@@ -2057,9 +2283,11 @@ sel_paste(void)
 	if (!mc)
 		return;
 
-	mconn_ipc_send(mc, IPC_MSG_INPUT, "\033[200~", 6);
+	if (focused_wants_bracketed_paste())
+		mconn_ipc_send(mc, IPC_MSG_INPUT, "\033[200~", 6);
 	mconn_ipc_send(mc, IPC_MSG_INPUT, buf, (uint32_t)len);
-	mconn_ipc_send(mc, IPC_MSG_INPUT, "\033[201~", 6);
+	if (focused_wants_bracketed_paste())
+		mconn_ipc_send(mc, IPC_MSG_INPUT, "\033[201~", 6);
 }
 
 static void
@@ -2186,6 +2414,30 @@ handle_mouse_turbo(struct iox_loop *loop, const struct tkbd_seq *seq)
 				need_status = 1;
 			}
 			need_render = 1;
+		}
+		return;
+	}
+
+	/* mouse wheel: scroll through history (skip on alternate screen) */
+	if (seq->key == TKBD_MOUSE_WHEEL_UP ||
+	    seq->key == TKBD_MOUSE_WHEEL_DOWN) {
+		struct client_window *fcw = cwin_focused();
+
+		if (fcw && fcw->vt &&
+		    fcw->vt->active_target != VT_TARGET_ALT) {
+			if (seq->key == TKBD_MOUSE_WHEEL_UP) {
+				if (!scrollback_mode)
+					scrollback_enter();
+				scrollback_offset += 3;
+			} else {
+				if (scrollback_mode) {
+					scrollback_offset -= 3;
+					if (scrollback_offset <= 0)
+						scrollback_leave();
+				}
+			}
+			need_render = 1;
+			need_status = 1;
 		}
 		return;
 	}
@@ -2438,6 +2690,30 @@ handle_mouse(struct iox_loop *loop, const struct tkbd_seq *seq)
 		return;
 	}
 
+	/* mouse wheel: scroll through history (skip on alternate screen) */
+	if (seq->key == TKBD_MOUSE_WHEEL_UP ||
+	    seq->key == TKBD_MOUSE_WHEEL_DOWN) {
+		struct client_window *fcw = cwin_focused();
+
+		if (fcw && fcw->vt &&
+		    fcw->vt->active_target != VT_TARGET_ALT) {
+			if (seq->key == TKBD_MOUSE_WHEEL_UP) {
+				if (!scrollback_mode)
+					scrollback_enter();
+				scrollback_offset += 3;
+			} else {
+				if (scrollback_mode) {
+					scrollback_offset -= 3;
+					if (scrollback_offset <= 0)
+						scrollback_leave();
+				}
+			}
+			need_render = 1;
+			need_status = 1;
+		}
+		return;
+	}
+
 	if (seq->key == TKBD_MOUSE_LEFT) {
 		if (sel_active()) {
 			sel_clear();
@@ -2493,7 +2769,7 @@ handle_mouse(struct iox_loop *loop, const struct tkbd_seq *seq)
 
 static char stdin_buf[4096];
 static int stdin_buflen;
-
+static int in_paste;
 
 static void
 dispatch_input(struct iox_loop *loop, const struct tkbd_seq *seq)
@@ -2502,6 +2778,42 @@ dispatch_input(struct iox_loop *loop, const struct tkbd_seq *seq)
 
 	if (seq->type == TKBD_MOUSE) {
 		handle_mouse(loop, seq);
+		return;
+	}
+
+	/* bracketed paste: intercept boundaries from the outer terminal.
+	 * while inside a paste, bypass the prefix key machine and forward
+	 * content directly to the child PTY. */
+	if (seq->key == TKBD_KEY_PASTE_BEGIN) {
+		in_paste = 1;
+		if (focused_wants_bracketed_paste()) {
+			struct mconn *mc = mconn_focused();
+
+			if (mc)
+				mconn_ipc_send(mc, IPC_MSG_INPUT,
+				    "\033[200~", 6);
+		}
+		return;
+	}
+	if (seq->key == TKBD_KEY_PASTE_END) {
+		in_paste = 0;
+		if (focused_wants_bracketed_paste()) {
+			struct mconn *mc = mconn_focused();
+
+			if (mc)
+				mconn_ipc_send(mc, IPC_MSG_INPUT,
+				    "\033[201~", 6);
+		}
+		return;
+	}
+	if (in_paste) {
+		if (seq->len > 0) {
+			struct mconn *mc = mconn_focused();
+
+			if (mc)
+				mconn_ipc_send(mc, IPC_MSG_INPUT,
+				    seq->data, (uint32_t)seq->len);
+		}
 		return;
 	}
 
@@ -2538,61 +2850,6 @@ dispatch_input(struct iox_loop *loop, const struct tkbd_seq *seq)
 
 	if (menu_visible) {
 		menu_input(loop, seq);
-		return;
-	}
-
-	/* scrollback mode: arrow keys / pgup / pgdn to scroll, q / ESC to exit */
-	if (scrollback_mode) {
-		int handled = 1;
-
-		switch (seq->key) {
-		case TKBD_KEY_UP:
-			scrollback_offset++;
-			break;
-		case TKBD_KEY_DOWN:
-			if (scrollback_offset > 0)
-				scrollback_offset--;
-			break;
-		case TKBD_KEY_PGUP:
-			scrollback_offset += content_rows / 2;
-			break;
-		case TKBD_KEY_PGDN:
-			scrollback_offset -= content_rows / 2;
-			if (scrollback_offset < 0)
-				scrollback_offset = 0;
-			break;
-		case TKBD_KEY_ESC:
-		case TKBD_KEY_ENTER:
-			scrollback_leave();
-			tile_need_full = 1;
-			turbo_need_full = 1;
-			need_render = 1;
-			need_status = 1;
-			return;
-		default:
-			if (seq->ch == 'q') {
-				scrollback_leave();
-				tile_need_full = 1;
-				turbo_need_full = 1;
-				need_render = 1;
-				need_status = 1;
-				return;
-			}
-			if (seq->ch == 'k') {
-				scrollback_offset++;
-			} else if (seq->ch == 'j') {
-				if (scrollback_offset > 0)
-					scrollback_offset--;
-			} else {
-				handled = 0;
-			}
-			break;
-		}
-
-		if (handled) {
-			need_render = 1;
-			need_status = 1;
-		}
 		return;
 	}
 
@@ -2683,9 +2940,58 @@ dispatch_input(struct iox_loop *loop, const struct tkbd_seq *seq)
 			return;
 		}
 		if (action != KEYS_ACTION_NONE) {
+			if (scrollback_mode)
+				scrollback_leave();
 			dispatch_action(loop, action);
 			return;
 		}
+	}
+
+	/* scrollback mode: arrow/vim keys to scroll, q/ESC/Enter to exit */
+	if (scrollback_mode) {
+		int handled = 1;
+
+		switch (seq->key) {
+		case TKBD_KEY_UP:
+			scrollback_offset++;
+			break;
+		case TKBD_KEY_DOWN:
+			if (scrollback_offset > 0)
+				scrollback_offset--;
+			break;
+		case TKBD_KEY_PGUP:
+			scrollback_offset += content_rows / 2;
+			break;
+		case TKBD_KEY_PGDN:
+			scrollback_offset -= content_rows / 2;
+			if (scrollback_offset < 0)
+				scrollback_offset = 0;
+			break;
+		case TKBD_KEY_ESC:
+		case TKBD_KEY_ENTER:
+			scrollback_leave();
+			return;
+		default:
+			if (seq->ch == 'q') {
+				scrollback_leave();
+				return;
+			}
+			if (seq->ch == 'k') {
+				scrollback_offset++;
+			} else if (seq->ch == 'j') {
+				if (scrollback_offset > 0)
+					scrollback_offset--;
+			} else {
+				handled = 0;
+			}
+			break;
+		}
+
+		if (handled) {
+			need_render = 1;
+			need_status = 1;
+		}
+		return;
 	}
 
 	/* unhandled input -> forward raw sequence to PTY */
@@ -2875,6 +3181,7 @@ start_proxy(const char *user, const char *host, const char *rsession)
 		dup2(sv[1], STDOUT_FILENO);
 		if (sv[1] > STDERR_FILENO)
 			close(sv[1]);
+		lu_umask_restore();
 		execlp("ssh", "ssh", "-T", "-o", "BatchMode=yes",
 		    dest, "lumi", "proxy", "-s", rsession, NULL);
 		_exit(127);
@@ -2972,6 +3279,7 @@ on_proxy_read(struct iox_loop *lp, int fd, unsigned events, void *arg)
 					break;
 				predict_confirm(cw->pred, cw->vt, buf, len);
 				vt_parse_feed(cw->parser, buf, len);
+				sync_vt_title(window_id, cw->vt);
 				need_render = 1;
 				need_status = 1;
 			}
@@ -3181,6 +3489,7 @@ on_mserver_read(struct iox_loop *lp, int fd, unsigned events, void *arg)
 
 			predict_confirm(cw->pred, cw->vt, buf, len);
 			vt_parse_feed(cw->parser, buf, len);
+			sync_vt_title(win_id, cw->vt);
 			need_render = 1;
 			need_status = 1;
 		}
@@ -3236,15 +3545,11 @@ micro_switch_session(struct iox_loop *loop, const char *name)
 		sessdir_watch_fd = -1;
 	}
 
-	/* free layout state */
-	if (client_mode == CLIENT_MODE_TURBO) {
-		wm_free(wmgr);
-		wmgr = wm_new(content_rows, content_cols);
-		turbo_need_full = 1;
-	} else {
-		tile_free(tilemgr);
-		tilemgr = NULL;
-	}
+	/* free layout state (both may be alive after mode toggles) */
+	wm_free(wmgr);
+	wmgr = NULL;
+	tile_free(tilemgr);
+	tilemgr = NULL;
 
 	/* switch session name */
 	free(session_name);
@@ -3277,11 +3582,13 @@ micro_switch_session(struct iox_loop *loop, const char *name)
 			vt = cw->vt;
 	}
 
-	/* reinitialize layout */
+	/* reinitialize layout for active mode */
 	if (client_mode == CLIENT_MODE_TURBO) {
+		wmgr = wm_new(content_rows, content_cols);
 		turbo_sync_windows();
 		turbo_apply_layout(session_name);
 		wm_focus(wmgr, watched_id);
+		overlay_repaint_fn = turbo_repaint;
 		turbo_need_full = 1;
 	} else {
 		if (screen_apply_layout(session_name) < 0) {
@@ -3702,9 +4009,13 @@ cmd_attach_main(int argc, char **argv)
 
 	if (client_mode != CLIENT_MODE_MINIMAL)
 		enable_mouse();
+	emit_mode(2004, 1);
+	tio_flush(STDOUT_FILENO);
 
 	loop = iox_loop_new();
 	if (!loop) {
+		emit_mode(2004, 0);
+		tio_flush(STDOUT_FILENO);
 		disable_mouse();
 		tio_restore(STDIN_FILENO);
 		log_err("failed to create event loop");
@@ -3813,6 +4124,8 @@ cmd_attach_main(int argc, char **argv)
 
 	iox_loop_free(loop);
 	reset_terminal_modes();
+	emit_mode(2004, 0);
+	tio_flush(STDOUT_FILENO);
 	set_cursor_vis(1);
 	disable_mouse();
 	reset_host_title();

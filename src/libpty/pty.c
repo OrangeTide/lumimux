@@ -4,6 +4,7 @@
 
 #include "pty.h"
 #include "log.h"
+#include "lu_umask.h"
 
 #include <fcntl.h>
 #include <signal.h>
@@ -31,13 +32,14 @@ pty_open(int *child_pid, const char *shell)
 	}
 
 	if (pid == 0) {
-		/* child -- reset signals and exec shell */
+		/* child -- reset signals and restore user's umask */
 		signal(SIGCHLD, SIG_DFL);
 		signal(SIGWINCH, SIG_DFL);
 		signal(SIGINT, SIG_DFL);
 		signal(SIGQUIT, SIG_DFL);
 		signal(SIGTERM, SIG_DFL);
 		signal(SIGHUP, SIG_DFL);
+		lu_umask_restore();
 
 		/* set TERM so child shell uses the right terminfo entry */
 		setenv("TERM", "screen-256color", 1);

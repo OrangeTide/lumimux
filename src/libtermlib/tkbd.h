@@ -158,6 +158,8 @@ int tkbd_stresc(char *buf, const char *str, size_t strsz);
 #define TKBD_KEY_NONE              0x00
 
 #define TKBD_KEY_UNKNOWN           0xFFFF
+#define TKBD_KEY_PASTE_BEGIN       0xFFF0
+#define TKBD_KEY_PASTE_END         0xFFF1
 
 #define TKBD_KEY_BACKSPACE         0x08
 #define TKBD_KEY_TAB               0x09

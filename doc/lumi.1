@@ -1,7 +1,7 @@
 .\" lumi.1 : manual page for lumiMUX
 .\" Copyright (c) 2026 Jon Mayo
 .\" Licensed under MIT-0 OR PUBLIC DOMAIN
-.TH LUMI 1 "2026-04-13" "lumiMUX" "User Commands"
+.TH LUMI 1 "2026-05-09" "lumiMUX" "User Commands"
 .SH NAME
 lumi \- terminal multiplexer
 .SH SYNOPSIS
@@ -285,6 +285,7 @@ v	Split pane vertically
 Tab	Next pane
 X	Close pane
 r	Resize pane
+t	Toggle between turbo and screen modes
 m	Minimize window (turbo mode)
 f	Maximize window (turbo mode)
 P	Window color picker (turbo mode)
@@ -342,6 +343,15 @@ position = bottom
 .fi
 .RE
 .SS Keys
+.TP
+.B attach.mode
+Default UI mode:
+.BR screen " (default),"
+.BR turbo ,
+.BR minimal .
+Overridden by the
+.B \-m
+command-line flag.
 .TP
 .B keys.prefix
 Change the prefix key.
@@ -468,6 +478,7 @@ scrollback	Enter scrollback mode
 window\-colors	Window color picker
 minimize	Minimize window
 maximize	Maximize window
+toggle\-mode	Toggle between turbo and screen modes
 scroll\-lock	Toggle scroll lock
 input\-lock	Toggle input lock
 session\-list	Session picker
@@ -475,6 +486,92 @@ paste	Paste from internal clipboard
 clipboard\-sync	Sync internal clipboard to system
 none	Unbind key
 .TE
+.SH SCROLLBACK MODE
+Enter scrollback mode with
+.B Ctrl\-A [
+or
+.BR "Ctrl\-A Escape" .
+In scrollback mode:
+.TP
+.BR "Up" ", " "Down" ", " "Page Up" ", " "Page Down"
+Scroll through history.
+.TP
+.B Mouse wheel
+Scroll up and down.
+.TP
+.B Mouse drag
+Select text.
+Selected text is copied to the internal clipboard on mouse release.
+.TP
+.BR q ", " Escape
+Exit scrollback mode.
+.PP
+A scrollbar is displayed on the right edge of the window in turbo mode.
+Selection highlighting is constrained to the visible window bounds.
+.SH MOUSE
+In
+.B turbo
+mode, mouse interactions include:
+.TP
+.B Title bar drag
+Move window.
+.TP
+.B Border drag
+Resize window.
+.TP
+.B Close button click
+Close window.
+.TP
+.B Click
+Focus window and deliver click to the application.
+.PP
+In all modes, mouse text selection copies to the internal clipboard.
+Use
+.B Ctrl\-A ]
+to paste and
+.B Ctrl\-A y
+to sync the internal clipboard to the system clipboard.
+.PP
+Bracketed paste sequences from the outer terminal are forwarded to
+the focused window when the application has enabled bracketed paste
+mode (DECSET 2004).
+.SH TERMINAL COMPATIBILITY
+.B lumi
+sets the host terminal's title to reflect the current window title.
+Title changes from child applications (via OSC 0 and OSC 2) are
+propagated to the outer terminal immediately.
+.PP
+Window layout (positions, sizes, z-order) is saved on detach and
+restored on reattach to the same session.
+.PP
+The following terminal features are recognized and forwarded:
+.TP
+.B Kitty keyboard protocol
+The prefix key (Ctrl\-A) is recognized in kitty keyboard encoding
+(CSI 97;5u) in addition to the traditional byte encoding.
+.TP
+.B Keyboard enhancement protocols
+Enhancement flags (XTPUSHSGR, kitty progressive enhancement) set by
+child applications are forwarded from the micro-server to the outer
+terminal.
+.TP
+.B DCS pass-through
+SIXEL graphics and other DCS sequences are passed through to the
+outer terminal when a single pane is focused in screen mode.
+.TP
+.B Cursor shape
+DECSCUSR (CSI Ps SP q) cursor shape changes are forwarded.
+.SH SECURITY
+.B lumi
+sets
+.BR umask (2)
+to 077 at startup so that the runtime directory
+.RI ( $XDG_RUNTIME_DIR/lumi/ )
+and its Unix domain sockets are accessible only by the owning user.
+The original umask is restored for child shell processes.
+.PP
+The session directory is cleaned of stale entries (dead server
+processes) on each attach and list operation.
 .SH ENVIRONMENT
 .TP
 .B LUMI_SESSION
@@ -494,5 +591,9 @@ executables.
 .B LUMI_DEBUG
 Set to a file path to enable debug tracing.
 Diagnostic output is appended to the specified file.
+.SH SEE ALSO
+.BR screen (1),
+.BR tmux (1),
+.BR ssh (1)
 .SH AUTHORS
 Jon Mayo

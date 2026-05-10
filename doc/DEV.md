@@ -9,32 +9,36 @@ Information for developers working on lumimux.
 | src/                 | Main source and module.mk entry point                     |
 | src/lumi.c           | Sub-command dispatcher (`lumi <cmd>` -> `lumi-<cmd>`)     |
 | src/libcfg/          | Gitconfig-style config file parser with key-value lookup  |
+| src/libattr/         | Transactional key-value attribute store with IPC and CLI  |
 | src/libcore/         | Logging, safe allocation (xmalloc), string helpers, PATH search |
 | src/libiox/          | Poll-based I/O multiplexer with fd watchers, signals, idle callbacks |
 | src/libipc/          | Unix domain socket IPC with TLV message framing           |
 | src/libkeys/         | Key binding table and prefix-key state machine            |
 | src/libpty/          | Pseudo-terminal allocation, shell spawning, resize        |
 | src/librender/       | Differential screen renderer (shadow buffer diffing)      |
-| src/libsessdir/      | Filesystem session directory for micro-server discovery    |
+| src/libsessdir/      | Filesystem session directory for micro-server discovery (inotify) |
 | src/libsession/      | Window lifecycle management (PTY + VT state per window)   |
 | src/libsplash/       | ANSI art splash screen scenes with viewport cropping      |
 | src/libstatus/       | Status line with shell-like template expansion            |
 | src/libtermlib/      | Vendored terminfo parser (aux01/termlib, MIT)             |
+| src/libtile/         | Binary split-pane compositor for screen mode splits       |
 | src/libtio/          | Terminal raw mode, 8KB buffered writes, restore on exit   |
 | src/libtxl/          | Terminal translation engine (operations -> escape sequences) |
 | src/libutf8/         | UTF-8 encode/decode, Unicode-version-aware rune_width()   |
 | src/libvt/           | VT500 terminal emulator: parser, ops, cell grid, scrollback |
 | src/libwm/           | Overlapping window manager compositor (z-order, hit test) |
 | src/cmd/attach/      | lumi-attach -- connect to server, relay I/O, menu overlay |
+| src/cmd/attr/        | lumi-attr -- get/set/delete per-session attributes        |
 | src/cmd/detach/      | lumi-detach -- tell server to detach a client             |
 | src/cmd/kill/        | lumi-kill -- terminate a session                          |
 | src/cmd/list/        | lumi-list -- list active sessions                         |
+| src/cmd/mserver/     | lumi-mserver -- single-PTY micro-server (one per window)  |
 | src/cmd/new/         | lumi-new -- create session and attach                     |
 | src/cmd/new-window/  | lumi-new-window -- create window in existing session      |
+| src/cmd/proxy/       | lumi-proxy -- multiplexing proxy for remote session tunneling |
 | src/cmd/reload/      | lumi-reload -- tell server to reload config               |
 | src/cmd/send-input/  | lumi-send-input -- inject raw input into a pane           |
 | src/cmd/send-keys/   | lumi-send-keys -- send keystrokes to a session            |
-| src/cmd/mserver/     | lumi-mserver -- single-PTY micro-server (one per window)  |
 | src/cmd/splash/      | lumi-splash -- display ANSI art splash screens            |
 | src/cmd/version/     | lumi-version -- print version info                        |
 
@@ -462,20 +466,24 @@ via `_TESTCMD` in module.mk files.
 
 | Suite          | Library    | Tests |
 |----------------|------------|-------|
-| test_iox       | libiox     | 11    |
-| test_vt        | libvt      | 26    |
-| test_render    | librender  | 10    |
+| test_iox       | libiox     | 14    |
+| test_vt        | libvt      | 32    |
+| test_render    | librender  | 11    |
 | test_txl       | libtxl     | 38    |
-| test_ipc       | libipc     | 10    |
-| test_session   | libsession | 9     |
-| test_keys      | libkeys    | 14    |
+| test_ipc       | libipc     | 8     |
+| test_attr_store| libattr    | 15    |
+| test_sessdir   | libsessdir | 55    |
+| test_keys      | libkeys    | 31    |
 | test_cfg       | libcfg     | 39    |
 | test_status    | libstatus  | 27    |
 | test_splash    | libsplash  | 131   |
 | test_utf8      | libutf8    | 48    |
 | test_tui       | libtui     | 27    |
-| test_wm        | libwm      | 18    |
-| **Total**      |            | **408** |
+| test_wm        | libwm      | 23    |
+| test_tile      | libtile    | 19    |
+| test_input     | attach     | 15    |
+| test_predict   | attach     | 12    |
+| **Total**      |            | **545** |
 
 ## Library Dependency Graph
 
@@ -484,7 +492,8 @@ lumi-mserver: libiox, libsessdir, libsession, libipc, libpty, libvt,
               libutf8, libcore
 lumi-attach:  libiox, libsessdir, libipc, libtio, librender, libtxl,
               libtermlib, libvt, libutf8, libkeys, libcfg, libstatus,
-              libcore, libtui, libtui_term, libwm
+              libcore, libtui, libtui_term, libwm, libtile, libattr
+lumi-proxy:   libiox, libsessdir, libipc, libcore
 libwm:        libvt, libtui, libutf8
 libtui:       libvt, libutf8
 libtui_term:  libtui, libtxl, libtio, libtermlib, libvt, libutf8, libcore

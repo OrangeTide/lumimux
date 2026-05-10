@@ -508,7 +508,11 @@ static int parse_special_seq(struct tkbd_seq *seq, const char *buf, int len)
 		int parms[2] = {0};
 		parse_seq_params(parms, ARRAYLEN(parms), parmdata);
 
-		if (parms[0] < (int)ARRAYLEN(fn_key_table))
+		if (parms[0] == 200)
+			seq->key = TKBD_KEY_PASTE_BEGIN;
+		else if (parms[0] == 201)
+			seq->key = TKBD_KEY_PASTE_END;
+		else if (parms[0] < (int)ARRAYLEN(fn_key_table))
 			seq->key = fn_key_table[parms[0]];
 		else
 			seq->key = TKBD_KEY_UNKNOWN;
