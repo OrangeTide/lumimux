@@ -145,8 +145,9 @@ keys_default(struct keys *k)
 
 	memset(lay->bindings, 0, sizeof(lay->bindings));
 
-	/* Ctrl-A Ctrl-A: send literal prefix */
+	/* Ctrl-A Ctrl-A or Ctrl-A a: send literal prefix */
 	lay->bindings[k->prefix] = KEYS_ACTION_SEND_PREFIX;
+	lay->bindings['a'] = KEYS_ACTION_SEND_PREFIX;
 
 	/* window creation/destruction */
 	lay->bindings['c'] = KEYS_ACTION_NEW_WINDOW;
@@ -215,6 +216,9 @@ keys_default(struct keys *k)
 
 	/* layout mode toggle */
 	lay->bindings['t'] = KEYS_ACTION_TOGGLE_MODE;
+
+	/* turbo window arrangement */
+	lay->bindings['G'] = KEYS_ACTION_ARRANGE_GRID;
 
 	/* clipboard */
 	lay->bindings[']'] = KEYS_ACTION_PASTE;
@@ -452,6 +456,7 @@ static const struct {
 	{ "paste",		KEYS_ACTION_PASTE },
 	{ "clipboard-sync",	KEYS_ACTION_CLIPBOARD_SYNC },
 	{ "toggle-mode",	KEYS_ACTION_TOGGLE_MODE },
+	{ "arrange-grid",	KEYS_ACTION_ARRANGE_GRID },
 	{ "none",		KEYS_ACTION_NONE },
 };
 

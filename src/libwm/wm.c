@@ -21,6 +21,7 @@ struct wm {
 	struct vt_cell *prev_screen;
 	uint8_t *row_dirty;
 	int next_z;
+	int composite_needed;	/* set when state changes require recomposite */
 
 	/* drag state */
 	enum wm_drag drag;
@@ -46,16 +47,29 @@ screen_put(struct wm *wm, int row, int col, uint32_t cp,
     struct vt_color fg, struct vt_color bg, uint16_t attrs)
 {
 	struct vt_cell *c = screen_cell(wm, row, col);
+	int w;
 
 	if (!c)
 		return;
+	w = rune_width(cp);
+	if (w < 1)
+		w = 1;
 	c->codepoint = cp;
 	c->fg = fg;
 	c->bg = bg;
 	c->attrs = attrs;
-	c->width = 1;
-	if (row >= 0 && row < wm->rows)
-		wm->row_dirty[row] = 1;
+	c->width = (uint8_t)w;
+	if (w == 2) {
+		struct vt_cell *c2 = screen_cell(wm, row, col + 1);
+
+		if (c2) {
+			c2->codepoint = 0;
+			c2->fg = fg;
+			c2->bg = bg;
+			c2->attrs = attrs;
+			c2->width = 0;
+		}
+	}
 }
 
 static void
@@ -68,15 +82,46 @@ screen_puts(struct wm *wm, int row, int col, const char *s,
 	while (*s && c < end) {
 		uint32_t cp;
 		int len = utf8_decode(&cp, (const unsigned char *)s, 4);
+		int w;
 
 		if (len <= 0) {
 			s++;
 			continue;
 		}
+		w = rune_width(cp);
+		if (w < 1)
+			w = 1;
+		if (c + w > end)
+			break;
 		screen_put(wm, row, c, cp, fg, bg, attrs);
-		c++;
+		c += w;
 		s += len;
 	}
+}
+
+static int
+str_display_width(const char *s, int maxcols)
+{
+	int cols = 0;
+
+	while (*s && cols < maxcols) {
+		uint32_t cp;
+		int len = utf8_decode(&cp, (const unsigned char *)s, 4);
+		int w;
+
+		if (len <= 0) {
+			s++;
+			continue;
+		}
+		w = rune_width(cp);
+		if (w < 1)
+			w = 1;
+		if (cols + w > maxcols)
+			break;
+		cols += w;
+		s += len;
+	}
+	return cols;
 }
 
 static void
@@ -140,6 +185,7 @@ wm_new(int rows, int cols)
 		free(wm);
 		return NULL;
 	}
+	wm->composite_needed = 1;
 	return wm;
 }
 
@@ -171,6 +217,7 @@ wm_resize(struct wm *wm, int rows, int cols)
 	wm->row_dirty = calloc((size_t)rows, 1);
 	wm->rows = rows;
 	wm->cols = cols;
+	wm->composite_needed = 1;
 }
 
 /* ---- window management ---- */
@@ -195,6 +242,7 @@ wm_add(struct wm *wm, uint32_t id, struct vt_state *vt,
 	win->w = w;
 	win->h = h;
 	win->z = wm->next_z++;
+	wm->composite_needed = 1;
 	return 0;
 }
 
@@ -206,6 +254,7 @@ wm_remove(struct wm *wm, uint32_t id)
 	for (i = 0; i < wm->count; i++) {
 		if (wm->windows[i].id == id) {
 			wm->windows[i] = wm->windows[--wm->count];
+			wm->composite_needed = 1;
 			return;
 		}
 	}
@@ -247,6 +296,7 @@ wm_focus(struct wm *wm, uint32_t id)
 	for (i = 0; i < wm->count; i++)
 		wm->windows[i].focused = (wm->windows[i].id == id) ? 1 : 0;
 	wm_raise(wm, id);
+	wm->composite_needed = 1;
 }
 
 void
@@ -254,8 +304,10 @@ wm_raise(struct wm *wm, uint32_t id)
 {
 	struct wm_window *win = wm_find(wm, id);
 
-	if (win)
+	if (win) {
 		win->z = wm->next_z++;
+		wm->composite_needed = 1;
+	}
 }
 
 /* ---- window manipulation ---- */
@@ -265,10 +317,10 @@ wm_move(struct wm *wm, uint32_t id, int x, int y)
 {
 	struct wm_window *win = wm_find(wm, id);
 
-	(void)wm;
 	if (win) {
 		win->x = x;
 		win->y = y;
+		wm->composite_needed = 1;
 	}
 }
 
@@ -283,6 +335,7 @@ wm_set_title(struct wm *wm, uint32_t id, const char *title)
 	len = utf8_trunc(title, WM_TITLE_MAX);
 	memcpy(win->title, title, len);
 	win->title[len] = '\0';
+	wm->composite_needed = 1;
 }
 
 void
@@ -290,8 +343,10 @@ wm_set_flags(struct wm *wm, uint32_t id, uint32_t flags)
 {
 	struct wm_window *win = wm_find(wm, id);
 
-	if (win)
+	if (win) {
 		win->flags = flags;
+		wm->composite_needed = 1;
+	}
 }
 
 void
@@ -299,8 +354,10 @@ wm_set_theme(struct wm *wm, uint32_t id, const struct tui_theme *t)
 {
 	struct wm_window *win = wm_find(wm, id);
 
-	if (win)
+	if (win) {
 		win->win_theme = t;
+		wm->composite_needed = 1;
+	}
 }
 
 const struct tui_theme *
@@ -324,6 +381,7 @@ wm_set_scroll(struct wm *wm, uint32_t id, float pos, float len)
 	if (len > 1.0f) len = 1.0f;
 	win->scroll_pos = pos;
 	win->scroll_len = len;
+	wm->composite_needed = 1;
 }
 
 float
@@ -360,8 +418,10 @@ wm_minimize(struct wm *wm, uint32_t id)
 {
 	struct wm_window *win = wm_find(wm, id);
 
-	if (win)
+	if (win) {
 		win->minimized = 1;
+		wm->composite_needed = 1;
+	}
 }
 
 void
@@ -369,8 +429,10 @@ wm_unminimize(struct wm *wm, uint32_t id)
 {
 	struct wm_window *win = wm_find(wm, id);
 
-	if (win)
+	if (win) {
 		win->minimized = 0;
+		wm->composite_needed = 1;
+	}
 }
 
 int
@@ -388,6 +450,7 @@ wm_toggle_maximize(struct wm *wm, uint32_t id)
 		win->w = win->saved_w;
 		win->h = win->saved_h;
 		win->maximized = 0;
+		wm->composite_needed = 1;
 		return 0;
 	}
 
@@ -401,6 +464,7 @@ wm_toggle_maximize(struct wm *wm, uint32_t id)
 	win->w = wm->cols - 2;
 	win->h = wm->rows - 2;
 	win->maximized = 1;
+	wm->composite_needed = 1;
 	return 1;
 }
 
@@ -492,19 +556,19 @@ draw_frame(struct wm *wm, const struct wm_window *win,
 				struct vt_color tfg = win->focused ?
 				    theme->title_focus_fg :
 				    theme->title_idle_fg;
-				int tlen = (int)strlen(win->title);
 				/* indicator + brackets + buttons + icon slots */
 				int avail = fw - nbtns - 2 - nicons;
+				int twidth;
 
 				if (avail < 0)
 					avail = 0;
-				if (tlen > avail)
-					tlen = avail;
+				twidth = str_display_width(win->title,
+				    avail);
 				screen_puts(wm, fy, start, theme->title_l,
 				    tfg, bbg, VT_ATTR_BOLD, 1);
 				screen_puts(wm, fy, start + 1, win->title,
-				    tfg, bbg, VT_ATTR_BOLD, tlen);
-				screen_puts(wm, fy, start + 1 + tlen,
+				    tfg, bbg, VT_ATTR_BOLD, twidth);
+				screen_puts(wm, fy, start + 1 + twidth,
 				    theme->title_r,
 				    tfg, bbg, VT_ATTR_BOLD, 1);
 			}
@@ -668,12 +732,9 @@ draw_content(struct wm *wm, const struct wm_window *win)
 	for (r = 0; r < win->h; r++) {
 		struct vt_row *vr = vt_buf_row(buf, r);
 		int dst_row = win->y + r;
-		int dirty;
 
 		if (!vr)
 			continue;
-
-		dirty = (vr->flags & VT_ROW_DIRTY) != 0;
 
 		for (c = 0; c < win->w; c++) {
 			struct vt_cell *dst;
@@ -682,13 +743,36 @@ draw_content(struct wm *wm, const struct wm_window *win)
 			if (!dst)
 				continue;
 			*dst = vr->cells[c];
+			dst->attrs &= ~VT_ATTR_PREDICTED;
 		}
-
-		if (dirty && dst_row >= 0 && dst_row < wm->rows)
-			wm->row_dirty[dst_row] = 1;
 
 		vr->flags &= ~VT_ROW_DIRTY;
 	}
+}
+
+static int
+any_vt_dirty(const struct wm *wm)
+{
+	int i;
+
+	for (i = 0; i < wm->count; i++) {
+		const struct wm_window *win = &wm->windows[i];
+		struct vt_buf *buf;
+		int r;
+
+		if (win->minimized || !win->vt)
+			continue;
+		buf = win->vt->buf;
+		if (!buf)
+			continue;
+		for (r = 0; r < win->h; r++) {
+			struct vt_row *vr = vt_buf_row(buf, r);
+
+			if (vr && (vr->flags & VT_ROW_DIRTY))
+				return 1;
+		}
+	}
+	return 0;
 }
 
 void
@@ -697,8 +781,12 @@ wm_composite(struct wm *wm, const struct tui_theme *theme)
 	int order[WM_MAX_WINDOWS][2]; /* [z, index] */
 	int i, n;
 
-	screen_clear(wm);
 	memset(wm->row_dirty, 0, (size_t)wm->rows);
+	if (!wm->composite_needed && !any_vt_dirty(wm))
+		return;
+	wm->composite_needed = 0;
+
+	screen_clear(wm);
 
 	/* build z-sorted order */
 	n = 0;
@@ -776,6 +864,46 @@ wm_row_dirty(const struct wm *wm)
 	return wm ? wm->row_dirty : NULL;
 }
 
+static int
+color_eq(const struct vt_color *a, const struct vt_color *b)
+{
+	if (a->type != b->type)
+		return 0;
+	switch (a->type) {
+	case VT_COLOR_DEFAULT:
+		return 1;
+	case VT_COLOR_INDEXED:
+		return a->index == b->index;
+	case VT_COLOR_RGB:
+		return a->rgb.r == b->rgb.r &&
+		    a->rgb.g == b->rgb.g &&
+		    a->rgb.b == b->rgb.b;
+	}
+	return 0;
+}
+
+static int
+cell_eq(const struct vt_cell *a, const struct vt_cell *b)
+{
+	return a->codepoint == b->codepoint &&
+	    a->attrs == b->attrs &&
+	    a->width == b->width &&
+	    color_eq(&a->fg, &b->fg) &&
+	    color_eq(&a->bg, &b->bg);
+}
+
+static int
+row_changed(const struct vt_cell *a, const struct vt_cell *b, int cols)
+{
+	int c;
+
+	for (c = 0; c < cols; c++) {
+		if (!cell_eq(&a[c], &b[c]))
+			return 1;
+	}
+	return 0;
+}
+
 void
 wm_update_dirty(struct wm *wm)
 {
@@ -790,7 +918,9 @@ wm_update_dirty(struct wm *wm)
 		size_t off = (size_t)r * (size_t)wm->cols;
 
 		if (memcmp(&wm->screen[off], &wm->prev_screen[off],
-		    row_bytes) != 0)
+		    row_bytes) != 0 &&
+		    row_changed(&wm->screen[off], &wm->prev_screen[off],
+		    wm->cols))
 			wm->row_dirty[r] = 1;
 	}
 	memcpy(wm->prev_screen, wm->screen,
@@ -1029,6 +1159,7 @@ wm_mouse_drag(struct wm *wm, int row, int col)
 			return 0;
 		win->x = new_x;
 		win->y = new_y;
+		wm->composite_needed = 1;
 		return 1;
 	}
 
@@ -1072,6 +1203,7 @@ wm_mouse_drag(struct wm *wm, int row, int col)
 		win->h = new_h;
 		win->x = new_x;
 		win->y = new_y;
+		wm->composite_needed = 1;
 		return 1;
 	}
 
@@ -1084,7 +1216,59 @@ wm_mouse_drag(struct wm *wm, int row, int col)
 		if (new_pos == win->scroll_pos)
 			return 0;
 		win->scroll_pos = new_pos;
+		wm->composite_needed = 1;
 		return 1;
+	}
+
+	return 0;
+}
+
+int
+wm_arrange_grid(struct wm *wm)
+{
+	struct wm_window *wins[WM_MAX_WINDOWS];
+	int n, i, gcols, grows;
+	int cell_w, cell_h, extra_w, extra_h;
+
+	n = 0;
+	for (i = 0; i < wm->count; i++) {
+		if (!wm->windows[i].minimized)
+			wins[n++] = &wm->windows[i];
+	}
+	if (n == 0)
+		return -1;
+
+	/* integer ceiling of sqrt(n) for column count */
+	gcols = 1;
+	while (gcols * gcols < n)
+		gcols++;
+	grows = (n + gcols - 1) / gcols;
+
+	cell_w = wm->cols / gcols;
+	cell_h = wm->rows / grows;
+	extra_w = wm->cols - cell_w * gcols;
+	extra_h = wm->rows - cell_h * grows;
+
+	for (i = 0; i < n; i++) {
+		int gr = i / gcols;
+		int gc = i % gcols;
+		int x, y, w, h;
+
+		x = gc * cell_w + (gc < extra_w ? gc : extra_w) + 1;
+		y = gr * cell_h + (gr < extra_h ? gr : extra_h) + 1;
+		w = cell_w + (gc < extra_w ? 1 : 0) - 2;
+		h = cell_h + (gr < extra_h ? 1 : 0) - 2;
+
+		if (w < WM_MIN_WIDTH)
+			w = WM_MIN_WIDTH;
+		if (h < WM_MIN_HEIGHT)
+			h = WM_MIN_HEIGHT;
+
+		wins[i]->x = x;
+		wins[i]->y = y;
+		wins[i]->w = w;
+		wins[i]->h = h;
+		wins[i]->maximized = 0;
 	}
 
 	return 0;

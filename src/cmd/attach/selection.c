@@ -16,10 +16,12 @@
 
 static int sel_dragging;		/* drag in progress */
 static int sel_visible;			/* selection shown (after release) */
+static enum sel_mode cur_mode;		/* char, word, or line granularity */
 static uint32_t sel_win_id;
 static int sel_sr, sel_sc;		/* start (anchor) */
 static int sel_er, sel_ec;		/* end (current drag point) */
 static int sel_col_min, sel_col_max;	/* window content column bounds */
+static int sel_anchor_r, sel_anchor_c0, sel_anchor_c1; /* word/line anchor */
 
 /* ---- clipboard buffer ---- */
 
@@ -72,6 +74,39 @@ sel_normalize(int *r0, int *c0, int *r1, int *c1)
 		*r1 = sel_sr;
 		*c1 = sel_sc;
 	}
+}
+
+/* ---- word boundary detection ---- */
+
+static int
+is_word_sep(uint32_t cp)
+{
+	if (cp == 0 || cp == ' ' || cp == '\t')
+		return 1;
+	if (cp >= 0x21 && cp <= 0x2F)
+		return 1;	/* !"#$%&'()*+,-./ */
+	if (cp >= 0x3A && cp <= 0x40)
+		return 1;	/* :;<=>?@ */
+	if (cp >= 0x5B && cp <= 0x60)
+		return 1;	/* [\]^_` */
+	if (cp >= 0x7B && cp <= 0x7E)
+		return 1;	/* {|}~ */
+	return 0;
+}
+
+static void
+find_word_bounds(const struct vt_cell *screen, int cols,
+    int row, int col, int cmin, int cmax, int *out_c0, int *out_c1)
+{
+	const struct vt_cell *line = &screen[row * cols];
+	int c0 = col, c1 = col;
+
+	while (c0 > cmin && !is_word_sep(line[c0 - 1].codepoint))
+		c0--;
+	while (c1 < cmax && !is_word_sep(line[c1 + 1].codepoint))
+		c1++;
+	*out_c0 = c0;
+	*out_c1 = c1;
 }
 
 /* ---- clipboard tool fallback ---- */
@@ -131,6 +166,7 @@ sel_begin(uint32_t win_id, int row, int col, int win_x, int win_w)
 {
 	sel_dragging = 1;
 	sel_visible = 0;
+	cur_mode = SEL_MODE_CHAR;
 	sel_win_id = win_id;
 	sel_sr = row;
 	sel_sc = col;
@@ -141,10 +177,99 @@ sel_begin(uint32_t win_id, int row, int col, int win_x, int win_w)
 }
 
 void
+sel_begin_word(uint32_t win_id, int row, int col, int win_x, int win_w,
+    const struct vt_cell *screen, int scr_cols)
+{
+	int c0, c1;
+
+	sel_dragging = 1;
+	sel_visible = 0;
+	cur_mode = SEL_MODE_WORD;
+	sel_win_id = win_id;
+	sel_col_min = win_x;
+	sel_col_max = win_x + win_w - 1;
+
+	find_word_bounds(screen, scr_cols, row, col,
+	    sel_col_min, sel_col_max, &c0, &c1);
+
+	sel_sr = row;
+	sel_sc = c0;
+	sel_er = row;
+	sel_ec = c1;
+	sel_anchor_r = row;
+	sel_anchor_c0 = c0;
+	sel_anchor_c1 = c1;
+}
+
+void
+sel_begin_line(uint32_t win_id, int row, int win_x, int win_w)
+{
+	sel_dragging = 1;
+	sel_visible = 0;
+	cur_mode = SEL_MODE_LINE;
+	sel_win_id = win_id;
+	sel_col_min = win_x;
+	sel_col_max = win_x + win_w - 1;
+
+	sel_sr = row;
+	sel_sc = sel_col_min;
+	sel_er = row;
+	sel_ec = sel_col_max;
+	sel_anchor_r = row;
+	sel_anchor_c0 = sel_col_min;
+	sel_anchor_c1 = sel_col_max;
+}
+
+void
 sel_update(int row, int col)
 {
 	sel_er = row;
 	sel_ec = col;
+}
+
+void
+sel_update_word(int row, int col,
+    const struct vt_cell *screen, int scr_cols)
+{
+	int c0, c1;
+
+	find_word_bounds(screen, scr_cols, row, col,
+	    sel_col_min, sel_col_max, &c0, &c1);
+
+	if (row < sel_anchor_r ||
+	    (row == sel_anchor_r && c0 < sel_anchor_c0)) {
+		sel_sr = sel_anchor_r;
+		sel_sc = sel_anchor_c1;
+		sel_er = row;
+		sel_ec = c0;
+	} else {
+		sel_sr = sel_anchor_r;
+		sel_sc = sel_anchor_c0;
+		sel_er = row;
+		sel_ec = c1;
+	}
+}
+
+void
+sel_update_line(int row)
+{
+	if (row < sel_anchor_r) {
+		sel_sr = sel_anchor_r;
+		sel_sc = sel_col_max;
+		sel_er = row;
+		sel_ec = sel_col_min;
+	} else {
+		sel_sr = sel_anchor_r;
+		sel_sc = sel_col_min;
+		sel_er = row;
+		sel_ec = sel_col_max;
+	}
+}
+
+enum sel_mode
+sel_get_mode(void)
+{
+	return cur_mode;
 }
 
 void
@@ -239,6 +364,7 @@ sel_clear(void)
 {
 	sel_dragging = 0;
 	sel_visible = 0;
+	cur_mode = SEL_MODE_CHAR;
 }
 
 int

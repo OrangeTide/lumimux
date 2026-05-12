@@ -66,20 +66,55 @@ write_to_pty(const char *data, size_t len)
 	}
 }
 
-/* ---- screen dump callback for replay on attach ---- */
+/* ---- buffered screen dump for replay on attach ---- */
+
+#define REPLAY_BUFSZ	32768
+
+struct replay_buf {
+	int fd;
+	char buf[REPLAY_BUFSZ];
+	uint32_t used;
+};
+
+static void
+replay_flush(struct replay_buf *rb)
+{
+	if (rb->used > 0) {
+		ipc_msg_send(rb->fd, IPC_MSG_OUTPUT,
+		    rb->buf, rb->used);
+		rb->used = 0;
+	}
+}
 
 static void
 dump_to_client(void *ctx, const char *data, size_t len)
 {
-	int fd = *(int *)ctx;
+	struct replay_buf *rb = ctx;
 
-	ipc_msg_send(fd, IPC_MSG_OUTPUT, data, (uint32_t)len);
+	while (len > 0) {
+		uint32_t space = REPLAY_BUFSZ - rb->used;
+		uint32_t chunk = (uint32_t)len;
+
+		if (chunk > space)
+			chunk = space;
+		memcpy(rb->buf + rb->used, data, chunk);
+		rb->used += chunk;
+		data += chunk;
+		len -= chunk;
+		if (rb->used == REPLAY_BUFSZ)
+			replay_flush(rb);
+	}
 }
 
 static void
 send_replay(int fd)
 {
-	window_dump(win, dump_to_client, &fd);
+	struct replay_buf rb;
+
+	rb.fd = fd;
+	rb.used = 0;
+	window_dump(win, dump_to_client, &rb);
+	replay_flush(&rb);
 }
 
 /* ---- title tracking ---- */

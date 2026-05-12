@@ -149,6 +149,12 @@ static int sel_press_row, sel_press_col;
 static uint32_t sel_press_id;
 static struct tkbd_seq sel_press_seq;	/* saved press for click-through */
 
+/* double/triple click tracking */
+static int sel_click_count;
+static int sel_click_row, sel_click_col;
+static uint32_t sel_click_id;
+static int sel_dblclick_timer_id = -1;
+
 static struct mconn *
 mconn_find_by_fd(int fd)
 {
@@ -534,6 +540,16 @@ on_prefix_timeout(struct keys *k, void *arg)
 
 	if (client_mode != CLIENT_MODE_MINIMAL)
 		menu_show();
+}
+
+static void
+on_dblclick_timeout(struct iox_loop *lp, void *arg)
+{
+	(void)lp;
+	(void)arg;
+
+	sel_click_count = 0;
+	sel_dblclick_timer_id = -1;
 }
 
 static void
@@ -929,6 +945,12 @@ scrollback_enter(void)
 		    " [scrollback ${offset}/${total} -- q to exit]");
 	}
 
+	if (sel_active()) {
+		sel_clear();
+		turbo_need_full = 1;
+		tile_need_full = 1;
+	}
+
 	scrollback_mode = 1;
 	scrollback_offset = 0;
 	scrollback_win_id = cw->id;
@@ -949,6 +971,9 @@ static void
 scrollback_leave(void)
 {
 	struct client_window *cw;
+
+	if (sel_active())
+		sel_clear();
 
 	cw = scrollback_cwin();
 	if (cw && cw->vt)
@@ -1170,6 +1195,8 @@ turbo_sync_focus(void)
 	struct client_window *cw;
 
 	if (turbo_focused_id(&id)) {
+		if (scrollback_mode && id != scrollback_win_id)
+			scrollback_leave();
 		watched_id = id;
 		watching = 1;
 		cw = cwin_find(id);
@@ -1889,7 +1916,6 @@ micro_cycle_focus(int dir)
 	if (client_mode == CLIENT_MODE_TURBO) {
 		wm_unminimize(wmgr, watched_id);
 		wm_focus(wmgr, watched_id);
-		turbo_need_full = 1;
 	} else {
 		/* swap the focused pane to show the selected window */
 		uint32_t old_id = tile_focused_id(tilemgr);
@@ -1927,7 +1953,6 @@ micro_select_window(uint32_t id)
 	if (client_mode == CLIENT_MODE_TURBO) {
 		wm_unminimize(wmgr, id);
 		wm_focus(wmgr, id);
-		turbo_need_full = 1;
 	} else {
 		/* swap the focused pane to show the selected window */
 		uint32_t old_id = tile_focused_id(tilemgr);
@@ -2127,7 +2152,6 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 				wm_minimize(wmgr, fid);
 				/* focus next visible window */
 				micro_cycle_focus(1);
-				turbo_need_full = 1;
 				need_render = 1;
 				need_status = 1;
 			}
@@ -2140,7 +2164,6 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 			if (turbo_focused_id(&fid)) {
 				wm_toggle_maximize(wmgr, fid);
 				turbo_sync_size(fid);
-				turbo_need_full = 1;
 				need_render = 1;
 			}
 		}
@@ -2175,7 +2198,6 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 						    w->flags &
 						    ~WM_WIN_SCROLL_LOCK);
 				}
-				turbo_need_full = 1;
 			}
 			need_render = 1;
 			need_status = 1;
@@ -2203,7 +2225,6 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 						    w->flags &
 						    ~WM_WIN_INPUT_LOCK);
 				}
-				turbo_need_full = 1;
 			}
 			need_render = 1;
 			need_status = 1;
@@ -2222,6 +2243,24 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 	case KEYS_ACTION_TOGGLE_MODE:
 		mode_toggle();
 		break;
+	case KEYS_ACTION_ARRANGE_GRID:
+		if (client_mode == CLIENT_MODE_TURBO && wmgr) {
+			int gi;
+
+			wm_arrange_grid(wmgr);
+			for (gi = 0; gi < wm_count(wmgr); gi++) {
+				struct wm_window *gw;
+
+				gw = wm_window_at(wmgr, gi);
+				if (gw && !gw->minimized)
+					turbo_sync_size(gw->id);
+			}
+			turbo_save_layout(session_name);
+			turbo_need_full = 1;
+			need_render = 1;
+			need_status = 1;
+		}
+		break;
 	default:
 		break;
 	}
@@ -2235,7 +2274,6 @@ void
 color_picker_set_theme(uint32_t id, const struct tui_theme *t)
 {
 	wm_set_theme(wmgr, id, t);
-	turbo_need_full = 1;
 	need_render = 1;
 }
 
@@ -2297,8 +2335,6 @@ handle_mouse_turbo(struct iox_loop *loop, const struct tkbd_seq *seq)
 	uint32_t id;
 	enum wm_hit area;
 
-	(void)loop;
-
 	/* tkbd converts SGR 1-based coords to 0-based */
 	row = seq->y;
 	col = seq->x;
@@ -2327,7 +2363,6 @@ handle_mouse_turbo(struct iox_loop *loop, const struct tkbd_seq *seq)
 			}
 			sel_update(row, col);
 			sel_pending = 0;
-			turbo_need_full = 1;
 			need_render = 1;
 			return;
 		}
@@ -2345,8 +2380,18 @@ handle_mouse_turbo(struct iox_loop *loop, const struct tkbd_seq *seq)
 				else if (col >= sw->x + sw->w)
 					col = sw->x + sw->w - 1;
 			}
-			sel_update(row, col);
-			turbo_need_full = 1;
+			switch (sel_get_mode()) {
+			case SEL_MODE_WORD:
+				sel_update_word(row, col,
+				    wm_screen(wmgr), wm_cols(wmgr));
+				break;
+			case SEL_MODE_LINE:
+				sel_update_line(row);
+				break;
+			default:
+				sel_update(row, col);
+				break;
+			}
 			need_render = 1;
 			return;
 		}
@@ -2423,6 +2468,10 @@ handle_mouse_turbo(struct iox_loop *loop, const struct tkbd_seq *seq)
 	    seq->key == TKBD_MOUSE_WHEEL_DOWN) {
 		struct client_window *fcw = cwin_focused();
 
+		if (sel_active()) {
+			sel_clear();
+			turbo_need_full = 1;
+		}
 		if (fcw && fcw->vt &&
 		    fcw->vt->active_target != VT_TARGET_ALT) {
 			if (seq->key == TKBD_MOUSE_WHEEL_UP) {
@@ -2448,7 +2497,6 @@ handle_mouse_turbo(struct iox_loop *loop, const struct tkbd_seq *seq)
 		/* clear previous selection on new click */
 		if (sel_active()) {
 			sel_clear();
-			turbo_need_full = 1;
 			need_render = 1;
 		}
 
@@ -2481,7 +2529,6 @@ handle_mouse_turbo(struct iox_loop *loop, const struct tkbd_seq *seq)
 		if (area == WM_HIT_MINIMIZE) {
 			wm_minimize(wmgr, id);
 			micro_cycle_focus(1);
-			turbo_need_full = 1;
 			need_render = 1;
 			need_status = 1;
 			return;
@@ -2489,7 +2536,6 @@ handle_mouse_turbo(struct iox_loop *loop, const struct tkbd_seq *seq)
 		if (area == WM_HIT_MAXIMIZE) {
 			wm_toggle_maximize(wmgr, id);
 			turbo_sync_size(id);
-			turbo_need_full = 1;
 			need_render = 1;
 			return;
 		}
@@ -2535,8 +2581,55 @@ handle_mouse_turbo(struct iox_loop *loop, const struct tkbd_seq *seq)
 			return;
 		}
 		if (area == WM_HIT_CONTENT) {
-			/* defer: wait for motion to distinguish
-			 * click from drag-select */
+			int near;
+
+			near = (id == sel_click_id &&
+			    abs(row - sel_click_row) <= 0 &&
+			    abs(col - sel_click_col) <= 2);
+
+			if (near && sel_dblclick_timer_id >= 0) {
+				sel_click_count++;
+				iox_timer_remove(loop, sel_dblclick_timer_id);
+			} else {
+				sel_click_count = 1;
+			}
+			sel_dblclick_timer_id = iox_timer_add(loop, 500,
+			    on_dblclick_timeout, NULL);
+			sel_click_row = row;
+			sel_click_col = col;
+			sel_click_id = id;
+
+			if (sel_click_count == 2) {
+				struct wm_window *sw;
+
+				sw = wm_find(wmgr, id);
+				if (sw) {
+					const struct vt_cell *scr;
+
+					scr = wm_screen(wmgr);
+					sel_begin_word(id, row, col,
+					    sw->x, sw->w,
+					    scr, wm_cols(wmgr));
+				}
+				sel_press_id = id;
+				turbo_need_full = 1;
+				need_render = 1;
+				return;
+			}
+			if (sel_click_count >= 3) {
+				struct wm_window *sw;
+
+				sel_click_count = 3;
+				sw = wm_find(wmgr, id);
+				if (sw)
+					sel_begin_line(id, row,
+					    sw->x, sw->w);
+				sel_press_id = id;
+				turbo_need_full = 1;
+				need_render = 1;
+				return;
+			}
+			/* single click: defer for drag detection */
 			sel_pending = 1;
 			sel_press_row = row;
 			sel_press_col = col;
@@ -2578,7 +2671,6 @@ handle_mouse_turbo(struct iox_loop *loop, const struct tkbd_seq *seq)
 			int nc = wm_cols(wmgr);
 
 			sel_finish(scr, nr, nc);
-			turbo_need_full = 1;
 			need_render = 1;
 			return;
 		}
@@ -2682,7 +2774,19 @@ handle_mouse(struct iox_loop *loop, const struct tkbd_seq *seq)
 			return;
 		}
 		if (sel_active()) {
-			sel_update(row, col);
+			switch (sel_get_mode()) {
+			case SEL_MODE_WORD:
+				sel_update_word(row, col,
+				    tile_screen(tilemgr),
+				    tile_cols(tilemgr));
+				break;
+			case SEL_MODE_LINE:
+				sel_update_line(row);
+				break;
+			default:
+				sel_update(row, col);
+				break;
+			}
 			tile_need_full = 1;
 			need_render = 1;
 			return;
@@ -2695,6 +2799,10 @@ handle_mouse(struct iox_loop *loop, const struct tkbd_seq *seq)
 	    seq->key == TKBD_MOUSE_WHEEL_DOWN) {
 		struct client_window *fcw = cwin_focused();
 
+		if (sel_active()) {
+			sel_clear();
+			tile_need_full = 1;
+		}
 		if (fcw && fcw->vt &&
 		    fcw->vt->active_target != VT_TARGET_ALT) {
 			if (seq->key == TKBD_MOUSE_WHEEL_UP) {
@@ -2715,10 +2823,49 @@ handle_mouse(struct iox_loop *loop, const struct tkbd_seq *seq)
 	}
 
 	if (seq->key == TKBD_MOUSE_LEFT) {
+		int near;
+
 		if (sel_active()) {
 			sel_clear();
 			tile_need_full = 1;
 			need_render = 1;
+		}
+
+		near = (sel_click_id == 0 &&
+		    abs(row - sel_click_row) <= 0 &&
+		    abs(col - sel_click_col) <= 2);
+
+		if (near && sel_dblclick_timer_id >= 0) {
+			sel_click_count++;
+			iox_timer_remove(loop, sel_dblclick_timer_id);
+		} else {
+			sel_click_count = 1;
+		}
+		sel_dblclick_timer_id = iox_timer_add(loop, 500,
+		    on_dblclick_timeout, NULL);
+		sel_click_row = row;
+		sel_click_col = col;
+		sel_click_id = 0;
+
+		if (sel_click_count == 2) {
+			const struct vt_cell *scr;
+			int nc;
+
+			scr = tile_screen(tilemgr);
+			nc = tile_cols(tilemgr);
+			sel_begin_word(0, row, col, 0, nc, scr, nc);
+			sel_press_id = 0;
+			tile_need_full = 1;
+			need_render = 1;
+			return;
+		}
+		if (sel_click_count >= 3) {
+			sel_click_count = 3;
+			sel_begin_line(0, row, 0, wm_cols(wmgr));
+			sel_press_id = 0;
+			tile_need_full = 1;
+			need_render = 1;
+			return;
 		}
 		/* defer press for drag detection */
 		sel_pending = 1;
@@ -2947,9 +3094,24 @@ dispatch_input(struct iox_loop *loop, const struct tkbd_seq *seq)
 		}
 	}
 
+	/* Escape dismisses a visible selection even outside scrollback */
+	if (seq->key == TKBD_KEY_ESC && sel_active() && !scrollback_mode) {
+		sel_clear();
+		turbo_need_full = 1;
+		tile_need_full = 1;
+		need_render = 1;
+		return;
+	}
+
 	/* scrollback mode: arrow/vim keys to scroll, q/ESC/Enter to exit */
 	if (scrollback_mode) {
 		int handled = 1;
+
+		if (sel_active()) {
+			sel_clear();
+			turbo_need_full = 1;
+			tile_need_full = 1;
+		}
 
 		switch (seq->key) {
 		case TKBD_KEY_UP:
@@ -3401,7 +3563,6 @@ remove_window(struct iox_loop *lp, uint32_t pid)
 				vt = cw->vt;
 			wm_focus(wmgr, watched_id);
 		}
-		turbo_need_full = 1;
 		need_render = 1;
 		need_status = 1;
 		return;
@@ -3442,78 +3603,90 @@ on_mserver_read(struct iox_loop *lp, int fd, unsigned events, void *arg)
 	struct mconn *mc = arg;
 	uint32_t type, len;
 	char buf[4096];
-	int rc;
+	int rc, batch;
 
 	(void)events;
 
-	rc = ipc_msg_recv(fd, &type, buf, sizeof(buf), &len);
-	if (rc != 0) {
-		/* mserver disconnected -- child process exited */
-		uint32_t pid = (uint32_t)mc->pid;
-		struct client_window *cw = cwin_find(pid);
+	/* drain all immediately available messages so a burst of
+	 * small IPC writes (e.g. screen replay) is processed in
+	 * one pass instead of one message per event-loop iteration */
+	for (batch = 0; batch < 4096; batch++) {
+		rc = ipc_msg_recv(fd, &type, buf, sizeof(buf), &len);
+		if (rc != 0) {
+			uint32_t pid = (uint32_t)mc->pid;
+			struct client_window *cw = cwin_find(pid);
 
-		if (cw && cwin_should_keep_open(cw)) {
-			/* keep window open: mark dead, close socket */
-			cw->dead = 1;
-			iox_fd_remove(lp, fd);
-			ipc_close(fd);
-			mc->fd = -1;
-			if (client_mode == CLIENT_MODE_TURBO) {
-				struct wm_window *win;
+			if (cw && cwin_should_keep_open(cw)) {
+				cw->dead = 1;
+				iox_fd_remove(lp, fd);
+				ipc_close(fd);
+				mc->fd = -1;
+				if (client_mode == CLIENT_MODE_TURBO) {
+					struct wm_window *win;
 
-				win = wm_find(wmgr, pid);
-				if (win)
-					wm_set_flags(wmgr, pid,
-					    win->flags | WM_WIN_DEAD);
-				turbo_need_full = 1;
+					win = wm_find(wmgr, pid);
+					if (win)
+						wm_set_flags(wmgr, pid,
+						    win->flags |
+						    WM_WIN_DEAD);
+				}
+				mconn_sync_winlist();
+				need_render = 1;
+				need_status = 1;
+				return;
 			}
-			mconn_sync_winlist();
-			need_render = 1;
-			need_status = 1;
+
+			remove_window(lp, pid);
 			return;
 		}
 
-		remove_window(lp, pid);
-		return;
-	}
+		switch (type) {
+		case IPC_MSG_OUTPUT:
+			{
+				struct client_window *cw;
+				uint32_t win_id = (uint32_t)mc->pid;
 
-	switch (type) {
-	case IPC_MSG_OUTPUT:
+				cw = cwin_find(win_id);
+				if (!cw)
+					break;
+
+				predict_confirm(cw->pred, cw->vt,
+				    buf, len);
+				vt_parse_feed(cw->parser, buf, len);
+				sync_vt_title(win_id, cw->vt);
+				need_render = 1;
+				need_status = 1;
+			}
+			break;
+
+		case IPC_MSG_PTY_FLAGS:
+			if (len >= 1) {
+				struct client_window *cw;
+				uint32_t win_id = (uint32_t)mc->pid;
+				uint8_t flags = (uint8_t)buf[0];
+
+				cw = cwin_find(win_id);
+				if (cw)
+					predict_set_echo(cw->pred,
+					    flags & IPC_PTY_ECHO);
+			}
+			break;
+
+		case IPC_MSG_DETACH:
+			iox_loop_stop(lp);
+			return;
+
+		default:
+			break;
+		}
+
 		{
-			struct client_window *cw;
-			uint32_t win_id = (uint32_t)mc->pid;
+			int avail = 0;
 
-			cw = cwin_find(win_id);
-			if (!cw)
+			if (ioctl(fd, FIONREAD, &avail) < 0 ||
+			    avail < IPC_HDR_SIZE)
 				break;
-
-			predict_confirm(cw->pred, cw->vt, buf, len);
-			vt_parse_feed(cw->parser, buf, len);
-			sync_vt_title(win_id, cw->vt);
-			need_render = 1;
-			need_status = 1;
 		}
-		break;
-
-	case IPC_MSG_PTY_FLAGS:
-		if (len >= 1) {
-			struct client_window *cw;
-			uint32_t win_id = (uint32_t)mc->pid;
-			uint8_t flags = (uint8_t)buf[0];
-
-			cw = cwin_find(win_id);
-			if (cw)
-				predict_set_echo(cw->pred,
-				    flags & IPC_PTY_ECHO);
-		}
-		break;
-
-	case IPC_MSG_DETACH:
-		iox_loop_stop(lp);
-		break;
-
-	default:
-		break;
 	}
 }
 
@@ -3681,7 +3854,6 @@ on_sessdir_watch(struct iox_loop *lp, int fd, unsigned events, void *arg)
 		turbo_sync_windows();
 		if (watching)
 			wm_focus(wmgr, watched_id);
-		turbo_need_full = 1;
 		need_render = 1;
 		need_status = 1;
 		return;

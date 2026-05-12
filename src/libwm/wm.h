@@ -128,6 +128,10 @@ int wm_mouse_drag(struct wm *wm, int row, int col);
  * sets *resized to 1 if a resize occurred (caller must resize PTY). */
 uint32_t wm_mouse_release(struct wm *wm, int *resized);
 
+/* arrange all non-minimized windows into a grid that fills the screen.
+ * returns 0 on success, -1 if no eligible windows. */
+int wm_arrange_grid(struct wm *wm);
+
 /* minimum content dimensions for resize */
 #define WM_MIN_WIDTH	4
 #define WM_MIN_HEIGHT	2

@@ -481,7 +481,7 @@ TARGET_TRIPLET := $(shell $(CC) -dumpmachine 2>/dev/null)
 
 # Cross-toolchain prefix derived from $(CC) so OBJCOPY/STRIP match the target.
 # e.g. CC=aarch64-linux-gnu-gcc -> aarch64-linux-gnu-objcopy.  Empty for native.
-_TOOLCHAIN_PREFIX := $(shell echo "$(CC)" | sed -E 's|.*/||; s/(gcc|clang|cc)(-[0-9.]+)?$$//')
+_TOOLCHAIN_PREFIX := $(shell echo "$(CC)" | sed -E 's|.*/||; s/^musl-//; s/(gcc|clang|cc)(-[0-9.]+)?$$//')
 OBJCOPY ?= $(_TOOLCHAIN_PREFIX)objcopy
 STRIP   ?= $(_TOOLCHAIN_PREFIX)strip
 

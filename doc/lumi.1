@@ -262,7 +262,9 @@ Session name (required).
 All key bindings use a prefix key (default:
 .BR Ctrl\-A )
 followed by a second key.
-Press the prefix key twice to send a literal
+Press the prefix key twice, or press
+.BR a ,
+to send a literal
 .B Ctrl\-A
 to the terminal.
 .PP
@@ -289,6 +291,7 @@ t	Toggle between turbo and screen modes
 m	Minimize window (turbo mode)
 f	Maximize window (turbo mode)
 P	Window color picker (turbo mode)
+G	Arrange windows in grid (turbo mode)
 S	Toggle scroll lock
 I	Toggle input lock
 U	Session picker
@@ -484,6 +487,7 @@ input\-lock	Toggle input lock
 session\-list	Session picker
 paste	Paste from internal clipboard
 clipboard\-sync	Sync internal clipboard to system
+arrange\-grid	Arrange windows in grid (turbo mode)
 none	Unbind key
 .TE
 .SH SCROLLBACK MODE
@@ -526,6 +530,8 @@ Close window.
 Focus window and deliver click to the application.
 .PP
 In all modes, mouse text selection copies to the internal clipboard.
+Double-click selects a word; triple-click selects a full line.
+Dragging after a double- or triple-click extends by word or line units.
 Use
 .B Ctrl\-A ]
 to paste and

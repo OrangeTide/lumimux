@@ -24,8 +24,8 @@ struct win_info {
 };
 
 #define ACTIVE_MARKER "\xe2\x9c\xb1"	/* U+2731 HEAVY ASTERISK ✱ */
-#define TAB_LEFT "\xe2\x96\x9f"		/* U+259F ▟ */
-#define TAB_RIGHT "\xe2\x96\x99"	/* U+2599 ▙ */
+#define TAB_LEFT "\xe2\x95\xb1"		/* U+2571 ╱ */
+#define TAB_RIGHT "\xe2\x95\xb2"	/* U+2572 ╲ */
 
 static struct win_info win_list[WIN_INFO_MAX];
 static int win_count;
