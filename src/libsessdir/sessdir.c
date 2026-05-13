@@ -3,6 +3,7 @@
  * Licensed under MIT-0 OR PUBLIC DOMAIN */
 
 #include "sessdir.h"
+#include "sessdir_state.h"
 #include "xmalloc.h"
 
 #include <dirent.h>
@@ -285,6 +286,7 @@ sessdir_cleanup_stale(const char *session)
 {
 	pid_t pids[64];
 	int n, i, removed = 0;
+	struct sessdir_state *st = NULL;
 
 	n = sessdir_list_servers(session, pids, 64);
 	if (n < 0)
@@ -292,9 +294,15 @@ sessdir_cleanup_stale(const char *session)
 
 	for (i = 0; i < n; i++) {
 		if (!sessdir_server_alive(pids[i])) {
+			if (!st)
+				st = sessdir_state_open(session);
+			if (st)
+				sessdir_state_remove_server(st, pids[i]);
 			sessdir_server_destroy(session, pids[i]);
 			removed++;
 		}
 	}
+
+	sessdir_state_close(st);
 	return removed;
 }

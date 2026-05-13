@@ -1,5 +1,22 @@
 # lumiMUX Release Notes
 
+## v26.05.4 -- 2026-05-12
+
+### TERM environment variable
+
+Child shells now inherit `TERM=xterm-256color` instead of
+`screen-256color`. This avoids missing terminfo entries on hosts
+that ship xterm profiles but not screen profiles.
+
+### Stale session state cleanup
+
+`sessdir_cleanup_stale` now removes dead server entries from the
+session state file before destroying their socket directories,
+preventing phantom windows from appearing in the window list after
+a server crash.
+
+---
+
 ## v26.05.3 -- 2026-05-11
 
 ### Double/triple-click text selection

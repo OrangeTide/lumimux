@@ -42,7 +42,7 @@ pty_open(int *child_pid, const char *shell)
 		lu_umask_restore();
 
 		/* set TERM so child shell uses the right terminfo entry */
-		setenv("TERM", "screen-256color", 1);
+		setenv("TERM", "xterm-256color", 1);
 
 		if (!shell)
 			shell = getenv("SHELL");
