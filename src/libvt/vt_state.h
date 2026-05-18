@@ -28,6 +28,7 @@ enum vt_target {
 #define VT_MODE_BRACKETPASTE	(1u << 5)
 #define VT_MODE_DECCKM		(1u << 6)
 #define VT_MODE_DECKPAM		(1u << 7)
+#define VT_MODE_MOUSE		(1u << 8)
 
 /* saved cursor state (DECSC/DECRC) */
 struct vt_saved_cursor {
@@ -71,6 +72,9 @@ struct vt_state {
 
 	/* reply fd for DSR/DA responses (-1 = disabled) */
 	int		reply_fd;
+
+	/* child mouse tracking mode (0 = off, 1000/1002/1003) */
+	int		mouse_mode;
 
 	/* keyboard enhancement protocols */
 	int		kitty_kbd_flags;	/* CSI > flags u (0 = off) */

@@ -1,5 +1,51 @@
 # lumiMUX Release Notes
 
+## v26.05.5 -- 2026-05-18
+
+### Mouse event filtering
+
+The VT emulator now tracks DECSET 1000/1002/1003 mouse modes in
+`vt_state`. Click-through forwarding is gated on the child having
+enabled mouse tracking, so applications that never request it (such
+as GNU Screen running inside lumi) no longer receive raw SGR mouse
+sequences as escape code garbage.
+
+### Attach client buffer overread
+
+The server sends replay data in up to 32 KB IPC messages, but
+`on_mserver_read()` and `on_proxy_read()` received into 4 KB stack
+buffers. `ipc_msg_recv()` truncated the payload but reported the
+original wire length, so `vt_parse_feed()` read past the buffer into
+stale stack memory and produced garbled output on reattach. Both
+receive buffers are now sized to `IPC_MAX_PAYLOAD`, and
+`ipc_msg_recv()` / `proxy_msg_recv()` cap the reported length on
+truncation as defense in depth.
+
+### Stale pointer after mconn swap-remove
+
+When a window was removed, the swap-remove compaction invalidated
+the iox callback argument pointer for the moved element.
+`on_mserver_read` now looks up the mconn by fd instead of trusting
+the stale pointer, preventing output from being routed to the wrong
+window.
+
+### Other changes
+
+- CSI 21t (XTWINOPS report title) is handled in the VT parser,
+  responding with the window title via OSC l and preventing the query
+  from passing through to the outer terminal.
+- Selection highlight no longer flashes every other frame in turbo
+  mode; the compositor is forced to recomposite while a selection is
+  active so the reverse-video XOR always applies to a clean buffer.
+- Mouse segfault in screen mode fixed: selection bounds used
+  `wm_cols()` on a NULL window manager instead of `content_cols`.
+- Negative-row guard added to `sel_finish()` to match the existing
+  guard in `sel_highlight()`.
+- `parse_mouse_seq()` now populates `seq->data`/`len` so mouse
+  events can be forwarded to child PTYs via click-through.
+
+---
+
 ## v26.05.4 -- 2026-05-12
 
 ### TERM environment variable

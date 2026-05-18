@@ -776,6 +776,13 @@ any_vt_dirty(const struct wm *wm)
 }
 
 void
+wm_invalidate(struct wm *wm)
+{
+	if (wm)
+		wm->composite_needed = 1;
+}
+
+void
 wm_composite(struct wm *wm, const struct tui_theme *theme)
 {
 	int order[WM_MAX_WINDOWS][2]; /* [z, index] */

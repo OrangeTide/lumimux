@@ -483,6 +483,12 @@ op_csi(void *ctx, const int *params, int nparam, int intermed, int final)
 			case 1049:	/* alt screen + save cursor */
 				vt_state_altscreen_enter(st);
 				break;
+			case 1000:
+			case 1002:
+			case 1003:
+				st->mouse_mode = n;
+				st->modes |= VT_MODE_MOUSE;
+				break;
 			case 2004:
 				st->modes |= VT_MODE_BRACKETPASTE;
 				break;
@@ -508,6 +514,12 @@ op_csi(void *ctx, const int *params, int nparam, int intermed, int final)
 			case 1047:	/* alt screen (xterm) */
 			case 1049:	/* alt screen + restore cursor */
 				vt_state_altscreen_leave(st);
+				break;
+			case 1000:
+			case 1002:
+			case 1003:
+				st->mouse_mode = 0;
+				st->modes &= ~VT_MODE_MOUSE;
 				break;
 			case 2004:
 				st->modes &= ~VT_MODE_BRACKETPASTE;
@@ -744,6 +756,21 @@ op_csi(void *ctx, const int *params, int nparam, int intermed, int final)
 			vt_state_tab_clear(st, st->cursor_col);
 		else if (n == 3)
 			vt_state_tab_reset(st);
+		break;
+
+	case 't':	/* XTWINOPS -- window operations */
+		n = param_or(params, nparam, 0, 0);
+		if (n == 21) {
+			/* report window title: OSC l <title> ST */
+			const char *title = st->title ? st->title : "";
+			char rsp[256];
+			int len;
+
+			len = snprintf(rsp, sizeof(rsp),
+			    "\033]l%s\033\\", title);
+			if (len > 0 && (size_t)len < sizeof(rsp))
+				vt_reply(st, rsp, (size_t)len);
+		}
 		break;
 
 	case 'Z':	/* CBT -- cursor back tab */

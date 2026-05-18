@@ -685,6 +685,9 @@ static int parse_mouse_seq(struct tkbd_seq *seq, const char *buf, int len)
 		seq->x = (uint8_t)buf[4] - 1 - 32;
 		seq->y = (uint8_t)buf[5] - 1 - 32;
 
+		seq->len = 6;
+		memcpy(seq->data, buf, 6);
+
 		return 6;
 	} else {
 		// xterm 1006 extended mode or urxvt 1015 extended mode
@@ -764,6 +767,9 @@ static int parse_mouse_seq(struct tkbd_seq *seq, const char *buf, int len)
 
 		seq->x = n2 - 1;
 		seq->y = n3 - 1;
+
+		seq->len = MIN((size_t)(mi + 1), TKBD_SEQ_MAX);
+		memcpy(seq->data, buf, seq->len);
 
 		return mi + 1;
 	}

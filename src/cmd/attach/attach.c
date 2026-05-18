@@ -830,6 +830,8 @@ turbo_render(void)
 {
 	int crow, ccol, cvis;
 
+	if (sel_active())
+		wm_invalidate(wmgr);
 	wm_composite(wmgr, theme);
 	if (sel_active())
 		sel_highlight(wm_screen_mut(wmgr),
@@ -2285,13 +2287,21 @@ color_picker_get_theme(uint32_t id)
 
 /* ---- mouse handling ---- */
 
+static int
+focused_wants_mouse(void)
+{
+	struct client_window *cw = cwin_focused();
+
+	return cw && cw->vt && (cw->vt->modes & VT_MODE_MOUSE);
+}
+
 /* forward a saved press event to the PTY as a click-through */
 static void
 sel_forward_press(void)
 {
 	struct mconn *mc = mconn_focused();
 
-	if (sel_press_seq.len > 0 && mc)
+	if (sel_press_seq.len > 0 && mc && focused_wants_mouse())
 		mconn_ipc_send(mc, IPC_MSG_INPUT,
 		    sel_press_seq.data, (uint32_t)sel_press_seq.len);
 }
@@ -2651,15 +2661,17 @@ handle_mouse_turbo(struct iox_loop *loop, const struct tkbd_seq *seq)
 		/* deferred press with no motion -> click-through */
 		if (sel_pending) {
 			sel_pending = 0;
-			sel_forward_press();
-			/* also forward the release */
-			{
-				struct mconn *mc = mconn_focused();
+			if (focused_wants_mouse()) {
+				sel_forward_press();
+				{
+					struct mconn *mc = mconn_focused();
 
-				if (seq->len > 0 && mc)
-					mconn_ipc_send(mc, IPC_MSG_INPUT,
-					    seq->data,
-					    (uint32_t)seq->len);
+					if (seq->len > 0 && mc)
+						mconn_ipc_send(mc,
+						    IPC_MSG_INPUT,
+						    seq->data,
+						    (uint32_t)seq->len);
+				}
 			}
 			return;
 		}
@@ -2766,7 +2778,7 @@ handle_mouse(struct iox_loop *loop, const struct tkbd_seq *seq)
 	if (seq->mod & TKBD_MOD_MOTION) {
 		if (sel_pending) {
 			sel_begin(0, sel_press_row, sel_press_col,
-			    0, wm_cols(wmgr));
+			    0, content_cols);
 			sel_update(row, col);
 			sel_pending = 0;
 			tile_need_full = 1;
@@ -2861,7 +2873,7 @@ handle_mouse(struct iox_loop *loop, const struct tkbd_seq *seq)
 		}
 		if (sel_click_count >= 3) {
 			sel_click_count = 3;
-			sel_begin_line(0, row, 0, wm_cols(wmgr));
+			sel_begin_line(0, row, 0, content_cols);
 			sel_press_id = 0;
 			tile_need_full = 1;
 			need_render = 1;
@@ -2883,16 +2895,18 @@ handle_mouse(struct iox_loop *loop, const struct tkbd_seq *seq)
 
 	if (seq->key == TKBD_MOUSE_RELEASE) {
 		if (sel_pending) {
-			/* click-through: forward to PTY */
 			sel_pending = 0;
-			sel_forward_press();
-			{
-				struct mconn *mc = mconn_focused();
+			if (focused_wants_mouse()) {
+				sel_forward_press();
+				{
+					struct mconn *mc = mconn_focused();
 
-				if (seq->len > 0 && mc)
-					mconn_ipc_send(mc, IPC_MSG_INPUT,
-					    seq->data,
-					    (uint32_t)seq->len);
+					if (seq->len > 0 && mc)
+						mconn_ipc_send(mc,
+						    IPC_MSG_INPUT,
+						    seq->data,
+						    (uint32_t)seq->len);
+				}
 			}
 			return;
 		}
@@ -3360,7 +3374,7 @@ static void
 on_proxy_read(struct iox_loop *lp, int fd, unsigned events, void *arg)
 {
 	uint32_t window_id, type, len;
-	char buf[4096];
+	char buf[IPC_MAX_PAYLOAD];
 	int rc;
 
 	(void)events;
@@ -3600,12 +3614,17 @@ remove_window(struct iox_loop *lp, uint32_t pid)
 static void
 on_mserver_read(struct iox_loop *lp, int fd, unsigned events, void *arg)
 {
-	struct mconn *mc = arg;
+	struct mconn *mc;
 	uint32_t type, len;
-	char buf[4096];
+	char buf[IPC_MAX_PAYLOAD];
 	int rc, batch;
 
 	(void)events;
+	(void)arg;
+
+	mc = mconn_find_by_fd(fd);
+	if (!mc)
+		return;
 
 	/* drain all immediately available messages so a burst of
 	 * small IPC writes (e.g. screen replay) is processed in

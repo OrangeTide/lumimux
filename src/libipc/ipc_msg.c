@@ -125,6 +125,8 @@ ipc_msg_recv(int fd, uint32_t *out_type, void *buf, size_t bufsz,
 		rc = read_full(fd, buf, bufsz);
 		if (rc != 0)
 			return rc;
+		if (out_len)
+			*out_len = (uint32_t)bufsz;
 		/* discard excess */
 		{
 			char discard[256];

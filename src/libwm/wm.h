@@ -94,6 +94,7 @@ void wm_unminimize(struct wm *wm, uint32_t id);
 int wm_toggle_maximize(struct wm *wm, uint32_t id);
 
 /* compositing -- paints all visible windows into the screen buffer */
+void wm_invalidate(struct wm *wm);
 void wm_composite(struct wm *wm, const struct tui_theme *theme);
 /* compare screen against previous frame and set row_dirty flags.
  * call after wm_composite and any post-composite modifications. */

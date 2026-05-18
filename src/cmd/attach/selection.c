@@ -287,6 +287,8 @@ sel_finish(const struct vt_cell *screen, int rows, int cols)
 
 	pos = 0;
 	for (r = r0; r <= r1 && r < rows; r++) {
+		if (r < 0)
+			continue;
 		start = (r == r0) ? c0 : sel_col_min;
 		end = (r == r1) ? c1 : sel_col_max;
 		if (start < 0)

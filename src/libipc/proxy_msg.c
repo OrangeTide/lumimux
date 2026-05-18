@@ -108,6 +108,9 @@ proxy_msg_recv(int fd, uint32_t *window_id, uint32_t *type,
 		rc = read_full(fd, buf, bufsz);
 		if (rc != 0)
 			return rc;
+		if (len)
+			*len = (uint32_t)bufsz;
+		/* discard excess */
 		{
 			char discard[256];
 			size_t left = l - (uint32_t)bufsz;
