@@ -760,16 +760,12 @@ op_csi(void *ctx, const int *params, int nparam, int intermed, int final)
 
 	case 't':	/* XTWINOPS -- window operations */
 		n = param_or(params, nparam, 0, 0);
-		if (n == 21) {
-			/* report window title: OSC l <title> ST */
-			const char *title = st->title ? st->title : "";
-			char rsp[256];
-			int len;
-
-			len = snprintf(rsp, sizeof(rsp),
-			    "\033]l%s\033\\", title);
-			if (len > 0 && (size_t)len < sizeof(rsp))
-				vt_reply(st, rsp, (size_t)len);
+		if (n == 22) {
+			/* push title onto stack */
+			vt_state_title_push(st);
+		} else if (n == 23) {
+			/* pop title from stack */
+			vt_state_title_pop(st);
 		}
 		break;
 

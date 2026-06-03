@@ -373,7 +373,7 @@
 #   FPC         Free Pascal compiler               (default: fpc)
 #   GM2         GCC Modula-2 frontend              (default: gm2)
 #   AR          Archiver                           (default: ar)
-#   ARFLAGS     Archiver flags                     (default: rvD)
+#   ARFLAGS     Archiver flags                     (default: rvD, rv on macOS)
 #   MKDIR_P     Directory creation command          (default: mkdir -p)
 #   RMDIR       Directory removal command           (default: rmdir)
 #   V           Verbose output.  V=1 prints full command lines.
@@ -465,7 +465,7 @@ endif
 
 MKDIR_P ?= mkdir -p
 RMDIR   ?= rmdir
-ARFLAGS  = rvD
+ARFLAGS  = $(if $(findstring darwin,$(TARGET_TRIPLET)),rv,rvD)
 # Override Make's built-in FC=f77 default, but respect user/env overrides
 ifeq ($(origin FC),default)
   FC := gfortran
@@ -576,30 +576,35 @@ endef
 EXTENSIONS := c cc cpp d m mm f f90 S asm pas mod
 
 # Command Macros
-link.c      = $(_quiet.ld)$(if $(CXX_MODE),$(CXX),$(CC)) -o $@ $(_BUILD_MODE_LDFLAGS) $(PROJECT_LDFLAGS) $(LDFLAGS) $(if $(LIBDIR),-L$(LIBDIR)) $^ $(PROJECT_LDLIBS) $(LDLIBS)
-link.a      = $(_quiet.ar)$(RM) $@.tmp && $(AR) $(ARFLAGS) $@.tmp $(filter %.o,$^) $(_ar_redir) && mv -f $@.tmp $@
-link.so     = $(_quiet.so)$(if $(CXX_MODE),$(CXX),$(CC)) -shared -o $@ $(_BUILD_MODE_LDFLAGS) $(PROJECT_LDFLAGS) $(LDFLAGS) $^ $(PROJECT_LDLIBS) $(LDLIBS)
-compile.c   = $(_quiet.cc)$(CC) -c -o $@ $< -MMD -MF $(@:.o=.dep) $(_BUILD_MODE_CFLAGS) $(_BUILD_MODE_CPPFLAGS) $(PROJECT_CFLAGS) $(PROJECT_CPPFLAGS) $(CFLAGS) $(CPPFLAGS)
-compile.cc  = $(_quiet.cxx)$(CXX) -c -o $@ $< -MMD -MF $(@:.o=.dep) $(_BUILD_MODE_CFLAGS) $(_BUILD_MODE_CPPFLAGS) $(PROJECT_CXXFLAGS) $(PROJECT_CPPFLAGS) $(CXXFLAGS) $(CPPFLAGS)
-compile.cpp = $(_quiet.cxx)$(CXX) -c -o $@ $< -MMD -MF $(@:.o=.dep) $(_BUILD_MODE_CFLAGS) $(_BUILD_MODE_CPPFLAGS) $(PROJECT_CXXFLAGS) $(PROJECT_CPPFLAGS) $(CXXFLAGS) $(CPPFLAGS)
-compile.d   = $(_quiet.gdc)$(GDC) -c -o $@ $< -MMD -MF $(@:.o=.dep) $(_BUILD_MODE_CFLAGS) $(_BUILD_MODE_CPPFLAGS) $(PROJECT_DFLAGS) $(PROJECT_CPPFLAGS) $(DFLAGS)
-compile.m   = $(_quiet.objc)$(CC) -c -o $@ $< -MMD -MF $(@:.o=.dep) $(_BUILD_MODE_CFLAGS) $(_BUILD_MODE_CPPFLAGS) $(PROJECT_CFLAGS) $(PROJECT_CPPFLAGS) $(CFLAGS) $(CPPFLAGS)
-compile.mm  = $(_quiet.objcxx)$(CXX) -c -o $@ $< -MMD -MF $(@:.o=.dep) $(_BUILD_MODE_CFLAGS) $(_BUILD_MODE_CPPFLAGS) $(PROJECT_CXXFLAGS) $(PROJECT_CPPFLAGS) $(CXXFLAGS) $(CPPFLAGS)
-compile.f   = $(_quiet.fc)$(FC) -c -o $@ $< -cpp -MMD -MF $(@:.o=.dep) $(_BUILD_MODE_CFLAGS) $(_BUILD_MODE_CPPFLAGS) $(PROJECT_FFLAGS) $(PROJECT_CPPFLAGS) $(FFLAGS)
-compile.f90 = $(_quiet.fc)$(FC) -c -o $@ $< -cpp -MMD -MF $(@:.o=.dep) $(_BUILD_MODE_CFLAGS) $(_BUILD_MODE_CPPFLAGS) $(PROJECT_FFLAGS) $(PROJECT_CPPFLAGS) $(FFLAGS)
-compile.S   = $(_quiet.as)$(CC) -c -o $@ $< -MMD -MF $(@:.o=.dep) $(_BUILD_MODE_CFLAGS) $(_BUILD_MODE_CPPFLAGS) $(PROJECT_CFLAGS) $(PROJECT_CPPFLAGS) $(ASFLAGS) $(CPPFLAGS)
-compile.asm = $(_quiet.nasm)$(NASM) -f $(NASM_FMT) -o $@ $(NASMFLAGS) $<
-compile.pas = $(_quiet.fpc)$(FPC) -Cn -FE$(@D) -FU$(@D) $(FPCFLAGS) $< $(_fpc_redir)
-compile.mod = $(_quiet.gm2)$(GM2) -c -o $@ $< -fcpp -MMD -MF $(@:.o=.dep) $(_BUILD_MODE_CFLAGS) $(_BUILD_MODE_CPPFLAGS) $(PROJECT_GM2FLAGS) $(PROJECT_CPPFLAGS) $(GM2FLAGS)
+link.c      = $(_quiet.ld)$(MKDIR_P) $(@D) && $(if $(CXX_MODE),$(CXX),$(CC)) -o $@ $(_BUILD_MODE_LDFLAGS) $(PROJECT_LDFLAGS) $(LDFLAGS) $(if $(SHARED_LIBS),-L$(LIBDIR)) $^ $(PROJECT_LDLIBS) $(LDLIBS)
+link.a      = $(_quiet.ar)$(MKDIR_P) $(@D) && $(RM) $@.tmp && $(AR) $(ARFLAGS) $@.tmp $(filter %.o,$^) $(_ar_redir) && mv -f $@.tmp $@
+link.so     = $(_quiet.so)$(MKDIR_P) $(@D) && $(if $(CXX_MODE),$(CXX),$(CC)) -shared -o $@ $(_BUILD_MODE_LDFLAGS) $(PROJECT_LDFLAGS) $(LDFLAGS) $^ $(PROJECT_LDLIBS) $(LDLIBS)
+compile.c   = $(_quiet.cc)$(MKDIR_P) $(@D) && $(CC) -c -o $@ $< -MMD -MF $(@:.o=.dep) $(_BUILD_MODE_CFLAGS) $(_BUILD_MODE_CPPFLAGS) $(PROJECT_CFLAGS) $(PROJECT_CPPFLAGS) $(CFLAGS) $(CPPFLAGS)
+compile.cc  = $(_quiet.cxx)$(MKDIR_P) $(@D) && $(CXX) -c -o $@ $< -MMD -MF $(@:.o=.dep) $(_BUILD_MODE_CFLAGS) $(_BUILD_MODE_CPPFLAGS) $(PROJECT_CXXFLAGS) $(PROJECT_CPPFLAGS) $(CXXFLAGS) $(CPPFLAGS)
+compile.cpp = $(_quiet.cxx)$(MKDIR_P) $(@D) && $(CXX) -c -o $@ $< -MMD -MF $(@:.o=.dep) $(_BUILD_MODE_CFLAGS) $(_BUILD_MODE_CPPFLAGS) $(PROJECT_CXXFLAGS) $(PROJECT_CPPFLAGS) $(CXXFLAGS) $(CPPFLAGS)
+compile.d   = $(_quiet.gdc)$(MKDIR_P) $(@D) && $(GDC) -c -o $@ $< -MMD -MF $(@:.o=.dep) $(_BUILD_MODE_CFLAGS) $(_BUILD_MODE_CPPFLAGS) $(PROJECT_DFLAGS) $(PROJECT_CPPFLAGS) $(DFLAGS)
+compile.m   = $(_quiet.objc)$(MKDIR_P) $(@D) && $(CC) -c -o $@ $< -MMD -MF $(@:.o=.dep) $(_BUILD_MODE_CFLAGS) $(_BUILD_MODE_CPPFLAGS) $(PROJECT_CFLAGS) $(PROJECT_CPPFLAGS) $(CFLAGS) $(CPPFLAGS)
+compile.mm  = $(_quiet.objcxx)$(MKDIR_P) $(@D) && $(CXX) -c -o $@ $< -MMD -MF $(@:.o=.dep) $(_BUILD_MODE_CFLAGS) $(_BUILD_MODE_CPPFLAGS) $(PROJECT_CXXFLAGS) $(PROJECT_CPPFLAGS) $(CXXFLAGS) $(CPPFLAGS)
+compile.f   = $(_quiet.fc)$(MKDIR_P) $(@D) && $(FC) -c -o $@ $< -cpp -MMD -MF $(@:.o=.dep) $(_BUILD_MODE_CFLAGS) $(_BUILD_MODE_CPPFLAGS) $(PROJECT_FFLAGS) $(PROJECT_CPPFLAGS) $(FFLAGS)
+compile.f90 = $(_quiet.fc)$(MKDIR_P) $(@D) && $(FC) -c -o $@ $< -cpp -MMD -MF $(@:.o=.dep) $(_BUILD_MODE_CFLAGS) $(_BUILD_MODE_CPPFLAGS) $(PROJECT_FFLAGS) $(PROJECT_CPPFLAGS) $(FFLAGS)
+compile.S   = $(_quiet.as)$(MKDIR_P) $(@D) && $(CC) -c -o $@ $< -MMD -MF $(@:.o=.dep) $(_BUILD_MODE_CFLAGS) $(_BUILD_MODE_CPPFLAGS) $(PROJECT_CFLAGS) $(PROJECT_CPPFLAGS) $(ASFLAGS) $(CPPFLAGS)
+compile.asm = $(_quiet.nasm)$(MKDIR_P) $(@D) && $(NASM) -f $(NASM_FMT) -o $@ $(NASMFLAGS) $<
+compile.pas = $(_quiet.fpc)$(MKDIR_P) $(@D) && $(FPC) -Cn -FE$(@D) -FU$(@D) $(FPCFLAGS) $< $(_fpc_redir)
+compile.mod = $(_quiet.gm2)$(MKDIR_P) $(@D) && $(GM2) -c -o $@ $< -fcpp -MMD -MF $(@:.o=.dep) $(_BUILD_MODE_CFLAGS) $(_BUILD_MODE_CPPFLAGS) $(PROJECT_GM2FLAGS) $(PROJECT_CPPFLAGS) $(GM2FLAGS)
 
 # Compilation database (compile_commands.json) support.
 # Extensions whose compile commands use GCC-style "-c -o" invocation and
 # are consumable by clangd / LSP tooling.  NASM and FPC are excluded.
 _compdb_exts := c cc cpp d m mm f f90 S mod
 # compdb._emit: write a JSON compilation-database fragment alongside each
-# object file.  Uses $(file) so it runs at recipe-expansion time with no
-# shell overhead.  $(suffix $<) selects the matching compile.X variable.
+# object file.  $(suffix $<) selects the matching compile.X variable.
+# GNU Make 4.0+ uses $(file) for zero shell overhead; older Make falls
+# back to printf.
+ifneq ($(filter 4.% 5.% 6.% 7.% 8.% 9.%,$(MAKE_VERSION)),)
 compdb._emit = $(file >$(@:.o=.cmd.json),{"directory":"$(CURDIR)","command":"$(subst ",\",$(compile.$(patsubst .%,%,$(suffix $<))))","file":"$(abspath $<)"})
+else
+compdb._emit = && printf '%s\n' '{"directory":"$(CURDIR)","command":"$(subst ",\",$(compile.$(patsubst .%,%,$(suffix $<))))","file":"$(abspath $<)"}' > $(@:.o=.cmd.json)
+endif
 
 # Utility Macros
 # explode_dirs: explode a path list into every intermediate directory.
@@ -784,13 +789,13 @@ get_lib_file = $(if $(filter $1,$(LIBRARIES)),$(call get_lib,$1),$(call get_so,$
 # get_all_libs($1) returns all direct and indirect _LIBS for target $1,
 # in topological order (dependents before dependencies) so that the
 # linker resolves symbols correctly with static archives.
-_expand_libs = $(if $1,$(eval _libs_depth += x)$(if $(word 100,$(_libs_depth)),$(error circular _LIBS dependency detected: $1))$(foreach L,$1,$L $(call _expand_libs,$($L_LIBS))))
+_expand_libs = $(if $1,$(if $(word 100,$2),$(error circular _LIBS dependency detected: $1))$(foreach L,$1,$L $(call _expand_libs,$($L_LIBS),$2 x)))
 # _uniq_last: keep last occurrence of each word (preserves topological order
 # so that dependencies appear after their dependents for static linking).
 _rev = $(if $1,$(call _rev,$(wordlist 2,$(words $1),$1)) $(firstword $1))
 _uniq_first = $(if $1,$(firstword $1) $(call _uniq_first,$(filter-out $(firstword $1),$1)))
 _uniq_last = $(call _rev,$(call _uniq_first,$(call _rev,$1)))
-get_all_libs = $(eval _libs_depth :=)$(call _uniq_last,$(call _expand_libs,$($1_LIBS)))
+get_all_libs = $(call _uniq_last,$(call _expand_libs,$($1_LIBS),))
 
 # Collect exported flags from all transitive _LIBS dependencies.
 get_exported_cppflags = $(strip $(foreach L,$(call get_all_libs,$1),$($L_EXPORTED_CPPFLAGS)))
@@ -802,19 +807,19 @@ get_exported_ldlibs   = $(strip $(foreach L,$(call get_all_libs,$1),$($L_EXPORTE
 # needs_cxx: true if target $1 or any transitive dep has C++/Obj-C++ sources
 needs_cxx = $(or $(filter %.cc %.cpp %.mm,$(call get_srcs,$1) $(call get_gen_srcs,$1)),$(strip $(foreach L,$(call get_all_libs,$1),$(filter %.cc %.cpp %.mm,$(call get_srcs,$L) $(call get_gen_srcs,$L)))))
 
-# _all_dirs: every directory that contains a build artifact (used by clean-all)
-_all_dirs = $(sort $(dir \
+# _all_dirs: every directory that contains a build artifact (used by clean-all).
+# Pre-created at parse time so $(file) in compdb._emit works before recipes run.
+_all_dirs := $(sort $(dir \
   $(foreach p,$(EXECUTABLES),$(BINDIR)/$p$(EXTENSION.exe) $(call get_all_objs,$p)) \
   $(foreach l,$(LIBRARIES),$(call get_lib,$l) $(call get_all_objs,$l)) \
   $(foreach s,$(SHARED_LIBS),$(call get_so,$s) $(call get_all_objs,$s))))
+$(if $(MAKECMDGOALS),$(if $(filter-out clean clean-all clean_%,$(MAKECMDGOALS)),$(shell $(MKDIR_P) $(_all_dirs))),$(shell $(MKDIR_P) $(_all_dirs)))
 
 .SECONDEXPANSION:
 
-# Ensure directories exist for generated sources so that module.mk code
-# generation rules do not need order-only directory prerequisites
-# (secondary expansion is not available in module.mk files).
+# Ensure directories exist for generated sources.
 _all_gen_srcs := $(foreach t,$(EXECUTABLES) $(LIBRARIES) $(SHARED_LIBS),$(call get_gen_srcs,$t))
-$(_all_gen_srcs) : | $$(@D)/
+$(_all_gen_srcs) : ; @$(MKDIR_P) $(@D)
 
 all :: $$(EXECUTABLES) compile_commands.json
 clean : $$(addprefix clean_,$$(EXECUTABLES) $$(LIBRARIES) $$(SHARED_LIBS))
@@ -830,17 +835,20 @@ clean-all : clean
 # 'make defconfig'.
 ifeq ($(wildcard $(BUILDDIR)/config.mk),)
 ifneq ($(wildcard defconfig),)
-$(BUILDDIR)/config.mk : defconfig | $(BUILDDIR)/
+$(BUILDDIR)/config.mk : defconfig
+	@$(MKDIR_P) $(@D)
 	cp $< $@
 else
-$(BUILDDIR)/config.mk : | $(BUILDDIR)/ ; touch $@
+$(BUILDDIR)/config.mk : ; @$(MKDIR_P) $(@D) && touch $@
 endif
 endif
 
 # defconfig: reset config.mk from a template.
-defconfig : | $(BUILDDIR)/
+defconfig :
+	@$(MKDIR_P) $(BUILDDIR)
 	$(if $(wildcard defconfig),cp defconfig $(BUILDDIR)/config.mk,$(error no defconfig found))
-defconfig_% : | $(BUILDDIR)/
+defconfig_% :
+	@$(MKDIR_P) $(BUILDDIR)
 	$(if $(wildcard configs/$*.mk),cp configs/$*.mk $(BUILDDIR)/config.mk,$(error no configs/$*.mk found))
 
 # config.h: auto-generated header from config.mk.
@@ -848,7 +856,7 @@ defconfig_% : | $(BUILDDIR)/
 # CONFIG_BAR = n  ->  (skipped)
 # CONFIG_X = val  ->  #define CONFIG_X val
 # Uses compare-and-swap to avoid unnecessary rebuilds.
-$(BUILDDIR)/config.h : $(BUILDDIR)/config.mk | $(BUILDDIR)/
+$(BUILDDIR)/config.h : $(BUILDDIR)/config.mk
 	@awk '/^[A-Za-z_][A-Za-z0-9_]*[[:space:]]*[?:]*=/ { \
 		name = $$1; \
 		value = $$0; sub(/^[^=]*=[[:space:]]*/, "", value); \
@@ -864,14 +872,15 @@ $(BUILDDIR)/config.h : $(BUILDDIR)/config.mk | $(BUILDDIR)/
 show-% :
 	@echo ${$*}
 
-# Create directories
+# Create directories (fallback for Make 4.x; recipes also mkdir inline
+# because Make 3.81 strips trailing slashes from order-only prerequisites)
 %/ : ; $(_Q)$(MKDIR_P) $@
 .PRECIOUS : %/
 
 # Per-library rules: compile objects and pack into a static archive.
 define library_rules
 $1 : $(call get_lib,$1)
-$(call get_lib,$1) : $$(call get_all_objs,$1) $$($1_EXTRA_OBJS) $(foreach d,$($1_LIBS),$(call get_lib_file,$d)) | $$(@D)/
+$(call get_lib,$1) : $$(call get_all_objs,$1) $$($1_EXTRA_OBJS) $(foreach d,$($1_LIBS),$(call get_lib_file,$d))
 	$$(link.a)
 $(call get_all_objs,$1) : CFLAGS=$$($1_CFLAGS) $(call get_exported_cflags,$1)
 $(call get_all_objs,$1) : CXXFLAGS=$$($1_CXXFLAGS) $(call get_exported_cxxflags,$1)
@@ -891,7 +900,7 @@ $(foreach l,$(LIBRARIES),$(eval $(call library_rules,$l)))
 # Per-shared-library rules: compile with -fPIC, link with -shared.
 define shared_library_rules
 $1 : $(call get_so,$1)
-$(call get_so,$1) : $$(call get_all_objs,$1) $$($1_EXTRA_OBJS) $(foreach d,$($1_LIBS),$(call get_lib_file,$d)) | $$(@D)/
+$(call get_so,$1) : $$(call get_all_objs,$1) $$($1_EXTRA_OBJS) $(foreach d,$($1_LIBS),$(call get_lib_file,$d))
 	$$(link.so)
 $(call get_so,$1) : CXX_MODE=$(if $(call needs_cxx,$1),1)
 $(call get_so,$1) : LDFLAGS=$$($1_LDFLAGS) $(call get_exported_ldflags,$1)
@@ -919,7 +928,7 @@ define project_rules
 $1_EXEC := $(BINDIR)/$1$(EXTENSION.exe)
 $1_RUN = $$(TESTWRAP) $$($1_EXEC)
 $1 : $(BINDIR)/$1$(EXTENSION.exe)
-$(BINDIR)/$1$(EXTENSION.exe) : $$(call get_all_objs,$1) $$($1_EXTRA_OBJS) $(foreach d,$(call get_all_libs,$1),$(call get_lib_file,$d)) | $(BINDIR)/
+$(BINDIR)/$1$(EXTENSION.exe) : $$(call get_all_objs,$1) $$($1_EXTRA_OBJS) $(foreach d,$(call get_all_libs,$1),$(call get_lib_file,$d))
 	$$(link.c)
 	$$(_split_debug)
 $(BINDIR)/$1$(EXTENSION.exe) : CXX_MODE=$(if $(call needs_cxx,$1),1)
@@ -970,12 +979,12 @@ run-tests-valgrind : run-tests
 # Compile rules -- generated from EXTENSIONS list.  Per-target flags are
 # set via target-specific variables on the individual .o files above.
 # clangd-compatible extensions also emit a .cmd.json sidecar via $(file).
-$(foreach X,$(_compdb_exts),$(eval $(BUILDDIR)/%.o : %.$X | $$$$(@D)/ ; $$(compile.$X)$$(compdb._emit)))
-$(foreach X,$(filter-out $(_compdb_exts),$(EXTENSIONS)),$(eval $(BUILDDIR)/%.o : %.$X | $$$$(@D)/ ; $$(compile.$X)))
+$(foreach X,$(_compdb_exts),$(eval $(BUILDDIR)/%.o : %.$X ; $$(compile.$X)$$(compdb._emit)))
+$(foreach X,$(filter-out $(_compdb_exts),$(EXTENSIONS)),$(eval $(BUILDDIR)/%.o : %.$X ; $$(compile.$X)))
 
 # Compile rules for generated sources (source and object both under BUILDDIR).
-$(foreach X,$(_compdb_exts),$(eval $(BUILDDIR)/%.o : $(BUILDDIR)/%.$X | $$$$(@D)/ ; $$(compile.$X)$$(compdb._emit)))
-$(foreach X,$(filter-out $(_compdb_exts),$(EXTENSIONS)),$(eval $(BUILDDIR)/%.o : $(BUILDDIR)/%.$X | $$$$(@D)/ ; $$(compile.$X)))
+$(foreach X,$(_compdb_exts),$(eval $(BUILDDIR)/%.o : $(BUILDDIR)/%.$X ; $$(compile.$X)$$(compdb._emit)))
+$(foreach X,$(filter-out $(_compdb_exts),$(EXTENSIONS)),$(eval $(BUILDDIR)/%.o : $(BUILDDIR)/%.$X ; $$(compile.$X)))
 
 # Pull in generated dependency files (silent on first build)
 -include $(patsubst %.o,%.dep,$(foreach p,$(EXECUTABLES) $(LIBRARIES) $(SHARED_LIBS),$(call get_all_objs,$p)))

@@ -62,6 +62,13 @@ vt_state_free(struct vt_state *st)
 	}
 	free(st->tabstops);
 	free(st->title);
+	{
+		int i;
+
+		for (i = 0; i < st->title_stack_len; i++)
+			free(st->title_stack[i]);
+		free(st->title_stack);
+	}
 	free(st);
 }
 
@@ -75,6 +82,44 @@ const char *
 vt_state_title(const struct vt_state *st)
 {
 	return st->title;
+}
+
+#define TITLE_STACK_MAX 16
+
+void
+vt_state_title_push(struct vt_state *st)
+{
+	char *copy;
+
+	if (st->title_stack_len >= TITLE_STACK_MAX)
+		return;
+	if (st->title_stack_len >= st->title_stack_cap) {
+		int newcap = st->title_stack_cap ? st->title_stack_cap * 2 : 4;
+		char **p;
+
+		if (newcap > TITLE_STACK_MAX)
+			newcap = TITLE_STACK_MAX;
+		p = realloc(st->title_stack,
+		    (size_t)newcap * sizeof(*p));
+		if (!p)
+			return;
+		st->title_stack = p;
+		st->title_stack_cap = newcap;
+	}
+	copy = st->title ? strdup(st->title) : NULL;
+	st->title_stack[st->title_stack_len++] = copy;
+}
+
+void
+vt_state_title_pop(struct vt_state *st)
+{
+	char *saved;
+
+	if (st->title_stack_len <= 0)
+		return;
+	saved = st->title_stack[--st->title_stack_len];
+	free(st->title);
+	st->title = saved;
 }
 
 int
@@ -432,6 +477,17 @@ vt_state_dump(struct vt_state *st, vt_dump_fn emit, void *ctx)
 	/* alt screen mode if active */
 	if (st->modes & VT_MODE_ALTSCREEN)
 		emit(ctx, "\033[?1049h", 8);
+
+	/* restore window title */
+	if (st->title && st->title[0]) {
+		char tbuf[256];
+		int tlen;
+
+		tlen = snprintf(tbuf, sizeof(tbuf),
+		    "\033]2;%s\033\\", st->title);
+		if (tlen > 0 && tlen < (int)sizeof(tbuf))
+			emit(ctx, tbuf, (size_t)tlen);
+	}
 
 	for (row = 0; row < rows; row++) {
 		struct vt_row *vr = vt_buf_row(st->buf, row);

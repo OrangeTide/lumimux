@@ -34,6 +34,8 @@ struct app_ctx app_context;
 
 void (*overlay_repaint_fn)(void);
 
+static int status_line_dirty = 1;
+
 /* ---- overlay helpers ---- */
 
 static int prev_ovr_r1 = -1, prev_ovr_c1, prev_ovr_r2, prev_ovr_c2;
@@ -78,8 +80,10 @@ overlay_repaint_status(void)
 {
 	struct winsize ws;
 
-	if (status_visible && ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0)
+	if (status_visible && ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0) {
+		status_line_dirty = 1;
 		render_status_line(STDOUT_FILENO, ws.ws_row, ws.ws_col);
+	}
 }
 
 void
@@ -197,9 +201,10 @@ render_status_line(int fd, int rows, int cols)
 	status_expand(statusbar, content, sizeof(content), max);
 
 	/* skip if nothing changed since last draw */
-	if (row == last_row && cols == last_cols &&
+	if (!status_line_dirty && row == last_row && cols == last_cols &&
 	    strcmp(content, last_content) == 0)
 		return;
+	status_line_dirty = 0;
 	memcpy(last_content, content, sizeof(last_content));
 	last_row = row;
 	last_cols = cols;
@@ -274,4 +279,10 @@ render_status_line(int fd, int rows, int cols)
 
 	tio_write(fd, buf, (size_t)pos);
 	tio_flush(fd);
+}
+
+void
+status_line_invalidate(void)
+{
+	status_line_dirty = 1;
 }

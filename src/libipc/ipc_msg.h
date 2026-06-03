@@ -68,6 +68,12 @@ int ipc_msg_send(int fd, uint32_t type, const void *payload, uint32_t len);
 /* convenience: send a message with no payload */
 int ipc_msg_send_empty(int fd, uint32_t type);
 
+/* serialize a complete message (header + payload) into a caller buffer
+ * without doing any I/O. returns the framed length (IPC_HDR_SIZE + len)
+ * on success, or -1 if it does not fit in outsz. */
+int ipc_msg_frame(uint8_t *out, size_t outsz, uint32_t type,
+    const void *payload, uint32_t len);
+
 /* convenience: send a message with IpcSize payload (rows, cols) */
 int ipc_msg_send_size(int fd, uint32_t type, int rows, int cols);
 

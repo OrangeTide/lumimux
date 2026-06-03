@@ -1,5 +1,80 @@
 # lumiMUX Release Notes
 
+## v26.06.0 -- 2026-06-02
+
+### mserver robustness under load
+
+A large paste could deadlock a window. The mserver wrote PTY output
+to the client with a blocking `write_full()` inside its single event
+loop while the attach client was itself blocked writing the paste
+back, so each side filled the other's socket buffer and stopped
+reading. The wedged loop never returned to `accept()`, so new attach
+attempts hung in the listen backlog too. All server-to-client traffic
+is now funneled through a growable byte queue drained with
+non-blocking `send(MSG_DONTWAIT)`. When the backlog crosses a
+high-water mark the mserver stops reading the PTY master so
+backpressure lands on the application instead of the event loop, and
+resumes once it drains below the low-water mark. A slow, stalled, or
+dead client can no longer block the loop or starve `accept()`.
+
+The attach handshake is now bounded. A wedged or dead-but-stale
+mserver still accepts a connection into its listen backlog but never
+sends `ATTACH_REPLY`, so attach blocked forever in `ipc_msg_recv()`
+during discovery. A 5 second `SO_RCVTIMEO`/`SO_SNDTIMEO` now wraps the
+handshake; on timeout the window is logged and skipped so the
+remaining windows attach normally. Blocking I/O is restored once the
+handshake succeeds.
+
+### xterm title stack
+
+Vim uses CSI 22t/23t to push and pop the window title on enter and
+exit. Lumi previously discarded these sequences, so the pre-vim title
+was never saved or restored and subsequent title sync cycles prepended
+`lumi - N:` repeatedly. A title stack now implements push/pop, and the
+stored title is emitted as OSC 2 during `vt_state_dump` so reconnecting
+clients pick up the correct title from the server.
+
+### macOS and BSD portability
+
+- kqueue (`EVFILT_VNODE`) backend for `sessdir_watch` on systems
+  without `sys/inotify.h`; the fd-based API is unchanged.
+- Executable path lookup and `-lutil` ported to macOS.
+- Build system fixes for GNU Make 3.81: inline directory creation,
+  false circular `_LIBS` detection, the `-L` warning, and
+  `compile_commands.json` generation.
+- Drop the `ar -D` flag where it is unsupported.
+
+### Status bar fixes
+
+- Status bar no longer goes blank on toggle or initial attach, and no
+  longer disappears after a full-screen repaint.
+- `need_status` is now cleared even when the status bar is hidden, so
+  `flush_render()` stops running its full body every poll cycle.
+- The toggle handler flips `status_visible` only after the `ioctl`
+  succeeds, avoiding inconsistent state on failure.
+- Window tabs update immediately on a title change.
+- CSI 21t (report title) is suppressed to prevent a recursive title
+  loop.
+
+### Other changes
+
+- The forked process for a built-in sub-command now rewrites its argv
+  to `lumi-<cmd>` (and sets the comm field via `prctl(PR_SET_NAME)` on
+  Linux) so `ps(1)` distinguishes mserver sessions from the main lumi
+  process.
+- `SIGPIPE` is ignored in mserver and attach so a peer closing mid
+  write no longer kills the process.
+- Attach reaps mserver children to prevent zombies.
+- Fixed an arena use-after-free in `${var:-default}` expansion, where
+  nested expansions could grow the arena and invalidate the format
+  string pointer.
+- Added a NULL guard to `wm_resize` (matching `tile_resize`) to prevent
+  a crash during session switching when the window manager is
+  temporarily NULL.
+- Picker tab brackets use rounded box-drawing arcs.
+
+---
+
 ## v26.05.5 -- 2026-05-18
 
 ### Mouse event filtering

@@ -82,6 +82,11 @@ struct vt_state {
 
 	/* window title set by OSC 0/2 */
 	char		*title;
+
+	/* xterm title stack (CSI 22/23 t) */
+	char		**title_stack;
+	int		title_stack_len;
+	int		title_stack_cap;
 };
 
 struct vt_state *vt_state_new(int rows, int cols, int scrollback);
@@ -105,6 +110,10 @@ void vt_state_set_reply_fd(struct vt_state *st, int fd);
 
 /* window title (set by OSC 0/2, NULL if never set) */
 const char *vt_state_title(const struct vt_state *st);
+
+/* xterm title stack (CSI 22/23 t) */
+void vt_state_title_push(struct vt_state *st);
+void vt_state_title_pop(struct vt_state *st);
 
 /* write a character at cursor, advance cursor */
 void vt_state_putchar(struct vt_state *st, uint32_t cp, int width);

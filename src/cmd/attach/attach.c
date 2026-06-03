@@ -50,6 +50,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -860,7 +861,11 @@ turbo_repaint(void)
 	int crow, ccol, cvis;
 
 	turbo_need_full = 1;
+	status_line_invalidate();
 	turbo_render();
+	if (status_visible)
+		render_status_line(STDOUT_FILENO,
+		    content_rows + 1, content_cols);
 	turbo_cursor(&crow, &ccol, &cvis);
 	render_move_cursor(renderer, STDOUT_FILENO, crow, ccol);
 	set_cursor_vis(cvis);
@@ -900,7 +905,11 @@ tiled_repaint(void)
 	int crow, ccol, cvis;
 
 	tile_need_full = 1;
+	status_line_invalidate();
 	tiled_render();
+	if (status_visible)
+		render_status_line(STDOUT_FILENO,
+		    content_rows + 1, content_cols);
 	tile_cursor(tilemgr, &crow, &ccol, &cvis);
 	render_move_cursor(renderer, STDOUT_FILENO, crow, ccol);
 	set_cursor_vis(cvis);
@@ -1108,6 +1117,10 @@ flush_render(void)
 	if (need_render) {
 		if (scrollback_mode)
 			scrollback_prepare();
+		if (turbo_need_full || tile_need_full) {
+			status_line_invalidate();
+			need_status = 1;
+		}
 		if (client_mode == CLIENT_MODE_TURBO)
 			turbo_render();
 		else
@@ -1123,12 +1136,14 @@ flush_render(void)
 		sync_keyboard_proto(vt);
 	}
 
-	if (need_status && status_visible) {
-		if (scrollback_mode)
-			scrollback_status();
-		else
-			render_status_line(STDOUT_FILENO,
-			    content_rows + 1, content_cols);
+	if (need_status) {
+		if (status_visible) {
+			if (scrollback_mode)
+				scrollback_status();
+			else
+				render_status_line(STDOUT_FILENO,
+				    content_rows + 1, content_cols);
+		}
 		need_status = 0;
 	}
 
@@ -1299,6 +1314,9 @@ sync_vt_title(uint32_t win_id, struct vt_state *st)
 
 	if (client_mode == CLIENT_MODE_TURBO && wmgr)
 		wm_set_title(wmgr, win_id, vt_title);
+
+	win_list_set_title(win_id, vt_title);
+	win_list_format_status();
 
 	if (watching && win_id == watched_id)
 		sync_keybinds_title();
@@ -2048,26 +2066,38 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 		{
 			struct winsize ws;
 
+			if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) != 0)
+				break;
 			status_visible = !status_visible;
-			if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0) {
-				update_content_size(ws.ws_row, ws.ws_col);
-				render_resize(renderer, content_rows,
-				    content_cols);
+			update_content_size(ws.ws_row, ws.ws_col);
+			render_resize(renderer, content_rows,
+			    content_cols);
 
-				if (client_mode == CLIENT_MODE_TURBO) {
-					wm_resize(wmgr, content_rows,
-					    content_cols);
-					turbo_need_full = 1;
-				} else {
-					tile_resize(tilemgr,
-					    content_rows, content_cols);
-					tile_each_pane(tilemgr,
-					    tiled_resize_pane_cb, NULL);
-					tile_need_full = 1;
+			if (client_mode == CLIENT_MODE_TURBO) {
+				wm_resize(wmgr, content_rows,
+				    content_cols);
+				for (int i = 0; i < wm_count(wmgr); i++) {
+					struct wm_window *w;
+					w = wm_window_at(wmgr, i);
+					if (w && w->maximized) {
+						w->x = 1;
+						w->y = 1;
+						w->w = content_cols - 2;
+						w->h = content_rows - 2;
+						turbo_sync_size(w->id);
+					}
 				}
-				need_render = 1;
-				need_status = 1;
+				turbo_need_full = 1;
+			} else {
+				tile_resize(tilemgr,
+				    content_rows, content_cols);
+				tile_each_pane(tilemgr,
+				    tiled_resize_pane_cb, NULL);
+				tile_need_full = 1;
 			}
+			mconn_sync_winlist();
+			need_render = 1;
+			need_status = 1;
 		}
 		break;
 	case KEYS_ACTION_APPS_MENU:
@@ -3242,6 +3272,26 @@ on_stdin_read(struct iox_loop *loop, int fd, unsigned events, void *arg)
 
 /* ---- micro-server event handling ---- */
 
+/* seconds to wait for an mserver's ATTACH handshake before giving up.
+ * a healthy server replies immediately; a wedged or dead one would
+ * otherwise hang attach indefinitely (its socket lingers in the session
+ * directory even after the server stops servicing it). */
+#define MCONN_HANDSHAKE_TIMEOUT 5
+
+/* bound blocking I/O on a socket. secs == 0 restores indefinite blocking,
+ * which we do once the handshake succeeds so the steady-state event loop
+ * is never tripped by a slow but live peer. */
+static void
+sock_set_timeout(int fd, int secs)
+{
+	struct timeval tv;
+
+	tv.tv_sec = secs;
+	tv.tv_usec = 0;
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
 /* connect to all mservers in the session directory, creating cwin
  * entries for each new connection at the server's current VT size.
  * the caller is responsible for resizing to the desired size afterward.
@@ -3282,6 +3332,11 @@ mconn_discover(struct iox_loop *lp)
 		if (fd < 0)
 			continue;
 
+		/* a wedged or dead-but-stale mserver accepts the connection
+		 * into its backlog but never replies; bound the handshake so
+		 * one bad window cannot hang the whole attach. */
+		sock_set_timeout(fd, MCONN_HANDSHAKE_TIMEOUT);
+
 		/* send ATTACH, receive ATTACH_REPLY with server's
 		 * current VT size so we create a matching client VT */
 		if (ipc_msg_send_empty(fd, IPC_MSG_ATTACH) < 0) {
@@ -3289,7 +3344,15 @@ mconn_discover(struct iox_loop *lp)
 			continue;
 		}
 		if (ipc_msg_recv(fd, &rtype, rbuf, sizeof(rbuf),
-		    &rlen) == 0 && rtype == IPC_MSG_ATTACH_REPLY) {
+		    &rlen) != 0 || rtype != IPC_MSG_ATTACH_REPLY) {
+			/* unresponsive: skip this window rather than hang.
+			 * the other windows still attach normally. */
+			log_warn("window %ld not responding, skipping",
+			    (long)pids[i]);
+			ipc_close(fd);
+			continue;
+		}
+		{
 			struct ipc_size sz;
 
 			if (ipc_size_decode(&sz, (const uint8_t *)rbuf,
@@ -3299,6 +3362,9 @@ mconn_discover(struct iox_loop *lp)
 				srv_cols = sz.cols;
 			}
 		}
+
+		/* live server: restore blocking I/O for the event loop */
+		sock_set_timeout(fd, 0);
 
 		title = sessdir_read_file(session_name, pids[i], "title");
 		mconn_add(lp, pids[i], fd, title);
@@ -3944,6 +4010,24 @@ on_sessdir_watch(struct iox_loop *lp, int fd, unsigned events, void *arg)
 }
 
 static void
+on_sigchld(struct iox_loop *lp, int signo, void *arg)
+{
+	int status;
+	pid_t pid;
+
+	(void)signo;
+	(void)arg;
+
+	while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+		if (WIFSIGNALED(status))
+			log_warn("child %d killed by signal %d",
+			    (int)pid, WTERMSIG(status));
+		if (mconn_find_by_pid(pid))
+			remove_window(lp, (uint32_t)pid);
+	}
+}
+
+static void
 on_shutdown_signal(struct iox_loop *lp, int signo, void *arg)
 {
 	(void)signo;
@@ -4221,8 +4305,6 @@ cmd_attach_main(int argc, char **argv)
 			mconn_discover_remote(loop);
 		else
 			mconn_discover(loop);
-		mconn_sync_winlist();
-
 		if (mconn_count == 0) {
 			log_err("no servers in session '%s'", name);
 			iox_loop_free(loop);
@@ -4233,6 +4315,7 @@ cmd_attach_main(int argc, char **argv)
 		/* set initial focus to first window */
 		watched_id = (uint32_t)mconns[0].pid;
 		watching = 1;
+		mconn_sync_winlist();
 		{
 			struct client_window *cw;
 
@@ -4280,6 +4363,11 @@ cmd_attach_main(int argc, char **argv)
 	if (focus_window)
 		micro_select_window(focus_window);
 
+	/* an mserver dying must not kill us with SIGPIPE mid-write; let the
+	 * write return EPIPE so we detach from that window cleanly. */
+	signal(SIGPIPE, SIG_IGN);
+
+	iox_signal_add(loop, SIGCHLD, on_sigchld, NULL);
 	iox_signal_add(loop, SIGWINCH, on_sigwinch, NULL);
 	iox_signal_add(loop, SIGTERM, on_shutdown_signal, NULL);
 	iox_signal_add(loop, SIGINT, on_shutdown_signal, NULL);

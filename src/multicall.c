@@ -12,6 +12,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
+
+static char *proc_argv_base;
+static size_t proc_argv_size;
 
 static const struct {
 	const char	*name;
@@ -68,20 +77,67 @@ lookup(const char *name))(int, char **)
 	return NULL;
 }
 
+/* Rewrite the original argv buffer so ps(1) reflects the active command. */
+static void
+update_proctitle(int argc, char **argv)
+{
+	size_t off;
+	int i;
+
+	if (!proc_argv_base || proc_argv_size == 0)
+		return;
+
+	memset(proc_argv_base, 0, proc_argv_size);
+	off = 0;
+	for (i = 0; i < argc && argv[i]; i++) {
+		size_t len = strlen(argv[i]);
+
+		if (off + len >= proc_argv_size)
+			break;
+		memcpy(proc_argv_base + off, argv[i], len);
+		off += len + 1;
+	}
+
+#ifdef __linux__
+	if (argc > 0 && argv[0])
+		prctl(PR_SET_NAME, (unsigned long)argv[0], 0, 0, 0);
+#endif
+}
+
+static int
+get_exe_path(char *buf, size_t bufsz)
+{
+#ifdef __APPLE__
+	uint32_t sz = (uint32_t)bufsz;
+	char raw[PATH_MAX];
+
+	if (_NSGetExecutablePath(raw, &sz) != 0)
+		return -1;
+	if (!realpath(raw, buf))
+		return -1;
+	return 0;
+#else
+	ssize_t n;
+
+	n = readlink("/proc/self/exe", buf, bufsz - 1);
+	if (n <= 0)
+		return -1;
+	buf[n] = '\0';
+	return 0;
+#endif
+}
+
 /* try to find an external lumi-<cmd> binary by searching:
- * 1. same directory as /proc/self/exe
+ * 1. same directory as our executable
  * 2. LUMI_LIBEXEC_PATH
  * 3. PATH */
 static char *
 find_external(const char *name)
 {
 	char self[PATH_MAX], *dir, *copy, *result;
-	ssize_t n;
 	int len;
 
-	n = readlink("/proc/self/exe", self, sizeof(self) - 1);
-	if (n > 0) {
-		self[n] = '\0';
+	if (get_exe_path(self, sizeof(self)) == 0) {
 		copy = strdup(self);
 		if (copy) {
 			dir = dirname(copy);
@@ -123,9 +179,12 @@ multicall_exec_cmd(const char *cmd, int argc, char **argv)
 	if (!fn)
 		return -1;
 
-	/* try external binary first */
 	if (snprintf(binname, sizeof(binname), "lumi-%s", cmd)
-	    < (int)sizeof(binname)) {
+	    >= (int)sizeof(binname))
+		binname[0] = '\0';
+
+	/* try external binary first */
+	if (binname[0]) {
 		char *path = find_external(binname);
 
 		if (path) {
@@ -135,6 +194,10 @@ multicall_exec_cmd(const char *cmd, int argc, char **argv)
 			free(path);
 		}
 	}
+
+	if (binname[0])
+		argv[0] = binname;
+	update_proctitle(argc, argv);
 
 	optind = 1;
 	return fn(argc, argv);
@@ -148,6 +211,13 @@ main(int argc, char **argv)
 	int (*fn)(int, char **);
 
 	lu_umask_save();
+
+	/* save argv buffer extent for update_proctitle() */
+	if (argc > 0 && argv[0]) {
+		proc_argv_base = argv[0];
+		proc_argv_size = (size_t)(argv[argc - 1] +
+		    strlen(argv[argc - 1]) + 1 - argv[0]);
+	}
 
 	/* symlink dispatch: check if argv[0] is "lumi-<cmd>" */
 	copy = strdup(argv[0] ? argv[0] : "lumi");

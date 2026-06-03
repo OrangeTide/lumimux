@@ -78,6 +78,24 @@ ipc_msg_send_empty(int fd, uint32_t type)
 }
 
 int
+ipc_msg_frame(uint8_t *out, size_t outsz, uint32_t type,
+    const void *payload, uint32_t len)
+{
+	uint32_t hdr[2];
+
+	if ((size_t)IPC_HDR_SIZE + len > outsz)
+		return -1;
+
+	hdr[0] = BE32(type);
+	hdr[1] = BE32(len);
+	memcpy(out, hdr, IPC_HDR_SIZE);
+	if (len > 0)
+		memcpy(out + IPC_HDR_SIZE, payload, len);
+
+	return (int)(IPC_HDR_SIZE + len);
+}
+
+int
 ipc_msg_send_size(int fd, uint32_t type, int rows, int cols)
 {
 	struct ipc_size sz;

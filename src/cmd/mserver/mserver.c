@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
@@ -66,6 +67,148 @@ write_to_pty(const char *data, size_t len)
 	}
 }
 
+/* ---- client output queue (non-blocking) ----
+ *
+ * All server -> client traffic is funneled through a growable byte queue
+ * and drained with non-blocking send(). A slow, stalled, or dead client
+ * can never block the event loop, and therefore can never block accept()
+ * for new attaches. When the backlog crosses the high-water mark we stop
+ * reading the PTY master, pushing backpressure onto the application; we
+ * resume reading once the backlog drains below the low-water mark.
+ */
+
+#define OUTQ_HIGH_WATER	(1u << 20)		/* 1 MiB */
+#define OUTQ_LOW_WATER	(256u * 1024)		/* 256 KiB */
+
+static uint8_t *outq;		/* pending bytes (framed messages) */
+static size_t outq_off;		/* bytes already sent from the front */
+static size_t outq_len;		/* total bytes valid in outq */
+static size_t outq_cap;		/* allocated capacity */
+static int outq_hiwater;	/* PTY reads paused due to backlog */
+
+static void disconnect_client(void);
+
+static size_t
+outq_pending(void)
+{
+	return outq_len - outq_off;
+}
+
+static void
+outq_reset(void)
+{
+	free(outq);
+	outq = NULL;
+	outq_off = outq_len = outq_cap = 0;
+	outq_hiwater = 0;
+}
+
+/* the PTY master is read unless the client asked us to pause (FLOW_CTRL)
+ * or our output backlog sits above the high-water mark. */
+static void
+update_master_interest(void)
+{
+	unsigned want = (output_paused || outq_hiwater) ? 0 : IOX_READ;
+
+	iox_fd_mod(loop, window_master_fd(win), want);
+}
+
+/* watch the client fd for writability only while a backlog exists. */
+static void
+update_client_interest(void)
+{
+	unsigned want = IOX_READ;
+
+	if (client_fd < 0)
+		return;
+	if (outq_pending() > 0)
+		want |= IOX_WRITE;
+	iox_fd_mod(loop, client_fd, want);
+}
+
+static void
+client_flush(void)
+{
+	if (client_fd < 0)
+		return;
+
+	while (outq_off < outq_len) {
+		ssize_t w = send(client_fd, outq + outq_off,
+		    outq_len - outq_off, MSG_DONTWAIT | MSG_NOSIGNAL);
+
+		if (w < 0) {
+			if (errno == EINTR)
+				continue;
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				break;
+			disconnect_client();
+			return;
+		}
+		outq_off += (size_t)w;
+	}
+
+	if (outq_off == outq_len)
+		outq_off = outq_len = 0;	/* fully drained */
+
+	if (outq_hiwater && outq_pending() <= OUTQ_LOW_WATER) {
+		outq_hiwater = 0;
+		update_master_interest();
+	}
+	update_client_interest();
+}
+
+static void
+client_enqueue(uint32_t type, const void *payload, uint32_t len)
+{
+	size_t need = (size_t)IPC_HDR_SIZE + len;
+	int n;
+
+	if (client_fd < 0)
+		return;
+
+	/* reclaim space already sent from the front before growing */
+	if (outq_off > 0) {
+		memmove(outq, outq + outq_off, outq_pending());
+		outq_len -= outq_off;
+		outq_off = 0;
+	}
+
+	if (outq_len + need > outq_cap) {
+		size_t cap = outq_cap ? outq_cap : 8192;
+		uint8_t *p;
+
+		while (cap < outq_len + need)
+			cap *= 2;
+		p = realloc(outq, cap);
+		if (!p) {
+			/* cannot buffer: drop the client rather than block or
+			 * lose loop integrity */
+			disconnect_client();
+			return;
+		}
+		outq = p;
+		outq_cap = cap;
+	}
+
+	n = ipc_msg_frame(outq + outq_len, outq_cap - outq_len,
+	    type, payload, len);
+	if (n < 0)
+		return;			/* sized above; should not happen */
+	outq_len += (size_t)n;
+
+	if (!outq_hiwater && outq_pending() >= OUTQ_HIGH_WATER) {
+		outq_hiwater = 1;
+		update_master_interest();
+	}
+	client_flush();
+}
+
+static void
+client_enqueue_empty(uint32_t type)
+{
+	client_enqueue(type, NULL, 0);
+}
+
 /* ---- buffered screen dump for replay on attach ---- */
 
 #define REPLAY_BUFSZ	32768
@@ -80,8 +223,7 @@ static void
 replay_flush(struct replay_buf *rb)
 {
 	if (rb->used > 0) {
-		ipc_msg_send(rb->fd, IPC_MSG_OUTPUT,
-		    rb->buf, rb->used);
+		client_enqueue(IPC_MSG_OUTPUT, rb->buf, rb->used);
 		rb->used = 0;
 	}
 }
@@ -160,7 +302,7 @@ sync_pty_flags(void)
 		return;
 	last_pty_flags = flags;
 	payload = (uint8_t)flags;
-	ipc_msg_send(client_fd, IPC_MSG_PTY_FLAGS, &payload, 1);
+	client_enqueue(IPC_MSG_PTY_FLAGS, &payload, 1);
 }
 
 /* ---- client handling ---- */
@@ -175,11 +317,10 @@ disconnect_client(void)
 		client_fd = -1;
 	}
 
-	/* resume PTY reads if paused */
-	if (output_paused) {
-		output_paused = 0;
-		iox_fd_mod(loop, window_master_fd(win), IOX_READ);
-	}
+	/* drop any pending output and resume PTY reads */
+	outq_reset();
+	output_paused = 0;
+	update_master_interest();
 }
 
 /* ---- attribute IPC handler ---- */
@@ -197,26 +338,26 @@ handle_attr_msg(int fd, uint32_t type, const char *buf, uint32_t len)
 	switch (type) {
 	case IPC_MSG_ATTR_TXN_BEGIN:
 		if (attr_store_txn_begin(&attrs, fd, &txn_id) < 0) {
-			ipc_msg_send(fd, IPC_MSG_ERROR,
+			client_enqueue(IPC_MSG_ERROR,
 			    "txn pool full", 13);
 			return;
 		}
 		tok.txn_id = txn_id;
 		n = ipc_attr_txn_ok_encode(&tok, enc, (int)sizeof(enc));
 		if (n > 0)
-			ipc_msg_send(fd, IPC_MSG_ATTR_TXN_OK, enc,
+			client_enqueue(IPC_MSG_ATTR_TXN_OK, enc,
 			    (uint32_t)n);
 		return;
 
 	case IPC_MSG_ATTR_TXN_COMMIT:
 		if (ipc_attr_key_decode(&ak,
 		    (const uint8_t *)buf, (int)len) < 0) {
-			ipc_msg_send(fd, IPC_MSG_ERROR,
+			client_enqueue(IPC_MSG_ERROR,
 			    "bad message", 11);
 			return;
 		}
 		if (attr_store_txn_commit(&attrs, ak.txn_id) < 0) {
-			ipc_msg_send(fd, IPC_MSG_ERROR,
+			client_enqueue(IPC_MSG_ERROR,
 			    "conflict", 8);
 			return;
 		}
@@ -224,14 +365,14 @@ handle_attr_msg(int fd, uint32_t type, const char *buf, uint32_t len)
 		tok.txn_id = ak.txn_id;
 		n = ipc_attr_txn_ok_encode(&tok, enc, (int)sizeof(enc));
 		if (n > 0)
-			ipc_msg_send(fd, IPC_MSG_ATTR_TXN_OK, enc,
+			client_enqueue(IPC_MSG_ATTR_TXN_OK, enc,
 			    (uint32_t)n);
 		return;
 
 	case IPC_MSG_ATTR_TXN_ROLLBACK:
 		if (ipc_attr_key_decode(&ak,
 		    (const uint8_t *)buf, (int)len) < 0) {
-			ipc_msg_send(fd, IPC_MSG_ERROR,
+			client_enqueue(IPC_MSG_ERROR,
 			    "bad message", 11);
 			return;
 		}
@@ -239,14 +380,14 @@ handle_attr_msg(int fd, uint32_t type, const char *buf, uint32_t len)
 		tok.txn_id = ak.txn_id;
 		n = ipc_attr_txn_ok_encode(&tok, enc, (int)sizeof(enc));
 		if (n > 0)
-			ipc_msg_send(fd, IPC_MSG_ATTR_TXN_OK, enc,
+			client_enqueue(IPC_MSG_ATTR_TXN_OK, enc,
 			    (uint32_t)n);
 		return;
 
 	case IPC_MSG_ATTR_SET:
 		if (ipc_attr_kv_decode(&kv,
 		    (const uint8_t *)buf, (int)len) < 0) {
-			ipc_msg_send(fd, IPC_MSG_ERROR,
+			client_enqueue(IPC_MSG_ERROR,
 			    "bad message", 11);
 			return;
 		}
@@ -261,18 +402,18 @@ handle_attr_msg(int fd, uint32_t type, const char *buf, uint32_t len)
 			    (int)kv.value_len, kv.value);
 			if (attr_store_set(&attrs, kv.txn_id,
 			    key, val) < 0) {
-				ipc_msg_send(fd, IPC_MSG_ERROR,
+				client_enqueue(IPC_MSG_ERROR,
 				    "set failed", 10);
 				return;
 			}
 		}
-		ipc_msg_send_empty(fd, IPC_MSG_ATTR_OK);
+		client_enqueue_empty(IPC_MSG_ATTR_OK);
 		return;
 
 	case IPC_MSG_ATTR_DELETE:
 		if (ipc_attr_key_decode(&ak,
 		    (const uint8_t *)buf, (int)len) < 0) {
-			ipc_msg_send(fd, IPC_MSG_ERROR,
+			client_enqueue(IPC_MSG_ERROR,
 			    "bad message", 11);
 			return;
 		}
@@ -283,18 +424,18 @@ handle_attr_msg(int fd, uint32_t type, const char *buf, uint32_t len)
 			    (int)ak.key_len, ak.key);
 			if (attr_store_delete(&attrs, ak.txn_id,
 			    key) < 0) {
-				ipc_msg_send(fd, IPC_MSG_ERROR,
+				client_enqueue(IPC_MSG_ERROR,
 				    "delete failed", 13);
 				return;
 			}
 		}
-		ipc_msg_send_empty(fd, IPC_MSG_ATTR_OK);
+		client_enqueue_empty(IPC_MSG_ATTR_OK);
 		return;
 
 	case IPC_MSG_ATTR_GET:
 		if (ipc_attr_key_decode(&ak,
 		    (const uint8_t *)buf, (int)len) < 0) {
-			ipc_msg_send(fd, IPC_MSG_ERROR,
+			client_enqueue(IPC_MSG_ERROR,
 			    "bad message", 11);
 			return;
 		}
@@ -307,7 +448,7 @@ handle_attr_msg(int fd, uint32_t type, const char *buf, uint32_t len)
 			    (int)ak.key_len, ak.key);
 			if (attr_store_get(&attrs, ak.txn_id,
 			    key, val, (int)sizeof(val)) < 0) {
-				ipc_msg_send(fd, IPC_MSG_ERROR,
+				client_enqueue(IPC_MSG_ERROR,
 				    "not found", 9);
 				return;
 			}
@@ -319,7 +460,7 @@ handle_attr_msg(int fd, uint32_t type, const char *buf, uint32_t len)
 			n = ipc_attr_kv_encode(&resp, enc,
 			    (int)sizeof(enc));
 			if (n > 0)
-				ipc_msg_send(fd, IPC_MSG_ATTR_VALUE,
+				client_enqueue(IPC_MSG_ATTR_VALUE,
 				    enc, (uint32_t)n);
 		}
 		return;
@@ -327,7 +468,7 @@ handle_attr_msg(int fd, uint32_t type, const char *buf, uint32_t len)
 	case IPC_MSG_ATTR_LIST:
 		if (ipc_attr_key_decode(&ak,
 		    (const uint8_t *)buf, (int)len) < 0) {
-			ipc_msg_send(fd, IPC_MSG_ERROR,
+			client_enqueue(IPC_MSG_ERROR,
 			    "bad message", 11);
 			return;
 		}
@@ -337,7 +478,7 @@ handle_attr_msg(int fd, uint32_t type, const char *buf, uint32_t len)
 
 			if (attr_store_list(&attrs, ak.txn_id,
 			    listing, (int)sizeof(listing)) < 0) {
-				ipc_msg_send(fd, IPC_MSG_ERROR,
+				client_enqueue(IPC_MSG_ERROR,
 				    "list failed", 11);
 				return;
 			}
@@ -346,7 +487,7 @@ handle_attr_msg(int fd, uint32_t type, const char *buf, uint32_t len)
 			n = ipc_attr_entries_encode(&resp, enc,
 			    (int)sizeof(enc));
 			if (n > 0)
-				ipc_msg_send(fd, IPC_MSG_ATTR_ENTRIES,
+				client_enqueue(IPC_MSG_ATTR_ENTRIES,
 				    enc, (uint32_t)n);
 		}
 		return;
@@ -360,8 +501,16 @@ on_client_read(struct iox_loop *lp, int fd, unsigned events, void *arg)
 	char buf[4096];
 	int rc;
 
-	(void)events;
 	(void)arg;
+
+	/* drain pending output when the socket becomes writable */
+	if (events & IOX_WRITE) {
+		client_flush();
+		if (client_fd < 0)
+			return;
+	}
+	if (!(events & IOX_READ))
+		return;
 
 	rc = ipc_msg_recv(fd, &type, buf, sizeof(buf), &len);
 	if (rc != 0) {
@@ -376,15 +525,11 @@ on_client_read(struct iox_loop *lp, int fd, unsigned events, void *arg)
 
 	case IPC_MSG_FLOW_CTRL:
 		if (len >= 1) {
-			int pause = (uint8_t)buf[0];
-			int master_fd = window_master_fd(win);
+			int pause = (uint8_t)buf[0] ? 1 : 0;
 
-			if (pause && !output_paused) {
-				output_paused = 1;
-				iox_fd_mod(lp, master_fd, 0);
-			} else if (!pause && output_paused) {
-				output_paused = 0;
-				iox_fd_mod(lp, master_fd, IOX_READ);
+			if (pause != output_paused) {
+				output_paused = pause;
+				update_master_interest();
 			}
 		}
 		break;
@@ -464,6 +609,7 @@ on_new_client(struct iox_loop *lp, int fd, unsigned events, void *arg)
 		disconnect_client();
 
 	client_fd = new_fd;
+	iox_fd_add(lp, client_fd, IOX_READ, on_client_read, NULL);
 
 	/* tell client our current VT size, then send screen replay.
 	 * the client creates its VT at this size so replay matches.
@@ -471,17 +617,22 @@ on_new_client(struct iox_loop *lp, int fd, unsigned events, void *arg)
 	 * size. */
 	{
 		struct vt_state *v = window_vt(win);
+		struct ipc_size sz;
+		uint8_t sbuf[16];
+		int sn;
 
-		ipc_msg_send_size(client_fd, IPC_MSG_ATTACH_REPLY,
-		    vt_buf_rows(v->buf), vt_buf_cols(v->buf));
+		sz.rows = (uint16_t)vt_buf_rows(v->buf);
+		sz.cols = (uint16_t)vt_buf_cols(v->buf);
+		sn = ipc_size_encode(&sz, sbuf, sizeof(sbuf));
+		if (sn > 0)
+			client_enqueue(IPC_MSG_ATTACH_REPLY, sbuf,
+			    (uint32_t)sn);
 	}
 	send_replay(client_fd);
 
 	/* send initial PTY flags so client knows echo state */
 	last_pty_flags = -1;
 	sync_pty_flags();
-
-	iox_fd_add(lp, client_fd, IOX_READ, on_client_read, NULL);
 }
 
 /* ---- PTY handling ---- */
@@ -506,11 +657,8 @@ on_master_read(struct iox_loop *lp, int fd, unsigned events, void *arg)
 	sync_title();
 	sync_pty_flags();
 
-	if (client_fd >= 0) {
-		if (ipc_msg_send(client_fd, IPC_MSG_OUTPUT,
-		    buf, (uint32_t)n) < 0)
-			disconnect_client();
-	}
+	if (client_fd >= 0)
+		client_enqueue(IPC_MSG_OUTPUT, buf, (uint32_t)n);
 }
 
 /* ---- signals ---- */
@@ -587,6 +735,11 @@ server(void)
 	const char *pty_path;
 
 	rune_width_init();
+
+	/* a client dropping mid-write must not kill the server -- ignore
+	 * SIGPIPE so writes to a gone client return EPIPE and we drop just
+	 * that client instead of terminating the whole window. */
+	signal(SIGPIPE, SIG_IGN);
 
 	/* create session directory (idempotent) */
 	if (sessdir_session_create(session_name) < 0) {

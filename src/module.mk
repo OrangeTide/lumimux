@@ -23,7 +23,7 @@ lumi_SRCS = multicall.c \
 lumi_LIBS = lu_iox lu_ipc lu_attr lu_sessdir lu_session lu_tio lu_render \
 	lu_txl lu_termlib lu_vt lu_utf8 lu_pty lu_keys lu_cfg lu_status \
 	lu_tui lu_tui_term lu_wm lu_tile lu_splash lu_core
-lumi_LDLIBS = -lutil
+lumi_LDLIBS = $(if $(findstring darwin,$(TARGET_TRIPLET)),,-lutil)
 lumi_CPPFLAGS = -I$(lumi_DIR)
 EXECUTABLES += lumi
 

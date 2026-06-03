@@ -24,8 +24,8 @@ struct win_info {
 };
 
 #define ACTIVE_MARKER "\xe2\x9c\xb1"	/* U+2731 HEAVY ASTERISK ✱ */
-#define TAB_LEFT "\xe2\x95\xb1"		/* U+2571 ╱ */
-#define TAB_RIGHT "\xe2\x95\xb2"	/* U+2572 ╲ */
+#define TAB_LEFT "\xe2\x95\xad"		/* U+256D ╭ */
+#define TAB_RIGHT "\xe2\x95\xae"	/* U+256E ╮ */
 
 static struct win_info win_list[WIN_INFO_MAX];
 static int win_count;
@@ -109,6 +109,26 @@ win_list_pid_at(int index)
 }
 
 void
+win_list_set_title(uint32_t pid, const char *title)
+{
+	int i;
+
+	for (i = 0; i < win_count; i++) {
+		if (win_list[i].pid == pid) {
+			if (title) {
+				size_t len = utf8_trunc(title,
+				    sizeof(win_list[i].title));
+				memcpy(win_list[i].title, title, len);
+				win_list[i].title[len] = '\0';
+			} else {
+				win_list[i].title[0] = '\0';
+			}
+			return;
+		}
+	}
+}
+
+void
 win_list_format_status(void)
 {
 	char buf[1024];
@@ -135,31 +155,32 @@ win_list_format_status(void)
 		if (wi->active) {
 			if (wi->title[0])
 				n = snprintf(buf + pos, (size_t)remain,
-				    "\033[37;40m" TAB_LEFT
-				    "\033[30;47m%u"
-				    "\033[33;47m" ACTIVE_MARKER
-				    "\033[30;47m%s"
-				    "\033[37;40m" TAB_RIGHT,
+				    "\033[37;100m" TAB_LEFT
+				    "%u"
+				    "\033[33;100m" ACTIVE_MARKER
+				    "\033[37;100m%s"
+				    TAB_RIGHT "\033[0;40m",
 				    wi->id, wi->title);
 			else
 				n = snprintf(buf + pos, (size_t)remain,
-				    "\033[37;40m" TAB_LEFT
-				    "\033[30;47m%u"
-				    "\033[33;47m" ACTIVE_MARKER
-				    "\033[37;40m" TAB_RIGHT,
+				    "\033[37;100m" TAB_LEFT
+				    "%u"
+				    "\033[33;100m" ACTIVE_MARKER
+				    "\033[37;100m" TAB_RIGHT
+				    "\033[0;40m",
 				    wi->id);
 		} else {
 			if (wi->title[0])
 				n = snprintf(buf + pos, (size_t)remain,
 				    "\033[90;40m" TAB_LEFT
-				    "\033[37;100m%u %s"
-				    "\033[90;40m" TAB_RIGHT,
+				    "%u %s"
+				    TAB_RIGHT,
 				    wi->id, wi->title);
 			else
 				n = snprintf(buf + pos, (size_t)remain,
 				    "\033[90;40m" TAB_LEFT
-				    "\033[37;100m%u"
-				    "\033[90;40m" TAB_RIGHT,
+				    "%u"
+				    TAB_RIGHT,
 				    wi->id);
 		}
 

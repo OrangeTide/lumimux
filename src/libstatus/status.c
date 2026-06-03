@@ -368,11 +368,13 @@ expand_braced_var(struct status *s, const char **pp, int depth)
 	}
 
 	if (*p == ':' && p[1] == '-') {
-		/* ${var:-default} */
+		/* ${var:-default} -- use heap copy because expand()
+		 * may grow the arena via realloc, invalidating arena
+		 * pointers used as the format string. */
 		const char *def_start;
 		int brace_depth = 1;
 		const char *scan;
-		char *def_text;
+		int def_len;
 
 		p += 2;
 		def_start = p;
@@ -385,13 +387,19 @@ expand_braced_var(struct status *s, const char **pp, int depth)
 			if (brace_depth > 0)
 				scan++;
 		}
-		def_text = status_arena_strndup(s, def_start, (int)(scan - def_start));
+		def_len = (int)(scan - def_start);
 		if (*scan == '}')
 			scan++;
 		*pp = scan;
 		if (!val || !val[0]) {
-			/* expand the default */
-			return expand(s, def_text, depth + 1);
+			char *def_text, *result;
+
+			def_text = xmalloc((size_t)def_len + 1);
+			memcpy(def_text, def_start, (size_t)def_len);
+			def_text[def_len] = '\0';
+			result = expand(s, def_text, depth + 1);
+			free(def_text);
+			return result;
 		}
 		return status_arena_strdup(s, val);
 	}

@@ -62,6 +62,7 @@ void overlay_erase_all(void);
 extern void (*overlay_repaint_fn)(void);
 
 void render_status_line(int fd, int rows, int cols);
+void status_line_invalidate(void);
 
 int mconn_focused_fd(void);
 void micro_select_window(uint32_t id);

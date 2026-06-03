@@ -205,6 +205,8 @@ wm_resize(struct wm *wm, int rows, int cols)
 {
 	struct vt_cell *new_screen;
 
+	if (!wm)
+		return;
 	new_screen = calloc((size_t)(rows * cols), sizeof(struct vt_cell));
 	if (!new_screen)
 		return;
