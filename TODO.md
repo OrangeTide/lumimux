@@ -4,7 +4,12 @@
       difference between lumi and an mserver session.
 
 - [ ] Networked client connections over QUIC reliable stream.
-      Swap Unix socket for QUIC transport in libipc -- existing TLV message
-      protocol works unchanged. Gets encrypted roaming (survives IP/network
-      changes), TLS 1.3, 0-RTT reconnect. Server listens on both Unix socket
-      (local) and QUIC (remote). Auth via pre-shared key or SSH key challenge.
+      See doc/FUTURE.md#11c for the design.
+
+- [ ] BUG: selecting text and changing windows leave the selection area behind. it should be cleared when: changing focus, entering/leaving scroll back mode, moving windows.
+
+- [ ] add input dialog to run simple directives like the ctrl-A : in screen
+  - setenv VAR="value to set"
+    - add or clear environment used when creating new windows.
+  - title New Title Name
+    - change current window's title

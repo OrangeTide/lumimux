@@ -12,6 +12,14 @@
  *
  *   FOCUS=12345
  *   WINDOW_ORDER="12345 12351 12360"
+ *   WINDOW_NUMS="12345 0 12360"
+ *
+ * WINDOW_ORDER is a dense layout/z-order list (no gaps). WINDOW_NUMS is a
+ * slot map where the slot index is the stable, user-visible window number
+ * and the value is the server PID; a 0 marks a spare (a number freed when
+ * a window closed). Window numbers are never reassigned when other windows
+ * close, so terminated windows leave gaps; a new window takes the lowest
+ * free number.
  *
  * Concurrency: flock(LOCK_SH) for reads, flock(LOCK_EX) for writes.
  * Writes use atomic rename (write to temp file, then rename).
@@ -45,9 +53,22 @@ int sessdir_state_set_focus(struct sessdir_state *st, pid_t pid);
  * returns 0 on success, -1 on error. */
 int sessdir_state_add_server(struct sessdir_state *st, pid_t pid);
 
-/* remove a server from the window order. if the removed server was
- * focused, focus moves to the next server in order (or 0 if empty).
- * returns 0 on success, -1 on error. */
+/* remove a server from the window order. the server's stable window
+ * number is freed (left as a spare); other windows keep their numbers.
+ * if the removed server was focused, focus moves to the next server in
+ * order (or 0 if empty). returns 0 on success, -1 on error. */
 int sessdir_state_remove_server(struct sessdir_state *st, pid_t pid);
+
+/* get the stable window number assigned to a server PID.
+ * returns the number (>= 0), or -1 if the PID has no number. */
+int sessdir_state_num(struct sessdir_state *st, pid_t pid);
+
+/* get the stable window-number map: out[number] = PID, 0 marks a spare.
+ * fills up to max slots; returns the number of slots, or -1 on error. */
+int sessdir_state_nums(struct sessdir_state *st, pid_t *out, int max);
+
+/* swap the stable window numbers of two server PIDs. both must already
+ * have numbers. returns 0 on success, -1 on error. */
+int sessdir_state_swap_num(struct sessdir_state *st, pid_t a, pid_t b);
 
 #endif /* SESSDIR_STATE_H */

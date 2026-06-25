@@ -163,6 +163,10 @@ keys_default(struct keys *k)
 	lay->bindings['p'] = KEYS_ACTION_PREV_WINDOW;
 	lay->bindings[0x10] = KEYS_ACTION_PREV_WINDOW;	/* Ctrl-P */
 
+	/* renumber: swap current window's number with its neighbor */
+	lay->bindings[','] = KEYS_ACTION_SWAP_NUM_LOWER;
+	lay->bindings['.'] = KEYS_ACTION_SWAP_NUM_HIGHER;
+
 	/* select by number */
 	lay->bindings['0'] = KEYS_ACTION_SELECT_0;
 	lay->bindings['1'] = KEYS_ACTION_SELECT_1;
@@ -425,6 +429,8 @@ static const struct {
 	{ "new-window",		KEYS_ACTION_NEW_WINDOW },
 	{ "next-window",	KEYS_ACTION_NEXT_WINDOW },
 	{ "prev-window",	KEYS_ACTION_PREV_WINDOW },
+	{ "swap-num-lower",	KEYS_ACTION_SWAP_NUM_LOWER },
+	{ "swap-num-higher",	KEYS_ACTION_SWAP_NUM_HIGHER },
 	{ "select-0",		KEYS_ACTION_SELECT_0 },
 	{ "select-1",		KEYS_ACTION_SELECT_1 },
 	{ "select-2",		KEYS_ACTION_SELECT_2 },

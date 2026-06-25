@@ -53,6 +53,8 @@ enum keys_action {
 	KEYS_ACTION_CLIPBOARD_SYNC,
 	KEYS_ACTION_TOGGLE_MODE,
 	KEYS_ACTION_ARRANGE_GRID,
+	KEYS_ACTION_SWAP_NUM_LOWER,	/* swap number with next lower window */
+	KEYS_ACTION_SWAP_NUM_HIGHER,	/* swap number with next higher window */
 };
 
 /* state of the prefix key state machine */

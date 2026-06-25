@@ -1,19 +1,23 @@
-# Phase 11: Advanced Features -- Implementation Plan
+# Future Work
 
-## Overview
+This file tracks planned and in-progress feature work. Phase 11 grouped four
+advanced features; three have shipped and one remains.
 
-Phase 11 adds four features of increasing complexity:
-1. State-dependent key bindings
-2. SIXEL pass-through
-3. QUIC networked connections
-4. Speculative local echo
+## Phase 11: Advanced Features
 
-Each is independent and can be implemented and shipped in any order.
-Recommended order: simplest first, most complex last.
+| Sub-phase | Feature                    | Status                       |
+|-----------|----------------------------|------------------------------|
+| 11A       | State-dependent bindings   | Done (commit 763af21)        |
+| 11B       | SIXEL/DCS pass-through     | Done (commit 763af21)        |
+| 11D       | Speculative local echo     | Done (commit 763af21)        |
+| 11C       | QUIC networked connections | **Outstanding** (see below)  |
+
+The plans below are retained for reference. 11A/11B/11D describe what was
+built; 11C is the remaining design and the only active planning item.
 
 ---
 
-## 11A: State-Dependent Key Bindings
+## 11A: State-Dependent Key Bindings (DONE)
 
 **Goal:** Bindings that activate conditionally based on window title regex
 or toggle state.
@@ -67,7 +71,7 @@ l = toggle              # pressing 'l' flips the toggle off
 
 ---
 
-## 11B: SIXEL Pass-Through
+## 11B: SIXEL Pass-Through (DONE)
 
 **Goal:** Forward SIXEL (and other DCS) sequences from child PTY through
 to the outer terminal without interpreting them.
@@ -99,16 +103,17 @@ DCS buffer is dynamically allocated (realloc doubling), capped at 16 MB.
 
 ---
 
-## 11C: QUIC Networked Connections
+## 11C: QUIC Networked Connections (OUTSTANDING)
 
 **Goal:** Attach to sessions over the network using QUIC, with the existing
-TLV message protocol unchanged.
+TLV message protocol unchanged. Gains encrypted roaming (survives IP/network
+changes), TLS 1.3, and 0-RTT reconnect.
 
 ### Design
 
 **New binary: `lumi-quic-proxy`** runs on the remote host (one per session):
 - Listens on a QUIC endpoint (host:port)
-- Authenticates via pre-shared key (PSK)
+- Authenticates via pre-shared key (PSK) or SSH key challenge
 - Bridges TLV messages to/from local mserver Unix sockets
 - Registers `quic-addr` file in sessdir
 
@@ -139,7 +144,7 @@ QUIC support is optional (`#ifdef HAVE_QUIC`).
 
 ---
 
-## 11D: Speculative Local Echo
+## 11D: Speculative Local Echo (DONE)
 
 **Goal:** Predict echoed characters on client side for low-latency typing,
 confirm or roll back when server responds.
@@ -174,6 +179,42 @@ Predicted cells rendered with `VT_ATTR_DIM` (configurable).
 | `src/cmd/attach/attach.c` | Hook prediction into input/output paths |
 | `src/librender/render.c` | Render predicted cells with dim style |
 | `tests/test_predict.c` | Prediction unit tests |
+
+---
+
+## Alt-Screen Scrollback Capture (Option C)
+
+**Goal:** Make lumi's `ctrl-A [` scrollback viewer show content from
+alt-screen applications (TUI apps, editors, claude CLI) rather than
+showing only the primary-screen bash history from before the app started.
+
+**Background:** Lumi's scrollback ring is attached to `VT_TARGET_PRIMARY`
+only. Apps that use the alternate screen (`VT_TARGET_ALT`, DECSET 1049)
+write output that is never captured in the ring. When the user enters
+scrollback while such an app is focused, they see bash history instead
+of the app's output.
+
+Option B (forwarding mouse wheel events to children that requested mouse
+tracking) was implemented first and handles the common case of scrolling
+within a live alt-screen app.
+
+**Design:** When a child calls `DECRST 1049` (leaves the alternate screen),
+copy the last visible rows of the ALT buffer into PRIMARY's scrollback ring
+as synthetic history. On re-entry (DECSET 1049), optionally mark the
+boundary so the viewer can show a separator. This is analogous to tmux's
+`alternate-screen off` option.
+
+**Changes required:**
+
+| File | Change |
+|------|--------|
+| `src/libvt/vt_state.c` | In `vt_state_altscreen_leave()`, copy ALT rows into PRIMARY ring |
+| `src/libvt/vt_buf.c` | Add `vt_buf_push_rows()` to append rows into the ring head |
+| `src/libvt/vt_buf.h` | Declare `vt_buf_push_rows()` |
+
+**Caution:** Pushing rows on every alt-screen exit may produce confusing
+history for apps that frequently toggle alt screen (e.g. vim during
+startup). A config option to gate the behavior may be warranted.
 
 ---
 

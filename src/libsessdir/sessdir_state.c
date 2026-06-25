@@ -188,16 +188,36 @@ state_read_all(struct sessdir_state *st)
 	return buf;
 }
 
-/* write state from scratch: FOCUS + WINDOW_ORDER.
+/* format a PID list into val[] as space-separated decimals.
+ * returns the byte length written. */
+static int
+format_pid_list(char *val, size_t valsz, const pid_t *list, int n)
+{
+	int pos = 0, i;
+
+	for (i = 0; i < n; i++) {
+		int w;
+
+		if (pos > 0 && pos < (int)valsz - 1)
+			val[pos++] = ' ';
+		w = snprintf(val + pos, valsz - (size_t)pos,
+		    "%d", (int)list[i]);
+		if (w > 0)
+			pos += w;
+	}
+	val[pos] = '\0';
+	return pos;
+}
+
+/* write state from scratch: FOCUS + WINDOW_ORDER + WINDOW_NUMS.
  * uses atomic rename via temp file. */
 static int
 state_write(struct sessdir_state *st, pid_t focus,
-    const pid_t *order, int norder)
+    const pid_t *order, int norder, const pid_t *nums, int nnums)
 {
 	char tmp[PATH_MAX];
 	FILE *f;
 	char val[4096];
-	int pos, i;
 
 	if (snprintf(tmp, sizeof(tmp), "%s.tmp", st->path) >= PATH_MAX)
 		return -1;
@@ -214,21 +234,13 @@ state_write(struct sessdir_state *st, pid_t focus,
 		write_kv(f, "FOCUS", buf);
 	}
 
-	/* WINDOW_ORDER */
-	pos = 0;
-	for (i = 0; i < norder; i++) {
-		int n;
-
-		if (pos > 0 && pos < (int)sizeof(val) - 1)
-			val[pos++] = ' ';
-		n = snprintf(val + pos, sizeof(val) - (size_t)pos,
-		    "%d", (int)order[i]);
-		if (n > 0)
-			pos += n;
-	}
-	val[pos] = '\0';
-	if (pos > 0)
+	/* WINDOW_ORDER (dense layout order) */
+	if (format_pid_list(val, sizeof(val), order, norder) > 0)
 		write_kv(f, "WINDOW_ORDER", val);
+
+	/* WINDOW_NUMS (slot map; 0 marks a spare) */
+	if (format_pid_list(val, sizeof(val), nums, nnums) > 0)
+		write_kv(f, "WINDOW_NUMS", val);
 
 	fclose(f);
 
@@ -249,35 +261,47 @@ struct parse_ctx {
 	pid_t focus;
 	pid_t order[64];
 	int norder;
+	pid_t nums[64];		/* slot map: index = number, 0 = spare */
+	int nnums;
 };
+
+/* parse a space-separated PID list into dst[]. when keep_zero is set,
+ * a literal 0 is stored as a spare slot rather than dropped. */
+static int
+parse_pid_list(const char *val, pid_t *dst, int max, int keep_zero)
+{
+	const char *p = val;
+	int n = 0;
+
+	while (*p && n < max) {
+		char *end;
+		long v;
+
+		while (*p == ' ')
+			p++;
+		if (*p == '\0')
+			break;
+		v = strtol(p, &end, 10);
+		if (end == p)
+			break;
+		if (v > 0 || keep_zero)
+			dst[n++] = (pid_t)v;
+		p = end;
+	}
+	return n;
+}
 
 static int
 parse_cb(const char *key, const char *val, void *arg)
 {
 	struct parse_ctx *ctx = arg;
 
-	if (strcmp(key, "FOCUS") == 0) {
+	if (strcmp(key, "FOCUS") == 0)
 		ctx->focus = (pid_t)atol(val);
-	} else if (strcmp(key, "WINDOW_ORDER") == 0) {
-		const char *p = val;
-
-		ctx->norder = 0;
-		while (*p && ctx->norder < 64) {
-			char *end;
-			long v;
-
-			while (*p == ' ')
-				p++;
-			if (*p == '\0')
-				break;
-			v = strtol(p, &end, 10);
-			if (end == p)
-				break;
-			if (v > 0)
-				ctx->order[ctx->norder++] = (pid_t)v;
-			p = end;
-		}
-	}
+	else if (strcmp(key, "WINDOW_ORDER") == 0)
+		ctx->norder = parse_pid_list(val, ctx->order, 64, 0);
+	else if (strcmp(key, "WINDOW_NUMS") == 0)
+		ctx->nnums = parse_pid_list(val, ctx->nums, 64, 1);
 	return 0;
 }
 
@@ -288,10 +312,27 @@ state_parse(struct sessdir_state *st, struct parse_ctx *ctx)
 
 	ctx->focus = 0;
 	ctx->norder = 0;
+	ctx->nnums = 0;
 
 	data = state_read_all(st);
 	parse_dotenv(data, parse_cb, ctx);
 	free(data);
+
+	/* migrate legacy state with no WINDOW_NUMS: seed numbers from the
+	 * current order so existing windows keep a stable number. */
+	if (ctx->nnums == 0 && ctx->norder > 0) {
+		memcpy(ctx->nums, ctx->order,
+		    (size_t)ctx->norder * sizeof(pid_t));
+		ctx->nnums = ctx->norder;
+	}
+}
+
+/* drop trailing spare slots so the map stays compact. */
+static void
+nums_trim(struct parse_ctx *ctx)
+{
+	while (ctx->nnums > 0 && ctx->nums[ctx->nnums - 1] == 0)
+		ctx->nnums--;
 }
 
 /* ---- public API ---- */
@@ -369,7 +410,8 @@ sessdir_state_set_focus(struct sessdir_state *st, pid_t pid)
 	flock(st->fd, LOCK_EX);
 	state_parse(st, &ctx);
 	ctx.focus = pid;
-	rc = state_write(st, ctx.focus, ctx.order, ctx.norder);
+	rc = state_write(st, ctx.focus, ctx.order, ctx.norder,
+	    ctx.nums, ctx.nnums);
 	flock(st->fd, LOCK_UN);
 	return rc;
 }
@@ -378,7 +420,7 @@ int
 sessdir_state_add_server(struct sessdir_state *st, pid_t pid)
 {
 	struct parse_ctx ctx;
-	int i, rc;
+	int i, slot, rc;
 
 	flock(st->fd, LOCK_EX);
 	state_parse(st, &ctx);
@@ -397,9 +439,25 @@ sessdir_state_add_server(struct sessdir_state *st, pid_t pid)
 	}
 
 	ctx.order[ctx.norder++] = pid;
+
+	/* assign the lowest free window number: reuse the first spare
+	 * slot, otherwise extend the map. */
+	slot = -1;
+	for (i = 0; i < ctx.nnums; i++) {
+		if (ctx.nums[i] == 0) {
+			slot = i;
+			break;
+		}
+	}
+	if (slot < 0 && ctx.nnums < 64)
+		slot = ctx.nnums++;
+	if (slot >= 0)
+		ctx.nums[slot] = pid;
+
 	if (ctx.focus == 0)
 		ctx.focus = pid;
-	rc = state_write(st, ctx.focus, ctx.order, ctx.norder);
+	rc = state_write(st, ctx.focus, ctx.order, ctx.norder,
+	    ctx.nums, ctx.nnums);
 	flock(st->fd, LOCK_UN);
 	return rc;
 }
@@ -413,16 +471,25 @@ sessdir_state_remove_server(struct sessdir_state *st, pid_t pid)
 	flock(st->fd, LOCK_EX);
 	state_parse(st, &ctx);
 
-	/* find and remove */
+	/* remove from the dense layout order (shifts remaining entries) */
 	for (i = 0; i < ctx.norder; i++) {
 		if (ctx.order[i] == pid) {
-			/* shift remaining entries */
 			ctx.norder--;
 			for (; i < ctx.norder; i++)
 				ctx.order[i] = ctx.order[i + 1];
 			break;
 		}
 	}
+
+	/* free the stable window number: leave a spare, do not renumber
+	 * the other windows. */
+	for (i = 0; i < ctx.nnums; i++) {
+		if (ctx.nums[i] == pid) {
+			ctx.nums[i] = 0;
+			break;
+		}
+	}
+	nums_trim(&ctx);
 
 	/* if focused server was removed, pick next or clear */
 	if (ctx.focus == pid) {
@@ -432,7 +499,73 @@ sessdir_state_remove_server(struct sessdir_state *st, pid_t pid)
 			ctx.focus = 0;
 	}
 
-	rc = state_write(st, ctx.focus, ctx.order, ctx.norder);
+	rc = state_write(st, ctx.focus, ctx.order, ctx.norder,
+	    ctx.nums, ctx.nnums);
+	flock(st->fd, LOCK_UN);
+	return rc;
+}
+
+int
+sessdir_state_num(struct sessdir_state *st, pid_t pid)
+{
+	struct parse_ctx ctx;
+	int i, num = -1;
+
+	flock(st->fd, LOCK_SH);
+	state_parse(st, &ctx);
+	flock(st->fd, LOCK_UN);
+
+	for (i = 0; i < ctx.nnums; i++) {
+		if (ctx.nums[i] == pid) {
+			num = i;
+			break;
+		}
+	}
+	return num;
+}
+
+int
+sessdir_state_nums(struct sessdir_state *st, pid_t *out, int max)
+{
+	struct parse_ctx ctx;
+	int n;
+
+	flock(st->fd, LOCK_SH);
+	state_parse(st, &ctx);
+	flock(st->fd, LOCK_UN);
+
+	n = ctx.nnums < max ? ctx.nnums : max;
+	memcpy(out, ctx.nums, (size_t)n * sizeof(pid_t));
+	return n;
+}
+
+int
+sessdir_state_swap_num(struct sessdir_state *st, pid_t a, pid_t b)
+{
+	struct parse_ctx ctx;
+	int i, sa = -1, sb = -1, rc;
+
+	if (a == b)
+		return 0;
+
+	flock(st->fd, LOCK_EX);
+	state_parse(st, &ctx);
+
+	for (i = 0; i < ctx.nnums; i++) {
+		if (ctx.nums[i] == a)
+			sa = i;
+		else if (ctx.nums[i] == b)
+			sb = i;
+	}
+	if (sa < 0 || sb < 0) {
+		flock(st->fd, LOCK_UN);
+		return -1;
+	}
+
+	ctx.nums[sa] = b;
+	ctx.nums[sb] = a;
+	rc = state_write(st, ctx.focus, ctx.order, ctx.norder,
+	    ctx.nums, ctx.nnums);
 	flock(st->fd, LOCK_UN);
 	return rc;
 }

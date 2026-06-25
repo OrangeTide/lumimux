@@ -97,13 +97,19 @@ blit_pane(struct vt_cell *screen, uint8_t *row_dirty, int srows, int scols,
     const struct tile_node *n)
 {
 	struct vt_buf *buf;
-	int r, c;
+	int r, c, bcols;
 
 	if (!n->vt)
 		return;
 	buf = n->vt->buf;
 	if (!buf)
 		return;
+
+	/* the source buffer may briefly be narrower than the pane (e.g.
+	 * a pending resize after a mode switch); never read past its row. */
+	bcols = vt_buf_cols(buf);
+	if (bcols > n->w)
+		bcols = n->w;
 
 	for (r = 0; r < n->h; r++) {
 		struct vt_row *vr = vt_buf_row(buf, r);
@@ -115,7 +121,7 @@ blit_pane(struct vt_cell *screen, uint8_t *row_dirty, int srows, int scols,
 
 		dirty = (vr->flags & VT_ROW_DIRTY) != 0;
 
-		for (c = 0; c < n->w; c++) {
+		for (c = 0; c < bcols; c++) {
 			struct vt_cell *src, *dst;
 
 			src = &vr->cells[c];

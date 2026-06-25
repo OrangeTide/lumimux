@@ -387,6 +387,65 @@ test_state_persistence(void)
 	printf("ok\n");
 }
 
+/* stable window numbers: closing a window leaves a spare, never renumbers
+ * the others; a new window takes the lowest free number. */
+static void
+test_state_window_nums(void)
+{
+	struct sessdir_state *st;
+	pid_t order[16], nums[16];
+	int n;
+
+	printf("  state stable window numbers ... ");
+	sessdir_session_create("st6");
+	st = sessdir_state_open("st6");
+	if (!st)
+		return;
+
+	sessdir_state_add_server(st, 100);
+	sessdir_state_add_server(st, 200);
+	sessdir_state_add_server(st, 300);
+
+	CHECK(sessdir_state_num(st, 100) == 0, "100 should be number 0");
+	CHECK(sessdir_state_num(st, 200) == 1, "200 should be number 1");
+	CHECK(sessdir_state_num(st, 300) == 2, "300 should be number 2");
+
+	/* close the middle window: 100 and 300 keep their numbers, 200's
+	 * number becomes a spare. */
+	CHECK(sessdir_state_remove_server(st, 200) == 0, "remove 200");
+	CHECK(sessdir_state_num(st, 100) == 0, "100 stays number 0");
+	CHECK(sessdir_state_num(st, 300) == 2, "300 stays number 2");
+	CHECK(sessdir_state_num(st, 200) == -1, "200 has no number");
+
+	n = sessdir_state_nums(st, nums, 16);
+	CHECK(n == 3, "nums map keeps the gap (3 slots)");
+	CHECK(nums[0] == 100 && nums[1] == 0 && nums[2] == 300,
+	    "slot 1 is a spare");
+
+	/* layout order stays dense (no gap) */
+	n = sessdir_state_order(st, order, 16);
+	CHECK(n == 2 && order[0] == 100 && order[1] == 300,
+	    "order compacts to [100 300]");
+
+	/* a new window fills the lowest free number (the spare at 1) */
+	sessdir_state_add_server(st, 400);
+	CHECK(sessdir_state_num(st, 400) == 1, "400 reuses spare number 1");
+
+	/* with no spare left, the next window extends the map */
+	sessdir_state_add_server(st, 500);
+	CHECK(sessdir_state_num(st, 500) == 3, "500 gets number 3");
+
+	/* swap number with a neighbor */
+	CHECK(sessdir_state_swap_num(st, 100, 500) == 0, "swap 100<->500");
+	CHECK(sessdir_state_num(st, 100) == 3, "100 now number 3");
+	CHECK(sessdir_state_num(st, 500) == 0, "500 now number 0");
+	CHECK(sessdir_state_swap_num(st, 100, 999) == -1,
+	    "swap with unknown pid fails");
+
+	sessdir_state_close(st);
+	printf("ok\n");
+}
+
 /* ---- inotify watch test ---- */
 
 static void
@@ -445,6 +504,7 @@ main(void)
 	test_state_set_focus();
 	test_state_remove_server();
 	test_state_persistence();
+	test_state_window_nums();
 
 	/* inotify watch */
 	test_watch();

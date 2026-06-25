@@ -5,3 +5,4 @@
 *.deb
 *.rpm
 /compile_commands.json
+.cache

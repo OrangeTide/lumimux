@@ -198,7 +198,22 @@ render_status_line(int fd, int rows, int cols)
 	row = status_get_position(statusbar) ? 1 : rows;
 
 	max = (row == rows) ? cols - 1 : cols;
-	status_expand(statusbar, content, sizeof(content), max);
+	{
+		/* prepend a fixed marker when the live window watch is off, so
+		 * the degraded state is visible regardless of the user's
+		 * status format (independent of status_expand). */
+		const char *warn = sessdir_watch_degraded ? "[!watch] " : "";
+		int wlen = (int)strlen(warn);
+
+		if (wlen > max) {
+			wlen = 0;
+			warn = "";
+		}
+		status_expand(statusbar, content + wlen,
+		    sizeof(content) - (size_t)wlen, max - wlen);
+		if (wlen > 0)
+			memcpy(content, warn, (size_t)wlen);
+	}
 
 	/* skip if nothing changed since last draw */
 	if (!status_line_dirty && row == last_row && cols == last_cols &&

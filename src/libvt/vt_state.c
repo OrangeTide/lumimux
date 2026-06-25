@@ -78,6 +78,50 @@ vt_state_set_reply_fd(struct vt_state *st, int fd)
 	st->reply_fd = fd;
 }
 
+/* push a new entry onto the kitty keyboard flag stack; when the stack is
+ * full the oldest entry is dropped, matching the kitty protocol */
+void
+vt_state_kitty_push(struct vt_state *st, int flags)
+{
+	if (st->kitty_kbd_depth == VT_KITTY_KBD_STACK_MAX) {
+		memmove(&st->kitty_kbd_stack[0], &st->kitty_kbd_stack[1],
+		    (VT_KITTY_KBD_STACK_MAX - 1) * sizeof(int));
+		st->kitty_kbd_depth--;
+	}
+	st->kitty_kbd_stack[st->kitty_kbd_depth++] = flags;
+	st->kitty_kbd_flags = flags;
+}
+
+/* pop count entries (default 1); effective flags become the new top, or 0 */
+void
+vt_state_kitty_pop(struct vt_state *st, int count)
+{
+	if (count < 1)
+		count = 1;
+	if (count > st->kitty_kbd_depth)
+		count = st->kitty_kbd_depth;
+	st->kitty_kbd_depth -= count;
+	st->kitty_kbd_flags = st->kitty_kbd_depth
+	    ? st->kitty_kbd_stack[st->kitty_kbd_depth - 1] : 0;
+}
+
+/* set the top entry's flags in place (CSI = flags ; mode u).
+ * mode 1 = replace (default), 2 = set bits, 3 = clear bits. */
+void
+vt_state_kitty_set(struct vt_state *st, int flags, int mode)
+{
+	int cur = st->kitty_kbd_flags;
+
+	switch (mode) {
+	case 3:	cur &= ~flags; break;
+	case 2:	cur |= flags; break;
+	default: cur = flags; break;
+	}
+	st->kitty_kbd_flags = cur;
+	if (st->kitty_kbd_depth)
+		st->kitty_kbd_stack[st->kitty_kbd_depth - 1] = cur;
+}
+
 const char *
 vt_state_title(const struct vt_state *st)
 {

@@ -3,6 +3,10 @@
  * Licensed under MIT-0 OR PUBLIC DOMAIN */
 
 #define _XOPEN_SOURCE 600
+/* expose BSD send() flags (MSG_DONTWAIT) that strict _XOPEN_SOURCE hides */
+#ifdef __APPLE__
+#define _DARWIN_C_SOURCE
+#endif
 
 #define ERR (-1)
 #define OK (0)
@@ -24,6 +28,7 @@
 #include "log.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdio.h>
@@ -33,6 +38,16 @@
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
+
+/* MSG_NOSIGNAL does not exist on macOS; SIGPIPE is ignored globally (see
+ * mserver_main), so a 0 fallback is safe. MSG_DONTWAIT is exposed above via
+ * _DARWIN_C_SOURCE and is present on Linux/BSD natively. */
+#ifndef MSG_DONTWAIT
+#define MSG_DONTWAIT 0
+#endif
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
 
 static int listen_fd = -1;
 static int client_fd = -1;
@@ -267,7 +282,9 @@ sync_title(void)
 	const char *vt_title;
 
 	vt_title = vt_state_title(window_vt(win));
-	if (vt_title && strcmp(vt_title, window_title(win)) != 0) {
+	if (!vt_title)
+		vt_title = "";	/* title cleared (e.g. title-stack pop) */
+	if (strcmp(vt_title, window_title(win)) != 0) {
 		window_set_title(win, vt_title);
 		sessdir_write_file(session_name, getpid(),
 		    "title", vt_title);

@@ -12,6 +12,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 static int test_count;
 static int fail_count;
@@ -967,6 +969,115 @@ test_integrated_cursor_shape(void)
 	PASS();
 }
 
+/* read one reply written to the pipe; returns NUL-terminated in buf */
+static ssize_t
+read_reply(int fd, char *buf, size_t cap)
+{
+	ssize_t r = read(fd, buf, cap - 1);
+
+	if (r < 0)
+		r = 0;
+	buf[r] = '\0';
+	return r;
+}
+
+static void
+test_keyboard_query(void)
+{
+	struct vt_state *st;
+	struct vt_parse *p;
+	int fds[2];
+	char buf[32];
+
+	TEST("keyboard protocol query replies");
+	st = vt_state_new(24, 80, 100);
+	ASSERT(st != NULL, "state new failed");
+	p = vt_parse_new(vt_ops_default(), st);
+	ASSERT(p != NULL, "parse new failed");
+	ASSERT(pipe(fds) == 0, "pipe failed");
+	/* non-blocking so a missing reply fails instead of hanging */
+	fcntl(fds[0], F_SETFL, O_NONBLOCK);
+	vt_state_set_reply_fd(st, fds[1]);
+
+	/* CSI ? u with no flags set -> CSI ? 0 u */
+	vt_parse_feed(p, "\033[?u", 4);
+	read_reply(fds[0], buf, sizeof(buf));
+	ASSERT(strcmp(buf, "\033[?0u") == 0, "kitty reply not flags 0");
+
+	/* enable kitty flags, then query -> CSI ? 1 u */
+	vt_parse_feed(p, "\033[>1u", 5);
+	vt_parse_feed(p, "\033[?u", 4);
+	read_reply(fds[0], buf, sizeof(buf));
+	ASSERT(strcmp(buf, "\033[?1u") == 0, "kitty reply not flags 1");
+
+	/* XTQMODKEYS query, default off -> CSI > 4 ; 0 m */
+	vt_parse_feed(p, "\033[?4m", 5);
+	read_reply(fds[0], buf, sizeof(buf));
+	ASSERT(strcmp(buf, "\033[>4;0m") == 0, "modkeys reply not 0");
+
+	/* enable modifyOtherKeys=2, then query -> CSI > 4 ; 2 m */
+	vt_parse_feed(p, "\033[>4;2m", 7);
+	vt_parse_feed(p, "\033[?4m", 5);
+	read_reply(fds[0], buf, sizeof(buf));
+	ASSERT(strcmp(buf, "\033[>4;2m") == 0, "modkeys reply not 2");
+
+	close(fds[0]);
+	close(fds[1]);
+	vt_parse_free(p);
+	vt_state_free(st);
+	PASS();
+}
+
+static void
+test_keyboard_stack(void)
+{
+	struct vt_state *st;
+	struct vt_parse *p;
+	int i;
+
+	TEST("kitty keyboard flag stack");
+	st = vt_state_new(24, 80, 100);
+	ASSERT(st != NULL, "state new failed");
+	p = vt_parse_new(vt_ops_default(), st);
+	ASSERT(p != NULL, "parse new failed");
+
+	/* nested pushes; current flags track the top of stack */
+	vt_parse_feed(p, "\033[>1u", 5);
+	ASSERT(st->kitty_kbd_flags == 1, "push 1 not effective");
+	vt_parse_feed(p, "\033[>5u", 5);
+	ASSERT(st->kitty_kbd_flags == 5, "push 5 not effective");
+	ASSERT(st->kitty_kbd_depth == 2, "depth not 2");
+
+	/* pop one restores the previous level, not 0 */
+	vt_parse_feed(p, "\033[<u", 4);
+	ASSERT(st->kitty_kbd_flags == 1, "pop did not restore previous");
+	ASSERT(st->kitty_kbd_depth == 1, "depth not 1 after pop");
+
+	/* set-bits / clear-bits modify the top entry in place */
+	vt_parse_feed(p, "\033[=4;2u", 7);	/* set bit 4 -> 5 */
+	ASSERT(st->kitty_kbd_flags == 5, "set-bits wrong");
+	vt_parse_feed(p, "\033[=1;3u", 7);	/* clear bit 1 -> 4 */
+	ASSERT(st->kitty_kbd_flags == 4, "clear-bits wrong");
+
+	/* multi-entry pop, then pop past empty leaves 0 */
+	vt_parse_feed(p, "\033[>7u", 5);
+	vt_parse_feed(p, "\033[<2u", 5);
+	ASSERT(st->kitty_kbd_depth == 0, "depth not 0 after pop 2");
+	ASSERT(st->kitty_kbd_flags == 0, "flags not 0 when empty");
+	vt_parse_feed(p, "\033[<9u", 5);
+	ASSERT(st->kitty_kbd_depth == 0, "over-pop went negative");
+
+	/* overflow drops the oldest entry, never overruns the stack */
+	for (i = 0; i < VT_KITTY_KBD_STACK_MAX + 4; i++)
+		vt_parse_feed(p, "\033[>1u", 5);
+	ASSERT(st->kitty_kbd_depth == VT_KITTY_KBD_STACK_MAX,
+	    "depth exceeded stack max");
+
+	vt_parse_free(p);
+	vt_state_free(st);
+	PASS();
+}
+
 /* ---- main ---- */
 
 int
@@ -1017,6 +1128,8 @@ main(void)
 	test_integrated_scroll_region();
 	test_integrated_altscreen();
 	test_integrated_cursor_shape();
+	test_keyboard_query();
+	test_keyboard_stack();
 
 	printf("\n%d tests, %d failures\n", test_count, fail_count);
 	return fail_count ? 1 : 0;

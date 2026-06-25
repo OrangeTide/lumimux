@@ -30,6 +30,9 @@ enum vt_target {
 #define VT_MODE_DECKPAM		(1u << 7)
 #define VT_MODE_MOUSE		(1u << 8)
 
+/* max depth of the kitty keyboard protocol flag stack */
+#define VT_KITTY_KBD_STACK_MAX	16
+
 /* saved cursor state (DECSC/DECRC) */
 struct vt_saved_cursor {
 	int		row;
@@ -77,7 +80,9 @@ struct vt_state {
 	int		mouse_mode;
 
 	/* keyboard enhancement protocols */
-	int		kitty_kbd_flags;	/* CSI > flags u (0 = off) */
+	int		kitty_kbd_flags;	/* effective flags = top of stack */
+	int		kitty_kbd_stack[VT_KITTY_KBD_STACK_MAX];
+	int		kitty_kbd_depth;	/* entries on the kitty stack */
 	int		modify_other_keys;	/* CSI > 4 ; Pm m (0 = off) */
 
 	/* window title set by OSC 0/2 */
@@ -107,6 +112,12 @@ void vt_state_cursor_clamp(struct vt_state *st);
 
 /* set the fd for DSR/DA reply writes (-1 to disable) */
 void vt_state_set_reply_fd(struct vt_state *st, int fd);
+
+/* kitty keyboard protocol flag stack (CSI > u push, CSI < u pop,
+ * CSI = u set top); kitty_kbd_flags tracks the current top entry */
+void vt_state_kitty_push(struct vt_state *st, int flags);
+void vt_state_kitty_pop(struct vt_state *st, int count);
+void vt_state_kitty_set(struct vt_state *st, int flags, int mode);
 
 /* window title (set by OSC 0/2, NULL if never set) */
 const char *vt_state_title(const struct vt_state *st);

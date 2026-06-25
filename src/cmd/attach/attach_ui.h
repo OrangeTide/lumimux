@@ -36,6 +36,7 @@ extern struct status *statusbar;
 extern const struct tui_theme *theme;
 extern int status_visible;
 extern int content_rows, content_cols;
+extern int sessdir_watch_degraded;	/* nonzero: live window watch is off */
 
 /* overlay system */
 extern struct tui_stack overlay;

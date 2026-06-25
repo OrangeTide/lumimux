@@ -526,6 +526,25 @@ op_csi(void *ctx, const int *params, int nparam, int intermed, int final)
 				break;
 			}
 			break;
+		case 'u':	/* kitty keyboard protocol: report flags */
+			{
+				/* CSI ? u -- query current progressive
+				 * enhancement flags; reply CSI ? flags u */
+				char rep[16];
+				int len = snprintf(rep, sizeof(rep),
+				    "\033[?%du", st->kitty_kbd_flags);
+				vt_reply(st, rep, (size_t)len);
+			}
+			break;
+		case 'm':	/* XTQMODKEYS -- query modifyOtherKeys */
+			if (n == 4) {
+				/* CSI ? 4 m -- reply CSI > 4 ; Pv m */
+				char rep[24];
+				int len = snprintf(rep, sizeof(rep),
+				    "\033[>4;%dm", st->modify_other_keys);
+				vt_reply(st, rep, (size_t)len);
+			}
+			break;
 		}
 		return;
 	}
@@ -541,12 +560,18 @@ op_csi(void *ctx, const int *params, int nparam, int intermed, int final)
 	/* keyboard enhancement protocol sequences */
 	if (intermed == '>' && final == 'u') {
 		/* CSI > flags u -- kitty keyboard protocol push */
-		st->kitty_kbd_flags = param_or(params, nparam, 0, 0);
+		vt_state_kitty_push(st, param_or(params, nparam, 0, 0));
 		return;
 	}
 	if (intermed == '<' && final == 'u') {
-		/* CSI < u -- kitty keyboard protocol pop */
-		st->kitty_kbd_flags = 0;
+		/* CSI < Pn u -- kitty keyboard protocol pop (default 1) */
+		vt_state_kitty_pop(st, param_or(params, nparam, 0, 1));
+		return;
+	}
+	if (intermed == '=' && final == 'u') {
+		/* CSI = flags ; mode u -- set the current flags in place */
+		vt_state_kitty_set(st, param_or(params, nparam, 0, 0),
+		    param_or(params, nparam, 1, 1));
 		return;
 	}
 	if (intermed == '>' && final == 'm') {
@@ -842,6 +867,7 @@ op_esc(void *ctx, int intermed, int final)
 			st->cursor_row = 0;
 			st->cursor_col = 0;
 			st->kitty_kbd_flags = 0;
+			st->kitty_kbd_depth = 0;
 			st->modify_other_keys = 0;
 			vt_state_tab_reset(st);
 			csi_erase_display(st, 2);

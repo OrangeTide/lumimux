@@ -65,12 +65,15 @@ static int watching;		/* nonzero if subscribed */
 struct mconn {
 	int		fd;
 	pid_t		pid;		/* = window ID */
+	int		num;		/* stable window number, -1 if unknown */
 	char		title[128];
 };
 
 static struct mconn mconns[CLIENT_WIN_MAX];
 static int mconn_count;
 static int sessdir_watch_fd = -1;
+int sessdir_watch_degraded;	/* nonzero: sessdir watch unavailable, so
+				 * new windows are not auto-discovered live */
 static char *session_name;	/* set in main for micro mode (allocated) */
 
 /* ---- remote proxy state ---- */
@@ -200,6 +203,7 @@ mconn_add(struct iox_loop *lp, pid_t pid, int fd, const char *title)
 	mc = &mconns[mconn_count++];
 	mc->fd = fd;
 	mc->pid = pid;
+	mc->num = -1;
 	if (title) {
 		size_t len = utf8_trunc(title, sizeof(mc->title));
 		memcpy(mc->title, title, len);
@@ -331,11 +335,40 @@ micro_resize_all(int rows, int cols)
 		    rows, cols);
 }
 
+static int mconn_refresh(struct iox_loop *lp);
+
+/* A new mserver registers its session directory slightly before it begins
+ * listening, so an immediate rescan can miss it. Retry a few times with a
+ * short delay to win that race. This makes new windows appear even when the
+ * sessdir watch is unavailable (e.g. inotify instances exhausted). */
+#define SPAWN_RESCAN_TRIES	5
+#define SPAWN_RESCAN_DELAY_MS	80
+
+struct spawn_rescan {
+	int tries_left;
+};
+
+static void
+spawn_rescan_cb(struct iox_loop *lp, void *arg)
+{
+	struct spawn_rescan *sr = arg;
+
+	/* mconn_refresh() is idempotent: already-connected windows are
+	 * skipped, so racing with the watch (when it works) is harmless. */
+	if (mconn_refresh(lp) <= 0 && --sr->tries_left > 0) {
+		if (iox_timer_add(lp, SPAWN_RESCAN_DELAY_MS,
+		    spawn_rescan_cb, sr) >= 0)
+			return;
+	}
+	free(sr);
+}
+
 /* spawn a new mserver for this session */
 static void
-micro_spawn_window(const char *name)
+micro_spawn_window(struct iox_loop *lp, const char *name)
 {
 	pid_t pid;
+	struct spawn_rescan *sr;
 
 	pid = fork();
 	if (pid < 0)
@@ -346,7 +379,15 @@ micro_spawn_window(const char *name)
 		};
 		_exit(multicall_exec_cmd("mserver", 3, child_argv));
 	}
-	/* parent: mserver will register in sessdir, picked up by watch */
+
+	/* parent: the watch picks this up if it is working; also schedule
+	 * active rescans so the window still appears when it is not. */
+	if (lp && (sr = malloc(sizeof(*sr))) != NULL) {
+		sr->tries_left = SPAWN_RESCAN_TRIES;
+		if (iox_timer_add(lp, SPAWN_RESCAN_DELAY_MS,
+		    spawn_rescan_cb, sr) < 0)
+			free(sr);
+	}
 }
 
 const char *
@@ -1183,6 +1224,37 @@ tiled_resize_pane_cb(uint32_t window_id, int w, int h, void *arg)
 		mconn_ipc_send_size(mc, IPC_MSG_WIN_RESIZE, h, w);
 }
 
+/* resize a single window's VT to the geometry of the pane it currently
+ * occupies.  call after swapping a window into the focused pane so a
+ * buffer carried over from turbo mode (often taller than the terminal)
+ * is shrunk to fit instead of leaving the live content below the pane. */
+static void
+screen_fit_window(uint32_t id)
+{
+	int w, h;
+
+	if (tile_pane_geometry(tilemgr, id, NULL, NULL, &w, &h) == 0)
+		tiled_resize_pane_cb(id, w, h, NULL);
+}
+
+/* enforce the screen-mode sizing policy: every window fits the area
+ * screen mode controls.  windows shown in a pane already get their pane
+ * size from tile_each_pane(); resize any remaining off-screen window to
+ * the full content area so it is never larger than the terminal. */
+static void
+screen_fit_all_windows(void)
+{
+	int i;
+
+	for (i = 0; i < cwin_count; i++) {
+		if (tile_pane_geometry(tilemgr, cwins[i].id,
+		    NULL, NULL, NULL, NULL) == 0)
+			continue;	/* sized by tile_each_pane */
+		tiled_resize_pane_cb(cwins[i].id, content_cols,
+		    content_rows, NULL);
+	}
+}
+
 /* sync watched_id / watching / vt globals from tilemgr's focused pane.
  * these globals are used by other files (prefix_menu.c, picker.c, etc.)
  * but tilemgr is the source of truth for focus. */
@@ -1805,6 +1877,7 @@ mode_toggle(void)
 		tile_resize(tilemgr, content_rows, content_cols);
 		overlay_repaint_fn = tiled_repaint;
 		tile_each_pane(tilemgr, tiled_resize_pane_cb, NULL);
+		screen_fit_all_windows();
 		tile_focus(tilemgr, watched_id);
 		tile_sync_focus();
 		tile_need_full = 1;
@@ -1863,33 +1936,171 @@ turbo_focused_id(uint32_t *out_id)
 
 /* ---- micro-server helpers (need turbo state) ---- */
 
+/* refresh each connection's stable window number from session state.
+ * windows keep their number across other windows closing; a closed
+ * window's number becomes a spare and is not reused until a new window
+ * is created. */
+static void
+mconn_refresh_nums(void)
+{
+	struct sessdir_state *st;
+	pid_t nums[CLIENT_WIN_MAX];
+	int nnums, i, j;
+
+	for (i = 0; i < mconn_count; i++)
+		mconns[i].num = -1;
+
+	st = sessdir_state_open(session_name);
+	if (!st)
+		return;
+	nnums = sessdir_state_nums(st, nums, CLIENT_WIN_MAX);
+	sessdir_state_close(st);
+
+	for (j = 0; j < nnums; j++) {
+		if (nums[j] == 0)
+			continue;
+		for (i = 0; i < mconn_count; i++) {
+			if ((pid_t)mconns[i].pid == nums[j]) {
+				mconns[i].num = j;
+				break;
+			}
+		}
+	}
+}
+
+/* find the connection whose number is adjacent to `from` in direction
+ * `dir` (>0 next higher, <0 next lower). spares are skipped. when `wrap`
+ * is set and no candidate lies in the direction, wraps to the extreme at
+ * the other end. returns the pid, or 0 if none. */
+static uint32_t
+mconn_adjacent_pid(int from, int dir, int wrap)
+{
+	uint32_t best_pid = 0, wrap_pid = 0;
+	int best = -1, wend = -1, i;
+
+	for (i = 0; i < mconn_count; i++) {
+		int n = mconns[i].num;
+
+		if (n < 0)
+			continue;
+
+		/* wrap-around extreme: smallest for next, largest for prev */
+		if (wend < 0 || (dir > 0 ? n < wend : n > wend)) {
+			wend = n;
+			wrap_pid = (uint32_t)mconns[i].pid;
+		}
+
+		/* nearest candidate strictly in the requested direction */
+		if (dir > 0 ? n > from : n < from) {
+			if (best < 0 || (dir > 0 ? n < best : n > best)) {
+				best = n;
+				best_pid = (uint32_t)mconns[i].pid;
+			}
+		}
+	}
+
+	if (best >= 0)
+		return best_pid;
+	return wrap ? wrap_pid : 0;
+}
+
+/* swap the current window's stable number with the next lower (dir<0)
+ * or next higher (dir>0) numbered window. does not wrap around. */
+static void
+micro_swap_num(int dir)
+{
+	struct sessdir_state *st;
+	uint32_t other;
+	int i, cur_num = -1;
+
+	if (!watching || mconn_count == 0)
+		return;
+
+	mconn_refresh_nums();
+
+	for (i = 0; i < mconn_count; i++) {
+		if ((uint32_t)mconns[i].pid == watched_id) {
+			cur_num = mconns[i].num;
+			break;
+		}
+	}
+	if (cur_num < 0)
+		return;
+
+	other = mconn_adjacent_pid(cur_num, dir, 0);
+	if (other == 0 || other == watched_id)
+		return;
+
+	st = sessdir_state_open(session_name);
+	if (st) {
+		sessdir_state_swap_num(st, (pid_t)watched_id, (pid_t)other);
+		sessdir_state_close(st);
+	}
+
+	mconn_sync_winlist();
+	need_status = 1;
+}
+
 static void
 mconn_sync_winlist(void)
 {
-	int i;
+	int i, k, ord[CLIENT_WIN_MAX], n = 0;
+
+	mconn_refresh_nums();
+
+	/* present windows in ascending stable-number order so the tab bar
+	 * reads 0,1,2,... with gaps where numbers are spare; windows with
+	 * no number yet sort to the end. */
+	for (i = 0; i < mconn_count; i++)
+		ord[n++] = i;
+	for (i = 1; i < n; i++) {
+		int t = ord[i], j = i - 1;
+		int tn = mconns[t].num < 0 ? INT_MAX : mconns[t].num;
+
+		while (j >= 0 &&
+		    (mconns[ord[j]].num < 0 ? INT_MAX : mconns[ord[j]].num)
+		    > tn) {
+			ord[j + 1] = ord[j];
+			j--;
+		}
+		ord[j + 1] = t;
+	}
 
 	win_list_clear();
-	for (i = 0; i < mconn_count; i++) {
+	for (k = 0; k < n; k++) {
 		struct client_window *cw;
 		char *title;
+		const char *use, *live;
 		char label[140];
 
+		i = ord[k];
+		cw = cwin_find((uint32_t)mconns[i].pid);
+
+		/* The client's live VT state is authoritative for the
+		 * on-screen title and is at least as fresh as the sessdir
+		 * file (the server writes the file from the same stream we
+		 * parse, before forwarding it to us). Prefer it, and use the
+		 * sessdir file only to seed a window we have not yet parsed a
+		 * title for. Reading the stale file unconditionally here is
+		 * what made switched-away tabs revert to old titles. */
 		title = sessdir_read_file(session_name, mconns[i].pid,
 		    "title");
-		if (title) {
-			size_t len = utf8_trunc(title,
+		live = (cw && cw->vt) ? vt_state_title(cw->vt) : NULL;
+		use = (live && live[0]) ? live : title;
+		if (use) {
+			size_t len = utf8_trunc(use,
 			    sizeof(mconns[i].title));
-			memcpy(mconns[i].title, title, len);
+			memcpy(mconns[i].title, use, len);
 			mconns[i].title[len] = '\0';
-			free(title);
 		}
-		cw = cwin_find((uint32_t)mconns[i].pid);
+		free(title);
 		snprintf(label, sizeof(label), "%s%s%s%s",
 		    mconns[i].title,
 		    (cw && cw->dead) ? " [dead]" : "",
 		    (cw && cw->scroll_lock) ? " [scroll-lock]" : "",
 		    (cw && cw->input_lock) ? " [input-lock]" : "");
-		win_list_add((uint32_t)i, (uint32_t)mconns[i].pid, label,
+		win_list_add((uint32_t)(mconns[i].num < 0 ? 0 : mconns[i].num),
+		    (uint32_t)mconns[i].pid, label,
 		    watching && (uint32_t)mconns[i].pid == watched_id);
 	}
 	win_list_format_status();
@@ -1901,29 +2112,33 @@ mconn_sync_winlist(void)
 static void
 micro_cycle_focus(int dir)
 {
-	int i, cur = -1;
+	int i, cur_num = -1, from;
 
 	if (mconn_count == 0)
 		return;
 
-	/* find current */
+	mconn_refresh_nums();
+
+	/* current window's stable number */
 	if (watching) {
 		for (i = 0; i < mconn_count; i++) {
 			if ((uint32_t)mconns[i].pid == watched_id) {
-				cur = i;
+				cur_num = mconns[i].num;
 				break;
 			}
 		}
 	}
 
-	if (cur < 0)
-		cur = 0;
-	else if (dir > 0)
-		cur = (cur + 1) % mconn_count;
+	/* not watching: start past the appropriate extreme so the first
+	 * window in the direction is chosen. */
+	if (cur_num < 0)
+		from = (dir > 0) ? -1 : INT_MAX;
 	else
-		cur = (cur + mconn_count - 1) % mconn_count;
+		from = cur_num;
 
-	watched_id = (uint32_t)mconns[cur].pid;
+	watched_id = mconn_adjacent_pid(from, dir, 1);
+	if (watched_id == 0)
+		return;
 	watching = 1;
 
 	{
@@ -1942,6 +2157,7 @@ micro_cycle_focus(int dir)
 
 		tile_set_window(tilemgr, old_id, watched_id, vt);
 		tile_focus(tilemgr, watched_id);
+		screen_fit_window(watched_id);
 		tile_need_full = 1;
 	}
 	need_render = 1;
@@ -1979,6 +2195,7 @@ micro_select_window(uint32_t id)
 
 		tile_set_window(tilemgr, old_id, id, vt);
 		tile_focus(tilemgr, id);
+		screen_fit_window(id);
 		tile_need_full = 1;
 	}
 	need_render = 1;
@@ -2010,13 +2227,19 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 		}
 		break;
 	case KEYS_ACTION_NEW_WINDOW:
-		micro_spawn_window(session_name);
+		micro_spawn_window(loop, session_name);
 		break;
 	case KEYS_ACTION_NEXT_WINDOW:
 		micro_cycle_focus(1);
 		break;
 	case KEYS_ACTION_PREV_WINDOW:
 		micro_cycle_focus(-1);
+		break;
+	case KEYS_ACTION_SWAP_NUM_LOWER:
+		micro_swap_num(-1);
+		break;
+	case KEYS_ACTION_SWAP_NUM_HIGHER:
+		micro_swap_num(1);
 		break;
 	case KEYS_ACTION_SELECT_0:
 	case KEYS_ACTION_SELECT_1:
@@ -2029,11 +2252,17 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 	case KEYS_ACTION_SELECT_8:
 	case KEYS_ACTION_SELECT_9:
 		{
-			int idx = (int)(action - KEYS_ACTION_SELECT_0);
+			int num = (int)(action - KEYS_ACTION_SELECT_0);
+			int i;
 
-			if (idx < mconn_count)
-				micro_select_window(
-				    (uint32_t)mconns[idx].pid);
+			mconn_refresh_nums();
+			for (i = 0; i < mconn_count; i++) {
+				if (mconns[i].num == num) {
+					micro_select_window(
+					    (uint32_t)mconns[i].pid);
+					break;
+				}
+			}
 		}
 		break;
 	case KEYS_ACTION_KILL_WINDOW:
@@ -2115,7 +2344,7 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 			{
 				uint32_t fid = tile_focused_id(tilemgr);
 
-				micro_spawn_window(session_name);
+				micro_spawn_window(loop, session_name);
 				tile_split(tilemgr, fid, dir, 0, NULL);
 				tile_each_pane(tilemgr,
 				    tiled_resize_pane_cb, NULL);
@@ -2503,7 +2732,7 @@ handle_mouse_turbo(struct iox_loop *loop, const struct tkbd_seq *seq)
 		return;
 	}
 
-	/* mouse wheel: scroll through history (skip on alternate screen) */
+	/* mouse wheel: scroll history, or forward to child in alt screen */
 	if (seq->key == TKBD_MOUSE_WHEEL_UP ||
 	    seq->key == TKBD_MOUSE_WHEEL_DOWN) {
 		struct client_window *fcw = cwin_focused();
@@ -2527,6 +2756,12 @@ handle_mouse_turbo(struct iox_loop *loop, const struct tkbd_seq *seq)
 			}
 			need_render = 1;
 			need_status = 1;
+		} else if (fcw && fcw->vt && focused_wants_mouse()) {
+			struct mconn *mc = mconn_focused();
+
+			if (seq->len > 0 && mc)
+				mconn_ipc_send(mc, IPC_MSG_INPUT,
+				    seq->data, (uint32_t)seq->len);
 		}
 		return;
 	}
@@ -2836,7 +3071,7 @@ handle_mouse(struct iox_loop *loop, const struct tkbd_seq *seq)
 		return;
 	}
 
-	/* mouse wheel: scroll through history (skip on alternate screen) */
+	/* mouse wheel: scroll history, or forward to child in alt screen */
 	if (seq->key == TKBD_MOUSE_WHEEL_UP ||
 	    seq->key == TKBD_MOUSE_WHEEL_DOWN) {
 		struct client_window *fcw = cwin_focused();
@@ -2860,6 +3095,12 @@ handle_mouse(struct iox_loop *loop, const struct tkbd_seq *seq)
 			}
 			need_render = 1;
 			need_status = 1;
+		} else if (fcw && fcw->vt && focused_wants_mouse()) {
+			struct mconn *mc = mconn_focused();
+
+			if (seq->len > 0 && mc)
+				mconn_ipc_send(mc, IPC_MSG_INPUT,
+				    seq->data, (uint32_t)seq->len);
 		}
 		return;
 	}
@@ -3633,6 +3874,14 @@ remove_window(struct iox_loop *lp, uint32_t pid)
 
 	if (client_mode == CLIENT_MODE_TURBO) {
 		wm_remove(wmgr, pid);
+		/* tilemgr is the inactive layout in turbo mode, but
+		 * cwin_remove already freed this window's vt.  drop the
+		 * orphan pane now so a later toggle back to screen does
+		 * not render a stale half-width leaf over a freed vt. */
+		if (tilemgr) {
+			if (tile_close(tilemgr, pid) < 0)
+				tile_set_window(tilemgr, pid, 0, NULL);
+		}
 		if (watching && watched_id == pid) {
 			struct client_window *cw;
 
@@ -3819,7 +4068,7 @@ micro_switch_session(struct iox_loop *loop, const char *name)
 
 	/* if empty session, spawn a window and re-discover */
 	if (mconn_count == 0) {
-		micro_spawn_window(session_name);
+		micro_spawn_window(loop, session_name);
 		/* brief pause for mserver to register */
 		usleep(100000);
 		mconn_discover(loop);
@@ -3856,31 +4105,36 @@ micro_switch_session(struct iox_loop *loop, const char *name)
 		}
 		overlay_repaint_fn = tiled_repaint;
 		tile_each_pane(tilemgr, tiled_resize_pane_cb, NULL);
+		screen_fit_all_windows();
 		tile_need_full = 1;
 	}
 
 	/* watch new session directory */
 	sessdir_watch_fd = sessdir_watch_start(session_name);
-	if (sessdir_watch_fd >= 0)
+	if (sessdir_watch_fd >= 0) {
 		iox_fd_add(loop, sessdir_watch_fd, IOX_READ,
 		    on_sessdir_watch, NULL);
+		sessdir_watch_degraded = 0;
+	} else {
+		/* Without the watch, windows we spawn ourselves still appear
+		 * (micro_spawn_window schedules an active rescan), but windows
+		 * created or closed by OTHER attach clients will not update
+		 * live. If that becomes a problem, add a periodic timer-driven
+		 * mconn_refresh() fallback here (the "#2 polling" option). */
+		sessdir_watch_degraded = 1;
+		log_warn("sessdir watch unavailable (inotify?); windows from "
+		    "other clients will not appear live");
+	}
 
 	need_render = 1;
 	need_status = 1;
 	sync_keybinds_title();
 }
 
-static void
-on_sessdir_watch(struct iox_loop *lp, int fd, unsigned events, void *arg)
+static int
+mconn_refresh(struct iox_loop *lp)
 {
-	int flags, added;
-
-	(void)events;
-	(void)arg;
-
-	flags = sessdir_watch_read(fd);
-	if (!(flags & SESSDIR_WATCH_CHANGED))
-		return;
+	int added;
 
 	added = mconn_discover(lp);
 	mconn_sync_winlist();
@@ -3941,7 +4195,7 @@ on_sessdir_watch(struct iox_loop *lp, int fd, unsigned events, void *arg)
 			wm_focus(wmgr, watched_id);
 		need_render = 1;
 		need_status = 1;
-		return;
+		return added;
 	}
 
 	/* screen mode: assign new windows to empty tile panes first,
@@ -4007,6 +4261,20 @@ on_sessdir_watch(struct iox_loop *lp, int fd, unsigned events, void *arg)
 	tile_need_full = 1;
 	need_render = 1;
 	need_status = 1;
+	return added;
+}
+
+static void
+on_sessdir_watch(struct iox_loop *lp, int fd, unsigned events, void *arg)
+{
+	int flags;
+
+	(void)events;
+	(void)arg;
+
+	flags = sessdir_watch_read(fd);
+	if (flags & SESSDIR_WATCH_CHANGED)
+		mconn_refresh(lp);
 }
 
 static void
@@ -4344,6 +4612,7 @@ cmd_attach_main(int argc, char **argv)
 
 			/* resize panes to content size and tell mservers */
 			tile_each_pane(tilemgr, tiled_resize_pane_cb, NULL);
+			screen_fit_all_windows();
 			tile_need_full = 1;
 		}
 		need_render = 1;
@@ -4353,9 +4622,15 @@ cmd_attach_main(int argc, char **argv)
 		 * remote proxy handles its own watch) */
 		if (!is_remote) {
 			sessdir_watch_fd = sessdir_watch_start(name);
-			if (sessdir_watch_fd >= 0)
+			if (sessdir_watch_fd >= 0) {
 				iox_fd_add(loop, sessdir_watch_fd, IOX_READ,
 				    on_sessdir_watch, NULL);
+			} else {
+				sessdir_watch_degraded = 1;
+				log_warn("sessdir watch unavailable (inotify?); "
+				    "windows from other clients will not "
+				    "appear live");
+			}
 		}
 	}
 

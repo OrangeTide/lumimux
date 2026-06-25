@@ -277,6 +277,8 @@ k, K	Kill current window
 n, Space, Ctrl\-Space, Ctrl\-N	Next window
 p, Ctrl\-P	Previous window
 0\-9	Select window by number
+,	Swap number with next lower window
+.	Swap number with next higher window
 d, D	Detach from session
 w, "	Window list
 s	Toggle status bar
@@ -298,6 +300,17 @@ U	Session picker
 ]	Paste from internal clipboard
 y	Sync internal clipboard to system
 .TE
+.PP
+Window numbers are stable: closing a window does not renumber the
+others, so a closed window leaves a gap (a spare number) in the
+sequence.
+A newly created window takes the lowest free number.
+Use
+.B ,
+and
+.B .
+to swap the current window's number with the next lower or higher
+numbered window.
 .SH CONFIGURATION
 The configuration file is loaded from:
 .PP
@@ -466,6 +479,8 @@ new\-window	Create new window
 next\-window	Next window
 prev\-window	Previous window
 select\-0 \- select\-9	Select window by number
+swap\-num\-lower	Swap number with next lower window
+swap\-num\-higher	Swap number with next higher window
 kill\-window	Kill current window
 detach	Detach from session
 window\-list	Show window list
