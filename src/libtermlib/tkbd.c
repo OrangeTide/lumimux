@@ -681,9 +681,13 @@ static int parse_mouse_seq(struct tkbd_seq *seq, const char *buf, int len)
 		if ((b & 32) != 0)
 			seq->mod |= TKBD_MOD_MOTION;
 
-		// the coord is 1,1 for upper left
-		seq->x = (uint8_t)buf[4] - 1 - 32;
-		seq->y = (uint8_t)buf[5] - 1 - 32;
+		// the coord is 1,1 for upper left. some terminals report 0
+		// when the pointer is past an edge; clamp so the 1-based to
+		// 0-based conversion never underflows to a negative coord.
+		seq->x = (uint8_t)buf[4] - 32;
+		seq->y = (uint8_t)buf[5] - 32;
+		seq->x = seq->x > 0 ? seq->x - 1 : 0;
+		seq->y = seq->y > 0 ? seq->y - 1 : 0;
 
 		seq->len = 6;
 		memcpy(seq->data, buf, 6);
@@ -765,8 +769,11 @@ static int parse_mouse_seq(struct tkbd_seq *seq, const char *buf, int len)
 		if ((n1&32) != 0)
 			seq->mod |= TKBD_MOD_MOTION;
 
-		seq->x = n2 - 1;
-		seq->y = n3 - 1;
+		// 1-based coords; some terminals report 0 when the pointer
+		// is past an edge. clamp so the conversion to 0-based never
+		// produces a negative coordinate.
+		seq->x = n2 > 0 ? n2 - 1 : 0;
+		seq->y = n3 > 0 ? n3 - 1 : 0;
 
 		seq->len = MIN((size_t)(mi + 1), TKBD_SEQ_MAX);
 		memcpy(seq->data, buf, seq->len);

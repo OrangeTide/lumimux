@@ -3039,8 +3039,18 @@ handle_mouse(struct iox_loop *loop, const struct tkbd_seq *seq)
 	row = seq->y;
 	col = seq->x;
 
-	/* text selection in tiled/screen mode */
+	/* text selection in tiled/screen mode. clamp the drag point to the
+	 * content area so a stray edge coordinate cannot extend the
+	 * selection past the visible screen (mirrors the turbo path). */
 	if (seq->mod & TKBD_MOD_MOTION) {
+		if (row < 0)
+			row = 0;
+		else if (row >= content_rows)
+			row = content_rows - 1;
+		if (col < 0)
+			col = 0;
+		else if (col >= content_cols)
+			col = content_cols - 1;
 		if (sel_pending) {
 			sel_begin(0, sel_press_row, sel_press_col,
 			    0, content_cols);
