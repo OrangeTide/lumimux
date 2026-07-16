@@ -6,6 +6,7 @@
 #include "tui_pad.h"
 #include "tui_list.h"
 #include "ipc_msg.h"
+#include "ipc_transport.h"
 #include "tkbd.h"
 
 #include <stdio.h>
@@ -190,8 +191,9 @@ dict_insert(struct app_ctx *ctx)
 
 	idx = dict.matched[dict.list.sel];
 	word = dict.words[idx];
-	ipc_msg_send(ctx->input_fd, IPC_MSG_INPUT,
-	    word, (uint32_t)strlen(word));
+	if (ctx->input_t)
+		ipc_transport_send(ctx->input_t, IPC_MSG_INPUT,
+		    word, (uint32_t)strlen(word));
 }
 
 static int

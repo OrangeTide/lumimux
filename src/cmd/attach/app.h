@@ -12,6 +12,7 @@
 #include <stdint.h>
 
 struct tkbd_seq;
+struct ipc_transport;
 
 struct app_ctx {
 	struct tui_pad		*pad;
@@ -20,7 +21,7 @@ struct app_ctx {
 	void			*be_ctx;
 	struct vt_buf		*base;
 	const struct tui_theme	*theme;
-	int			input_fd;
+	struct ipc_transport	*input_t;	/* focused window, may be NULL */
 	int			screen_rows;
 	int			screen_cols;
 	void			(*render)(struct app_ctx *ctx);

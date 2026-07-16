@@ -212,6 +212,63 @@ sessdir_read_file(const char *session, pid_t pid, const char *name)
 }
 
 int
+sessdir_write_session_file(const char *session, const char *name,
+    const char *content)
+{
+	char *dir, fpath[PATH_MAX];
+	FILE *f;
+
+	dir = sessdir_session_path(session);
+	if (!dir)
+		return -1;
+
+	if (snprintf(fpath, sizeof(fpath), "%s/%s", dir, name) >= PATH_MAX) {
+		free(dir);
+		return -1;
+	}
+	free(dir);
+
+	f = fopen(fpath, "w");
+	if (!f)
+		return -1;
+	fputs(content, f);
+	fputc('\n', f);
+	fclose(f);
+	return 0;
+}
+
+char *
+sessdir_read_session_file(const char *session, const char *name)
+{
+	char *dir, fpath[PATH_MAX];
+	FILE *f;
+	char buf[4096];
+	size_t len;
+
+	dir = sessdir_session_path(session);
+	if (!dir)
+		return NULL;
+
+	if (snprintf(fpath, sizeof(fpath), "%s/%s", dir, name) >= PATH_MAX) {
+		free(dir);
+		return NULL;
+	}
+	free(dir);
+
+	f = fopen(fpath, "r");
+	if (!f)
+		return NULL;
+	len = fread(buf, 1, sizeof(buf) - 1, f);
+	fclose(f);
+	buf[len] = '\0';
+
+	while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
+		buf[--len] = '\0';
+
+	return xstrdup(buf);
+}
+
+int
 sessdir_list_sessions(char **names, int max)
 {
 	char *base;

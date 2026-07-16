@@ -21,6 +21,14 @@
 #define TKBD_SEQ_MAX 32         // max length in bytes of an escape sequence
 
 /*
+ * tkbd_parse() return value meaning "the buffer holds the start of a
+ * sequence that is not yet complete": the caller should read more bytes
+ * and call again with the data appended. Distinct from a 0 return, which
+ * means no sequence could be decoded from the front of the buffer.
+ */
+#define TKBD_INCOMPLETE (-1)
+
+/*
  * Keyboard, mouse, or unicode character sequence structure.
  *
  * The tkbd_parse() and tkbd_read() functions fill this structure with
@@ -44,7 +52,10 @@ struct tkbd_seq {
  * with information. No more than sz bytes will be read from buf.
  *
  * Returns the number of bytes read from buf when the structure is filled.
- * Returns 0 when not enough data is available to decode a sequence.
+ * Returns TKBD_INCOMPLETE when the buffer holds only the unterminated
+ * start of an escape or multi-byte sequence and more bytes are needed.
+ * Returns 0 when no sequence could be decoded from the front of the
+ * buffer (an unrecognized byte the caller should skip to resync).
  */
 int tkbd_parse(struct tkbd_seq *seq, const char *buf, size_t sz);
 

@@ -17,7 +17,9 @@ int win_list_count(void);
 uint32_t win_list_id_at(int index);
 const char *win_list_title_at(int index);
 void win_list_set_title(uint32_t pid, const char *title);
-void win_list_format_status(void);
+void win_list_set_active(uint32_t pid);
+void win_list_format_taskbar(void);
+int win_list_hit_test(int col, uint32_t *out_pid);
 void picker_show(void);
 void picker_input(const struct tkbd_seq *seq);
 

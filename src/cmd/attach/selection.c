@@ -221,6 +221,21 @@ sel_begin_line(uint32_t win_id, int row, int win_x, int win_w)
 }
 
 void
+sel_begin_block(uint32_t win_id, int row, int col, int win_x, int win_w)
+{
+	sel_dragging = 1;
+	sel_visible = 0;
+	cur_mode = SEL_MODE_BLOCK;
+	sel_win_id = win_id;
+	sel_sr = row;
+	sel_sc = col;
+	sel_er = row;
+	sel_ec = col;
+	sel_col_min = win_x;
+	sel_col_max = win_x + win_w - 1;
+}
+
+void
 sel_update(int row, int col)
 {
 	sel_er = row;
@@ -272,72 +287,95 @@ sel_get_mode(void)
 	return cur_mode;
 }
 
+/* append columns [start,end] of screen row r to copy_buf, stripping
+ * trailing whitespace.  advances *pos. */
+static void
+extract_row_span(const struct vt_cell *screen, int cols, int r,
+    int start, int end, size_t *pos)
+{
+	int c, last_nonspace;
+
+	if (start < 0)
+		start = 0;
+	if (end >= cols)
+		end = cols - 1;
+
+	/* find last non-space to strip trailing whitespace */
+	last_nonspace = start - 1;
+	for (c = start; c <= end; c++) {
+		const struct vt_cell *cell = &screen[r * cols + c];
+
+		/* skip continuation cells of wide characters */
+		if (cell->codepoint == 0 && cell->width == 0)
+			continue;
+		if (cell->codepoint != ' ' && cell->codepoint != 0)
+			last_nonspace = c;
+	}
+
+	for (c = start; c <= last_nonspace; c++) {
+		const struct vt_cell *cell = &screen[r * cols + c];
+		unsigned char u8[4];
+		int n;
+
+		/* skip continuation cells of wide characters */
+		if (cell->codepoint == 0 && cell->width == 0)
+			continue;
+
+		if (cell->codepoint == 0) {
+			/* empty cell -> space */
+			if (*pos < COPY_MAX - 1)
+				copy_buf[(*pos)++] = ' ';
+			continue;
+		}
+
+		n = utf8_encode(u8, cell->codepoint);
+		if (n > 0 && *pos + (size_t)n < COPY_MAX) {
+			memcpy(copy_buf + *pos, u8, (size_t)n);
+			*pos += (size_t)n;
+		}
+	}
+}
+
 void
 sel_finish(const struct vt_cell *screen, int rows, int cols)
 {
 	int r0, c0, r1, c1;
-	int r, c, start, end;
+	int r, start, end;
 	size_t pos;
 
 	sel_dragging = 0;
 	sel_visible = 1;
 
-	/* extract text into copy_buf */
-	sel_normalize(&r0, &c0, &r1, &c1);
-
 	pos = 0;
-	for (r = r0; r <= r1 && r < rows; r++) {
-		if (r < 0)
-			continue;
-		start = (r == r0) ? c0 : sel_col_min;
-		end = (r == r1) ? c1 : sel_col_max;
-		if (start < 0)
-			start = 0;
-		if (end >= cols)
-			end = cols - 1;
+	if (cur_mode == SEL_MODE_BLOCK) {
+		/* rectangular: same column range on every spanned row */
+		r0 = sel_sr < sel_er ? sel_sr : sel_er;
+		r1 = sel_sr < sel_er ? sel_er : sel_sr;
+		c0 = sel_sc < sel_ec ? sel_sc : sel_ec;
+		c1 = sel_sc < sel_ec ? sel_ec : sel_sc;
 
-		/* find last non-space to strip trailing whitespace */
-		int last_nonspace = start - 1;
-
-		for (c = start; c <= end; c++) {
-			const struct vt_cell *cell =
-			    &screen[r * cols + c];
-
-			/* skip continuation cells of wide characters */
-			if (cell->codepoint == 0 && cell->width == 0)
+		for (r = r0; r <= r1 && r < rows; r++) {
+			if (r < 0)
 				continue;
-			if (cell->codepoint != ' ' &&
-			    cell->codepoint != 0)
-				last_nonspace = c;
+			extract_row_span(screen, cols, r, c0, c1, &pos);
+			if (r < r1 && pos < COPY_MAX - 1)
+				copy_buf[pos++] = '\n';
 		}
+	} else {
+		/* linear (char/word/line): row-major reading order */
+		sel_normalize(&r0, &c0, &r1, &c1);
 
-		for (c = start; c <= last_nonspace; c++) {
-			const struct vt_cell *cell =
-			    &screen[r * cols + c];
-			unsigned char u8[4];
-			int n;
-
-			/* skip continuation cells of wide characters */
-			if (cell->codepoint == 0 && cell->width == 0)
+		for (r = r0; r <= r1 && r < rows; r++) {
+			if (r < 0)
 				continue;
+			start = (r == r0) ? c0 : sel_col_min;
+			end = (r == r1) ? c1 : sel_col_max;
+			extract_row_span(screen, cols, r, start, end, &pos);
 
-			if (cell->codepoint == 0) {
-				/* empty cell -> space */
-				if (pos < COPY_MAX - 1)
-					copy_buf[pos++] = ' ';
-				continue;
-			}
-
-			n = utf8_encode(u8, cell->codepoint);
-			if (n > 0 && pos + (size_t)n < COPY_MAX)  {
-				memcpy(copy_buf + pos, u8, (size_t)n);
-				pos += (size_t)n;
-			}
+			/* newline between rows (not after last) */
+			if (r < r1 && pos < COPY_MAX - 1)
+				copy_buf[pos++] = '\n';
 		}
-
-		/* newline between rows (not after last) */
-		if (r < r1 && pos < COPY_MAX - 1)
-			copy_buf[pos++] = '\n';
 	}
 	copy_len = pos;
 
@@ -375,6 +413,12 @@ sel_active(void)
 	return sel_dragging || sel_visible;
 }
 
+uint32_t
+sel_owner(void)
+{
+	return sel_win_id;
+}
+
 void
 sel_highlight(struct vt_cell *screen, int rows, int cols)
 {
@@ -384,13 +428,25 @@ sel_highlight(struct vt_cell *screen, int rows, int cols)
 	if (!sel_active())
 		return;
 
-	sel_normalize(&r0, &c0, &r1, &c1);
+	if (cur_mode == SEL_MODE_BLOCK) {
+		r0 = sel_sr < sel_er ? sel_sr : sel_er;
+		r1 = sel_sr < sel_er ? sel_er : sel_sr;
+		c0 = sel_sc < sel_ec ? sel_sc : sel_ec;
+		c1 = sel_sc < sel_ec ? sel_ec : sel_sc;
+	} else {
+		sel_normalize(&r0, &c0, &r1, &c1);
+	}
 
 	for (r = r0; r <= r1 && r < rows; r++) {
 		if (r < 0)
 			continue;
-		start = (r == r0) ? c0 : sel_col_min;
-		end = (r == r1) ? c1 : sel_col_max;
+		if (cur_mode == SEL_MODE_BLOCK) {
+			start = c0;
+			end = c1;
+		} else {
+			start = (r == r0) ? c0 : sel_col_min;
+			end = (r == r1) ? c1 : sel_col_max;
+		}
 		if (start < 0)
 			start = 0;
 		if (end >= cols)

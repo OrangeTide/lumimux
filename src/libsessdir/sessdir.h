@@ -38,6 +38,16 @@ int sessdir_write_file(const char *session, pid_t pid,
  * trailing newline is stripped. */
 char *sessdir_read_file(const char *session, pid_t pid, const char *name);
 
+/* write a session-level file (not tied to a server PID), e.g. the
+ * "net-addr" endpoint published by lumi-net-proxy. overwrites if it
+ * exists. returns 0 on success, -1 on error. */
+int sessdir_write_session_file(const char *session, const char *name,
+    const char *content);
+
+/* read a session-level file. returns malloc'd content, or NULL on error.
+ * trailing newline is stripped. */
+char *sessdir_read_session_file(const char *session, const char *name);
+
 /* list session names under the base directory.
  * fills names[] with malloc'd strings, up to max entries.
  * returns number of sessions found, or -1 on error. */

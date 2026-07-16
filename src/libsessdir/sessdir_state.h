@@ -71,4 +71,11 @@ int sessdir_state_nums(struct sessdir_state *st, pid_t *out, int max);
  * have numbers. returns 0 on success, -1 on error. */
 int sessdir_state_swap_num(struct sessdir_state *st, pid_t a, pid_t b);
 
+/* set a server PID's stable window number to target. if another window
+ * already holds target, the two swap numbers; if target is a free slot
+ * the window moves there and its old slot becomes a spare. pid must have
+ * a number and target must be in range. returns 0 on success, -1 on
+ * error. */
+int sessdir_state_set_num(struct sessdir_state *st, pid_t pid, int target);
+
 #endif /* SESSDIR_STATE_H */

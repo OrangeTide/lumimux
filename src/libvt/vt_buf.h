@@ -31,6 +31,10 @@ struct vt_cell *vt_buf_cell(struct vt_buf *buf, int row, int col);
 
 /* scrollback access (-1 = most recent scrollback line, etc.) */
 int vt_buf_scrollback_lines(const struct vt_buf *buf);
+
+/* monotonic counter bumped each time the buffer actually scrolls;
+ * used to detect that content shifted out from under a selection */
+unsigned vt_buf_scroll_gen(const struct vt_buf *buf);
 struct vt_row *vt_buf_scrollback_row(struct vt_buf *buf, int offset);
 
 /* scroll visible region: positive = scroll up (new blank at bottom) */
@@ -41,6 +45,13 @@ void vt_buf_clear_rows(struct vt_buf *buf, int from, int to);
 
 /* mark all rows dirty */
 void vt_buf_dirty_all(struct vt_buf *buf);
+
+/* append `count` visible rows of src (starting at src row `from`) into dst's
+ * scrollback ring as history, deep-copied and clipped to dst width.  a no-op
+ * when dst has no scrollback ring.  used to preserve alt-screen content when
+ * an application leaves the alternate screen. */
+void vt_buf_push_rows(struct vt_buf *dst, struct vt_buf *src, int from,
+    int count);
 
 /* copy rows from the scrollback+visible history into dst.
  * src_offset is the line index into the virtual concatenation of

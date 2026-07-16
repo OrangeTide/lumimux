@@ -19,6 +19,9 @@
 #include "iox_timer.h"
 #include "ipc.h"
 #include "ipc_msg.h"
+#include "ipc_transport.h"
+#include "ipc_transport_netchan.h"
+#include "nc_udp.h"
 #include "lumi_msg.h"
 #include "proxy_msg.h"
 #include "byte_order.h"
@@ -43,7 +46,13 @@
 #include "tile.h"
 #include "xmalloc.h"
 
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <errno.h>
 #include <limits.h>
+#include <netdb.h>
+#include <time.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,7 +72,8 @@ static int watching;		/* nonzero if subscribed */
 /* ---- micro-server connection table ---- */
 
 struct mconn {
-	int		fd;
+	int		fd;		/* raw fd, kept for the event loop */
+	struct ipc_transport *t;	/* carries messages; NULL when remote */
 	pid_t		pid;		/* = window ID */
 	int		num;		/* stable window number, -1 if unknown */
 	char		title[128];
@@ -81,6 +91,18 @@ static char *session_name;	/* set in main for micro mode (allocated) */
 static int is_remote;
 static int rproxy_fd = -1;
 static pid_t rproxy_pid;
+
+/* netchan remote carrier: an alternative to the SSH pipe (rproxy_fd).
+ * when remote_netchan is set, the proxy envelope rides an ipc_transport
+ * (rnet) over UDP instead of proxy_msg over a raw fd, and a re-armed
+ * one-shot timer services netchan while the link is idle. */
+static struct ipc_transport *rnet;
+static int remote_netchan;
+static int net_service_timer = -1;
+static int net_registered_fd = -1;	/* rnet's fd currently in the iox loop */
+static uint32_t net_last_roam_ms;	/* rate-limit automatic roams */
+#define NET_SERVICE_MS	100
+#define NET_ROAM_COOLDOWN_MS	1000
 
 /* Returns 1 if name is remote (scp-style), 0 if local.
  * On remote: *user may be NULL, *host and *rsession are set.
@@ -137,14 +159,32 @@ parse_session_name(const char *name, const char **user,
 /* ---- tiled mode state ---- */
 
 static struct tile *tilemgr;		/* NULL when not tiled */
+static struct wm *wmgr;			/* turbo layout, NULL when not turbo */
 static int tile_need_full;		/* next render should be full redraw */
 static int resize_mode;			/* 1 = hjkl resize mode active */
+static int altscreen_scrollback;	/* capture alt-screen into scrollback */
 static int scrollback_mode;		/* 1 = viewing scrollback buffer */
 static int scrollback_offset;		/* lines scrolled back (0 = live) */
 static uint32_t scrollback_win_id;	/* window we entered scrollback on */
-static struct status *scrollback_sb;	/* status bar for scrollback mode */
+static struct taskbar *scrollback_sb;	/* taskbar for scrollback mode */
+
+/* ---- keyboard copy mode (within scrollback) ---- */
+static int copy_cur_row, copy_cur_col;	/* copy cursor, screen coords */
+static int copy_anchor_row, copy_anchor_col; /* selection mark, screen coords */
+static int copy_selecting;		/* 1 = mark set, extending selection */
+static enum sel_mode copy_gran;		/* char/line/block granularity */
+
+/* ---- command input line (Ctrl-A :) ---- */
+static int cmdline_visible;		/* 1 = command line prompt active */
+static char cmd_buf[512];		/* current input text */
+static size_t cmd_len;			/* bytes in cmd_buf */
+static char cmd_msg[128];		/* transient result/error message */
+static int cmdline_row(void);
+static void cmdline_render(void);
+static void paste_cancel(void);
+
 static int need_render;			/* screen needs repaint before poll */
-static int need_status;			/* status line needs redraw */
+static int need_taskbar;			/* taskbar needs redraw */
 
 /* ---- mouse selection state ---- */
 
@@ -202,6 +242,10 @@ mconn_add(struct iox_loop *lp, pid_t pid, int fd, const char *title)
 		return NULL;
 	mc = &mconns[mconn_count++];
 	mc->fd = fd;
+	/* wrap the connected fd in a transport for message I/O.  remote
+	 * windows carry fd = -1 (multiplexed over the proxy) and have no
+	 * per-window transport. */
+	mc->t = (fd >= 0) ? ipc_transport_unix_new(fd) : NULL;
 	mc->pid = pid;
 	mc->num = -1;
 	if (title) {
@@ -223,11 +267,10 @@ mconn_remove(struct iox_loop *lp, pid_t pid)
 
 	for (i = 0; i < mconn_count; i++) {
 		if (mconns[i].pid == pid) {
-			if (mconns[i].fd >= 0) {
-				if (lp)
-					iox_fd_remove(lp, mconns[i].fd);
-				ipc_close(mconns[i].fd);
-			}
+			if (mconns[i].fd >= 0 && lp)
+				iox_fd_remove(lp, mconns[i].fd);
+			ipc_transport_free(mconns[i].t);	/* closes fd */
+			mconns[i].t = NULL;
 			mconns[i] = mconns[--mconn_count];
 			return;
 		}
@@ -241,11 +284,10 @@ mconn_disconnect_all(struct iox_loop *lp)
 
 	for (i = 0; i < mconn_count; i++) {
 		mconn_ipc_send_empty(&mconns[i], IPC_MSG_DETACH);
-		if (mconns[i].fd >= 0) {
-			if (lp)
-				iox_fd_remove(lp, mconns[i].fd);
-			ipc_close(mconns[i].fd);
-		}
+		if (mconns[i].fd >= 0 && lp)
+			iox_fd_remove(lp, mconns[i].fd);
+		ipc_transport_free(mconns[i].t);	/* closes fd */
+		mconns[i].t = NULL;
 	}
 	mconn_count = 0;
 }
@@ -279,14 +321,14 @@ mconn_focused(void)
 	return NULL;
 }
 
-/* get the fd for the focused/active mserver connection.
- * returns -1 if no connection is active. */
-int
-mconn_focused_fd(void)
+/* get the transport for the focused/active mserver connection.
+ * returns NULL if no connection is active (or the session is remote). */
+struct ipc_transport *
+mconn_focused_transport(void)
 {
 	struct mconn *mc = mconn_focused();
 
-	return mc ? mc->fd : -1;
+	return mc ? mc->t : NULL;
 }
 
 /* send IPC message to a specific mserver, routing through proxy
@@ -295,12 +337,16 @@ static int
 mconn_ipc_send(struct mconn *mc, uint32_t type,
     const void *payload, uint32_t len)
 {
-	if (is_remote)
+	if (is_remote) {
+		if (remote_netchan)
+			return proxy_msg_xsend(rnet, (uint32_t)mc->pid,
+			    type, payload, len);
 		return proxy_msg_send(rproxy_fd, (uint32_t)mc->pid,
 		    type, payload, len);
-	if (mc->fd < 0)
+	}
+	if (!mc->t)
 		return -1;
-	return ipc_msg_send(mc->fd, type, payload, len);
+	return ipc_transport_send(mc->t, type, payload, len);
 }
 
 static int
@@ -333,6 +379,20 @@ micro_resize_all(int rows, int cols)
 	for (i = 0; i < mconn_count; i++)
 		mconn_ipc_send_size(&mconns[i], IPC_MSG_WIN_RESIZE,
 		    rows, cols);
+}
+
+/* ask every connected mserver to re-send its screen replay.  used after
+ * the panes have been sized so each window resyncs at its final size,
+ * without relying on the child process to repaint after SIGWINCH (a
+ * full-screen alt-screen app that does not redraw would otherwise leave
+ * the pane blank until the next unrelated update). */
+static void
+mconn_request_refresh_all(void)
+{
+	int i;
+
+	for (i = 0; i < mconn_count; i++)
+		mconn_ipc_send_empty(&mconns[i], IPC_MSG_REFRESH);
 }
 
 static int mconn_refresh(struct iox_loop *lp);
@@ -425,6 +485,7 @@ struct client_window {
 	int		input_lock;	/* keystrokes discarded */
 	struct win_layout layout;	/* current mode's placement */
 	struct win_layout prev_layout;	/* saved from previous mode */
+	char		title_override[128];	/* :title override, "" = none */
 };
 
 static struct client_window cwins[CLIENT_WIN_MAX];
@@ -438,6 +499,88 @@ cwin_should_keep_open(const struct client_window *cw)
 	if (cw->keep_open >= 0)
 		return cw->keep_open;
 	return keep_open_default;
+}
+
+/* effective on-screen title for a window: a :title override wins over
+ * the live VT title, which the running program can change at any time.
+ * cw may be NULL (a window we have not materialized locally). */
+static const char *
+cwin_effective_title(const struct client_window *cw, const char *vt_title)
+{
+	if (cw && cw->title_override[0])
+		return cw->title_override;
+	return vt_title;
+}
+
+/*
+ * Most-recently-used window order.  mru[0] is the current window, mru[1]
+ * the one focused before it, and so on.  The list is refreshed once per
+ * event-loop iteration from the live focus (mru_note_focus), so every
+ * focus path updates it without each having to call in.  It drives the
+ * last-window bounce (Ctrl-A Ctrl-A) and the focus fallback when the
+ * current window closes.
+ */
+static uint32_t mru[CLIENT_WIN_MAX];
+static int mru_len;
+
+/* move id to the front of the MRU list, inserting it if absent */
+static void
+mru_touch(uint32_t id)
+{
+	int i, n;
+
+	if (id == 0 || (mru_len > 0 && mru[0] == id))
+		return;
+	for (i = 0, n = 0; i < mru_len; i++) {
+		if (mru[i] != id)
+			mru[n++] = mru[i];
+	}
+	if (n > CLIENT_WIN_MAX - 1)
+		n = CLIENT_WIN_MAX - 1;
+	memmove(&mru[1], &mru[0], (size_t)n * sizeof(mru[0]));
+	mru[0] = id;
+	mru_len = n + 1;
+}
+
+/* drop id from the MRU list */
+static void
+mru_remove(uint32_t id)
+{
+	int i, n;
+
+	for (i = 0, n = 0; i < mru_len; i++) {
+		if (mru[i] != id)
+			mru[n++] = mru[i];
+	}
+	mru_len = n;
+}
+
+/* the window focused before the current one, or 0 if there is none */
+static uint32_t
+mru_prev(void)
+{
+	return mru_len >= 2 ? mru[1] : 0;
+}
+
+/* most-recently-used window that still has a live connection, or 0 */
+static uint32_t
+mru_recent_live(void)
+{
+	int i;
+
+	for (i = 0; i < mru_len; i++) {
+		if (mconn_find_by_pid((pid_t)mru[i]))
+			return mru[i];
+	}
+	return 0;
+}
+
+/* record the live focus at the front of the MRU list */
+static void
+mru_note_focus(void)
+{
+	if (watching && watched_id != 0)
+		mru_touch(watched_id);
 }
 
 static struct client_window *
@@ -497,6 +640,35 @@ dcs_passthru(void *ctx, int introducer, const char *data, size_t len)
 	tio_write(STDOUT_FILENO, "\033\\", 2);
 }
 
+/* OSC passthrough: forward desktop-notification OSCs (kitty OSC 99, the
+ * simple OSC 9 form, and OSC 777 "notify") from any window to the outer
+ * terminal so pop-ups from programs like Claude reach the user. */
+static void
+osc_passthru(void *ctx, const char *data, size_t len)
+{
+	int num = 0;
+	size_t i;
+
+	(void)ctx;
+
+	if (!watching)
+		return;
+
+	/* parse the leading "N;" selector */
+	for (i = 0; i < len && data[i] >= '0' && data[i] <= '9'; i++)
+		num = num * 10 + (data[i] - '0');
+	if (i == 0 || i >= len || data[i] != ';')
+		return;
+
+	if (num != 9 && num != 99 && num != 777)
+		return;
+
+	/* re-wrap as ESC ] <data> ST for the host terminal */
+	tio_write(STDOUT_FILENO, "\033]", 2);
+	tio_write(STDOUT_FILENO, data, len);
+	tio_write(STDOUT_FILENO, "\033\\", 2);
+}
+
 static struct client_window *
 cwin_add_sized(uint32_t id, int rows, int cols)
 {
@@ -509,12 +681,14 @@ cwin_add_sized(uint32_t id, int rows, int cols)
 	cw->vt = vt_state_new(rows, cols, SCROLLBACK_LINES);
 	if (!cw->vt)
 		return NULL;
+	vt_state_set_altscreen_scrollback(cw->vt, altscreen_scrollback);
 	cw->parser = vt_parse_new(vt_ops_default(), cw->vt);
 	if (!cw->parser) {
 		vt_state_free(cw->vt);
 		return NULL;
 	}
 	vt_parse_set_dcs_cb(cw->parser, dcs_passthru, NULL);
+	vt_parse_set_osc_cb(cw->parser, osc_passthru, NULL);
 	cw->pred = predict_new();
 	cw->keep_open = -1;	/* inherit global default */
 	cw->dead = 0;
@@ -537,6 +711,13 @@ cwin_remove(uint32_t id)
 
 	for (i = 0; i < cwin_count; i++) {
 		if (cwins[i].id == id) {
+			/* drop any layout reference before freeing the vt so
+			 * a stale leaf/window cannot dereference a dangling
+			 * pointer during a later composite. */
+			if (tilemgr)
+				tile_forget_vt(tilemgr, cwins[i].vt);
+			if (wmgr)
+				wm_forget_vt(wmgr, cwins[i].vt);
 			predict_free(cwins[i].pred);
 			vt_parse_free(cwins[i].parser);
 			vt_state_free(cwins[i].vt);
@@ -552,6 +733,10 @@ cwin_free_all(void)
 	int i;
 
 	for (i = 0; i < cwin_count; i++) {
+		if (tilemgr)
+			tile_forget_vt(tilemgr, cwins[i].vt);
+		if (wmgr)
+			wm_forget_vt(wmgr, cwins[i].vt);
 		predict_free(cwins[i].pred);
 		vt_parse_free(cwins[i].parser);
 		vt_state_free(cwins[i].vt);
@@ -620,7 +805,6 @@ sync_prefix_timer(struct iox_loop *lp)
 
 /* ---- turbo mode state ---- */
 
-static struct wm *wmgr;
 static int turbo_need_full;	/* next render should be full redraw */
 
 /* cascade offset for new turbo windows */
@@ -795,7 +979,7 @@ static void
 update_content_size(int rows, int cols)
 {
 	content_cols = cols;
-	content_rows = status_visible ? rows - 1 : rows;
+	content_rows = taskbar_visible ? rows - 1 : rows;
 	if (content_rows < 1)
 		content_rows = 1;
 }
@@ -902,10 +1086,10 @@ turbo_repaint(void)
 	int crow, ccol, cvis;
 
 	turbo_need_full = 1;
-	status_line_invalidate();
+	taskbar_invalidate();
 	turbo_render();
-	if (status_visible)
-		render_status_line(STDOUT_FILENO,
+	if (taskbar_visible)
+		render_taskbar(STDOUT_FILENO,
 		    content_rows + 1, content_cols);
 	turbo_cursor(&crow, &ccol, &cvis);
 	render_move_cursor(renderer, STDOUT_FILENO, crow, ccol);
@@ -946,10 +1130,10 @@ tiled_repaint(void)
 	int crow, ccol, cvis;
 
 	tile_need_full = 1;
-	status_line_invalidate();
+	taskbar_invalidate();
 	tiled_render();
-	if (status_visible)
-		render_status_line(STDOUT_FILENO,
+	if (taskbar_visible)
+		render_taskbar(STDOUT_FILENO,
 		    content_rows + 1, content_cols);
 	tile_cursor(tilemgr, &crow, &ccol, &cvis);
 	render_move_cursor(renderer, STDOUT_FILENO, crow, ccol);
@@ -958,6 +1142,8 @@ tiled_repaint(void)
 }
 
 /* ---- scrollback viewer ---- */
+
+static int copy_win_rect(int *x, int *y, int *w, int *h);
 
 /* return the client_window we entered scrollback on */
 static struct client_window *
@@ -990,10 +1176,10 @@ scrollback_enter(void)
 		vt_buf_resize(cw->vt->targets[VT_TARGET_SCROLLBACK],
 		    rows, cols);
 
-	/* create the scrollback status bar on first use */
+	/* create the scrollback taskbar on first use */
 	if (!scrollback_sb) {
-		scrollback_sb = status_new();
-		status_set_format(scrollback_sb,
+		scrollback_sb = taskbar_new();
+		taskbar_set_format(scrollback_sb,
 		    " [scrollback ${offset}/${total} -- q to exit]");
 	}
 
@@ -1006,6 +1192,21 @@ scrollback_enter(void)
 	scrollback_mode = 1;
 	scrollback_offset = 0;
 	scrollback_win_id = cw->id;
+
+	/* place the copy cursor at the top-left of the visible content */
+	copy_selecting = 0;
+	copy_gran = SEL_MODE_CHAR;
+	{
+		int wx, wy, ww, wh;
+
+		if (copy_win_rect(&wx, &wy, &ww, &wh) == 0) {
+			copy_cur_row = wy;
+			copy_cur_col = wx;
+		} else {
+			copy_cur_row = 0;
+			copy_cur_col = 0;
+		}
+	}
 
 	/* show scrollbar in turbo mode */
 	if (client_mode == CLIENT_MODE_TURBO && wmgr) {
@@ -1038,11 +1239,165 @@ scrollback_leave(void)
 	scrollback_mode = 0;
 	scrollback_offset = 0;
 	scrollback_win_id = 0;
+	copy_selecting = 0;
 
 	tile_need_full = 1;
 	turbo_need_full = 1;
 	need_render = 1;
-	need_status = 1;
+	need_taskbar = 1;
+}
+
+/* resolve the content rectangle of the window we are viewing in
+ * scrollback.  returns 0 on success, -1 if it cannot be found. */
+static int
+copy_win_rect(int *x, int *y, int *w, int *h)
+{
+	if (client_mode == CLIENT_MODE_TURBO) {
+		struct wm_window *win = wmgr ?
+		    wm_find(wmgr, scrollback_win_id) : NULL;
+
+		if (!win)
+			return -1;
+		*x = win->x;
+		*y = win->y;
+		*w = win->w;
+		*h = win->h;
+		return 0;
+	}
+	if (tilemgr &&
+	    tile_pane_geometry(tilemgr, scrollback_win_id, x, y, w, h) == 0)
+		return 0;
+	return -1;
+}
+
+/* extend the active copy selection to the copy cursor, honoring the
+ * current granularity. */
+static void
+copy_extend(void)
+{
+	if (!copy_selecting)
+		return;
+	if (copy_gran == SEL_MODE_LINE)
+		sel_update_line(copy_cur_row);
+	else
+		sel_update(copy_cur_row, copy_cur_col);
+	turbo_need_full = 1;
+	tile_need_full = 1;
+}
+
+/* scroll the scrollback view by delta lines (positive = older),
+ * clamped to the available history. */
+static void
+copy_scroll(int delta)
+{
+	struct client_window *cw = scrollback_cwin();
+	struct vt_buf *primary;
+	int maxoff;
+
+	if (!cw || !cw->vt)
+		return;
+	primary = cw->vt->targets[VT_TARGET_PRIMARY];
+	maxoff = primary ? vt_buf_scrollback_lines(primary) : 0;
+	scrollback_offset += delta;
+	if (scrollback_offset < 0)
+		scrollback_offset = 0;
+	if (scrollback_offset > maxoff)
+		scrollback_offset = maxoff;
+}
+
+/* move the copy cursor one row (dir -1 up, +1 down).  when not
+ * selecting, moving past a vertical edge scrolls the view instead. */
+static void
+copy_move_vert(int dir)
+{
+	int wx, wy, ww, wh;
+
+	if (copy_win_rect(&wx, &wy, &ww, &wh) != 0)
+		return;
+	if (dir < 0) {
+		if (copy_cur_row > wy)
+			copy_cur_row--;
+		else if (!copy_selecting)
+			copy_scroll(1);
+	} else {
+		if (copy_cur_row < wy + wh - 1)
+			copy_cur_row++;
+		else if (!copy_selecting)
+			copy_scroll(-1);
+	}
+	copy_extend();
+}
+
+/* move the copy cursor one column (dir -1 left, +1 right),
+ * clamped to the window content. */
+static void
+copy_move_horiz(int dir)
+{
+	int wx, wy, ww, wh;
+
+	if (copy_win_rect(&wx, &wy, &ww, &wh) != 0)
+		return;
+	if (dir < 0) {
+		if (copy_cur_col > wx)
+			copy_cur_col--;
+	} else {
+		if (copy_cur_col < wx + ww - 1)
+			copy_cur_col++;
+	}
+	copy_extend();
+}
+
+/* set (or re-anchor) the selection mark at the copy cursor and begin
+ * extending with the given granularity.  switching granularity while
+ * selecting keeps the original anchor. */
+static void
+copy_start(enum sel_mode gran)
+{
+	int wx, wy, ww, wh;
+
+	if (copy_win_rect(&wx, &wy, &ww, &wh) != 0)
+		return;
+	if (!copy_selecting) {
+		copy_anchor_row = copy_cur_row;
+		copy_anchor_col = copy_cur_col;
+	}
+	copy_gran = gran;
+	copy_selecting = 1;
+	if (gran == SEL_MODE_LINE)
+		sel_begin_line(scrollback_win_id, copy_anchor_row, wx, ww);
+	else if (gran == SEL_MODE_BLOCK)
+		sel_begin_block(scrollback_win_id, copy_anchor_row,
+		    copy_anchor_col, wx, ww);
+	else
+		sel_begin(scrollback_win_id, copy_anchor_row,
+		    copy_anchor_col, wx, ww);
+	copy_extend();
+	turbo_need_full = 1;
+	tile_need_full = 1;
+}
+
+/* copy the active selection to the clipboard and leave scrollback. */
+static void
+copy_yank(void)
+{
+	const struct vt_cell *scr;
+	int nr, nc;
+
+	if (!copy_selecting) {
+		scrollback_leave();
+		return;
+	}
+	if (client_mode == CLIENT_MODE_TURBO) {
+		scr = wm_screen(wmgr);
+		nr = wm_rows(wmgr);
+		nc = wm_cols(wmgr);
+	} else {
+		scr = tile_screen(tilemgr);
+		nr = tile_rows(tilemgr);
+		nc = tile_cols(tilemgr);
+	}
+	sel_finish(scr, nr, nc);
+	scrollback_leave();
 }
 
 /*
@@ -1106,17 +1461,17 @@ scrollback_prepare(void)
 	}
 }
 
-/* update scrollback status variables and render via the status bar */
+/* update scrollback taskbar variables and render via the taskbar */
 static void
-scrollback_status(void)
+scrollback_taskbar_render(void)
 {
 	struct client_window *cw;
 	struct vt_buf *primary;
-	struct status *saved;
+	struct taskbar *saved;
 	char tmp[16];
 	int total;
 
-	if (!status_visible || !scrollback_sb)
+	if (!taskbar_visible || !scrollback_sb)
 		return;
 
 	cw = scrollback_cwin();
@@ -1128,20 +1483,20 @@ scrollback_status(void)
 	}
 
 	snprintf(tmp, sizeof(tmp), "%d", scrollback_offset);
-	status_set(scrollback_sb, "offset", tmp);
+	taskbar_set(scrollback_sb, "offset", tmp);
 	snprintf(tmp, sizeof(tmp), "%d", total);
-	status_set(scrollback_sb, "total", tmp);
+	taskbar_set(scrollback_sb, "total", tmp);
 
-	/* temporarily swap the active status bar */
-	saved = statusbar;
-	statusbar = scrollback_sb;
-	render_status_line(STDOUT_FILENO,
+	/* temporarily swap the active taskbar */
+	saved = taskbar;
+	taskbar = scrollback_sb;
+	render_taskbar(STDOUT_FILENO,
 	    content_rows + 1, content_cols);
-	statusbar = saved;
+	taskbar = saved;
 }
 
 /*
- * Deferred rendering: event handlers set need_render / need_status
+ * Deferred rendering: event handlers set need_render / need_taskbar
  * flags instead of calling render functions directly.  flush_render()
  * is called once per main-loop iteration, just before blocking in poll.
  * This batches multiple events (e.g. several IPC_MSG_OUTPUT messages
@@ -1152,15 +1507,32 @@ flush_render(void)
 {
 	int did_render = 0;
 
-	if (!need_render && !need_status)
+	/* refresh MRU order from the live focus every iteration, so all
+	 * focus paths are captured without each calling in explicitly. */
+	mru_note_focus();
+
+	if (!need_render && !need_taskbar)
 		return;
+
+	/* Hold the backdrop static while a modal overlay (prefix menu,
+	 * command palette, color picker) is visible.  Repainting it would
+	 * flush app output over the overlay, which then redraws on top; when
+	 * the underlying window updates rapidly (a spinner, a full-screen
+	 * app) that reads as the overlay strobing.  The VT is still fed by
+	 * the IPC handler, and closing the overlay triggers a full repaint,
+	 * so no output is lost, only deferred. */
+	if (overlay_visible) {
+		need_render = 0;
+		need_taskbar = 0;
+		return;
+	}
 
 	if (need_render) {
 		if (scrollback_mode)
 			scrollback_prepare();
 		if (turbo_need_full || tile_need_full) {
-			status_line_invalidate();
-			need_status = 1;
+			taskbar_invalidate();
+			need_taskbar = 1;
 		}
 		if (client_mode == CLIENT_MODE_TURBO)
 			turbo_render();
@@ -1177,15 +1549,24 @@ flush_render(void)
 		sync_keyboard_proto(vt);
 	}
 
-	if (need_status) {
-		if (status_visible) {
+	if (need_taskbar) {
+		/* the command line occupies the taskbar row while open */
+		if (cmdline_visible) {
+			cmdline_render();
+		} else if (taskbar_visible) {
 			if (scrollback_mode)
-				scrollback_status();
-			else
-				render_status_line(STDOUT_FILENO,
+				scrollback_taskbar_render();
+			else {
+				/* highlight the tab for the live focus: focus
+				 * can change after mconn_sync_winlist stamped
+				 * the winlist (window add/close), so drive the
+				 * highlight from watched_id here. */
+				win_list_set_active(watching ? watched_id : 0);
+				render_taskbar(STDOUT_FILENO,
 				    content_rows + 1, content_cols);
+			}
 		}
-		need_status = 0;
+		need_taskbar = 0;
 	}
 
 	if (overlay_visible)
@@ -1194,14 +1575,24 @@ flush_render(void)
 	if (did_render) {
 		int crow = 0, ccol = 0, cvis = 0;
 
-		if (!scrollback_mode) {
-			if (client_mode == CLIENT_MODE_TURBO)
-				turbo_cursor(&crow, &ccol, &cvis);
-			else if (tilemgr)
-				tile_cursor(tilemgr, &crow, &ccol, &cvis);
+		if (cmdline_visible) {
+			/* keep the prompt intact and the caret on it */
+			cmdline_render();
+			crow = cmdline_row();
+			ccol = 1 + (int)cmd_len;
+			cvis = 1;
+		} else if (scrollback_mode) {
+			/* show the copy cursor instead of the app cursor */
+			crow = copy_cur_row;
+			ccol = copy_cur_col;
+			cvis = 1;
+		} else if (client_mode == CLIENT_MODE_TURBO) {
+			turbo_cursor(&crow, &ccol, &cvis);
+		} else if (tilemgr) {
+			tile_cursor(tilemgr, &crow, &ccol, &cvis);
 		}
 		render_move_cursor(renderer, STDOUT_FILENO, crow, ccol);
-		set_cursor_vis(scrollback_mode ? 0 : cvis);
+		set_cursor_vis(cvis);
 		tio_flush(STDOUT_FILENO);
 	}
 }
@@ -1255,6 +1646,27 @@ screen_fit_all_windows(void)
 	}
 }
 
+/* a visible selection belongs to the window it was made in and is
+ * pinned to screen coordinates.  drop it when the foreground window is
+ * about to change so it does not linger over another window's content. */
+static void
+sel_clear_on_focus_change(uint32_t new_id)
+{
+	if (new_id != watched_id && sel_active()) {
+		sel_clear();
+		turbo_need_full = 1;
+		tile_need_full = 1;
+		need_render = 1;
+	}
+
+	/* a PASTE_BEGIN with no matching PASTE_END (e.g. the window that
+	 * started the paste lost focus, was closed, or the terminating
+	 * marker was lost) must not permanently divert the prefix key to
+	 * a different window's child process. */
+	if (new_id != watched_id)
+		paste_cancel();
+}
+
 /* sync watched_id / watching / vt globals from tilemgr's focused pane.
  * these globals are used by other files (prefix_menu.c, picker.c, etc.)
  * but tilemgr is the source of truth for focus. */
@@ -1265,6 +1677,7 @@ tile_sync_focus(void)
 	struct client_window *cw;
 
 	if (id) {
+		sel_clear_on_focus_change(id);
 		watched_id = id;
 		watching = 1;
 		cw = cwin_find(id);
@@ -1275,7 +1688,7 @@ tile_sync_focus(void)
 
 /* sync watched_id / watching / vt globals from wmgr's focused window.
  * analogous to tile_sync_focus() -- wmgr is the source of truth for
- * turbo mode focus, and these globals must track it for the status
+ * turbo mode focus, and these globals must track it for the taskbar
  * line, keybinds title, and window list formatting. */
 static void
 turbo_sync_focus(void)
@@ -1286,6 +1699,7 @@ turbo_sync_focus(void)
 	if (turbo_focused_id(&id)) {
 		if (scrollback_mode && id != scrollback_win_id)
 			scrollback_leave();
+		sel_clear_on_focus_change(id);
 		watched_id = id;
 		watching = 1;
 		cw = cwin_find(id);
@@ -1375,6 +1789,8 @@ sync_vt_title(uint32_t win_id, struct vt_state *st)
 	vt_title = vt_state_title(st);
 	if (!vt_title)
 		vt_title = "";
+	/* a :title override, when set, replaces the program's title */
+	vt_title = cwin_effective_title(cwin_find(win_id), vt_title);
 
 	mc = mconn_find_by_pid((pid_t)win_id);
 	if (!mc || strcmp(mc->title, vt_title) == 0)
@@ -1388,7 +1804,7 @@ sync_vt_title(uint32_t win_id, struct vt_state *st)
 		wm_set_title(wmgr, win_id, vt_title);
 
 	win_list_set_title(win_id, vt_title);
-	win_list_format_status();
+	win_list_format_taskbar();
 
 	if (watching && win_id == watched_id)
 		sync_keybinds_title();
@@ -1911,7 +2327,7 @@ mode_toggle(void)
 	}
 
 	need_render = 1;
-	need_status = 1;
+	need_taskbar = 1;
 }
 
 /* find the focused wm_window's ID, return via out_id.
@@ -2038,7 +2454,32 @@ micro_swap_num(int dir)
 	}
 
 	mconn_sync_winlist();
-	need_status = 1;
+	need_taskbar = 1;
+}
+
+/* renumber the current window to the stable number target.  if target is
+ * taken the two windows swap numbers, otherwise the window moves into the
+ * free slot.  returns 0 on success, -1 on error. */
+static int
+micro_set_num(int target)
+{
+	struct sessdir_state *st;
+	int rc;
+
+	if (!watching || mconn_count == 0)
+		return -1;
+
+	st = sessdir_state_open(session_name);
+	if (!st)
+		return -1;
+	rc = sessdir_state_set_num(st, (pid_t)watched_id, target);
+	sessdir_state_close(st);
+	if (rc < 0)
+		return -1;
+
+	mconn_sync_winlist();
+	need_taskbar = 1;
+	return 0;
 }
 
 static void
@@ -2087,6 +2528,7 @@ mconn_sync_winlist(void)
 		    "title");
 		live = (cw && cw->vt) ? vt_state_title(cw->vt) : NULL;
 		use = (live && live[0]) ? live : title;
+		use = cwin_effective_title(cw, use);
 		if (use) {
 			size_t len = utf8_trunc(use,
 			    sizeof(mconns[i].title));
@@ -2103,8 +2545,40 @@ mconn_sync_winlist(void)
 		    (uint32_t)mconns[i].pid, label,
 		    watching && (uint32_t)mconns[i].pid == watched_id);
 	}
-	win_list_format_status();
+	win_list_format_taskbar();
 	sync_keybinds_title();
+}
+
+/* choose the window to focus at attach time: prefer the session's
+ * recorded foreground window, then the first window in stable order,
+ * then the first discovered connection. */
+static uint32_t
+mconn_initial_focus(void)
+{
+	struct sessdir_state *st;
+	pid_t focus = 0;
+	pid_t order[CLIENT_WIN_MAX];
+	int norder = 0, i;
+
+	st = sessdir_state_open(session_name);
+	if (st) {
+		focus = sessdir_state_focus(st);
+		norder = sessdir_state_order(st, order, CLIENT_WIN_MAX);
+		sessdir_state_close(st);
+	}
+
+	/* recorded foreground window, if still connected */
+	if (focus > 0 && mconn_find_by_pid((pid_t)focus))
+		return (uint32_t)focus;
+
+	/* otherwise the first window in stable order that is connected */
+	for (i = 0; i < norder; i++) {
+		if (mconn_find_by_pid(order[i]))
+			return (uint32_t)order[i];
+	}
+
+	/* fallback: first discovered connection */
+	return (uint32_t)mconns[0].pid;
 }
 
 /* cycle focus to next/prev mserver window.
@@ -2136,9 +2610,14 @@ micro_cycle_focus(int dir)
 	else
 		from = cur_num;
 
-	watched_id = mconn_adjacent_pid(from, dir, 1);
-	if (watched_id == 0)
-		return;
+	{
+		uint32_t next = mconn_adjacent_pid(from, dir, 1);
+
+		if (next == 0)
+			return;
+		sel_clear_on_focus_change(next);
+		watched_id = next;
+	}
 	watching = 1;
 
 	{
@@ -2161,7 +2640,7 @@ micro_cycle_focus(int dir)
 		tile_need_full = 1;
 	}
 	need_render = 1;
-	need_status = 1;
+	need_taskbar = 1;
 	sync_keybinds_title();
 
 	mconn_sync_winlist();
@@ -2179,6 +2658,7 @@ micro_select_window(uint32_t id)
 	if (!mc)
 		return;
 
+	sel_clear_on_focus_change(id);
 	watched_id = id;
 	watching = 1;
 
@@ -2199,10 +2679,234 @@ micro_select_window(uint32_t id)
 		tile_need_full = 1;
 	}
 	need_render = 1;
-	need_status = 1;
+	need_taskbar = 1;
 	sync_keybinds_title();
 
 	mconn_sync_winlist();
+}
+
+/* ---- command input line (Ctrl-A :) ---- */
+
+/* 0-based screen row where the command line and taskbar sit. */
+static int
+cmdline_row(void)
+{
+	return taskbar_visible ? content_rows : content_rows - 1;
+}
+
+/* draw the prompt line: ':' + input (or the result message) at the
+ * bottom row, clearing the rest of the line. */
+static void
+cmdline_render(void)
+{
+	const char *body = cmd_msg[0] ? cmd_msg : cmd_buf;
+	char lead = cmd_msg[0] ? ' ' : ':';
+
+	/* The raw tio_write() calls below advance the terminal cursor
+	 * without the renderer knowing, so its tracked position is stale
+	 * by the time we return.  Invalidate first, otherwise a second
+	 * cmdline_render() in the same frame finds the tracked position
+	 * already at (row, 0), skips the move, and redraws the prompt at
+	 * the wrong column -- showing the text twice. */
+	render_invalidate_cursor(renderer);
+	render_move_cursor(renderer, STDOUT_FILENO, cmdline_row(), 0);
+	tio_write(STDOUT_FILENO, "\033[0m", 4);
+	tio_write(STDOUT_FILENO, &lead, 1);
+	if (body[0])
+		tio_write(STDOUT_FILENO, body, strlen(body));
+	tio_write(STDOUT_FILENO, "\033[K", 3);
+	tio_flush(STDOUT_FILENO);
+}
+
+/* parse and run a submitted directive.  on success cmd_msg is left
+ * empty (caller hides the line); on error cmd_msg holds a message and
+ * the line stays open. */
+static void
+cmdline_execute(const char *line)
+{
+	char word[64];
+	const char *p = line;
+	size_t i;
+
+	cmd_msg[0] = '\0';
+
+	while (*p == ' ' || *p == '\t')
+		p++;
+	if (!*p)
+		return;
+
+	/* first word = directive */
+	for (i = 0; *p && *p != ' ' && *p != '\t' && i < sizeof(word) - 1; i++)
+		word[i] = *p++;
+	word[i] = '\0';
+	while (*p == ' ' || *p == '\t')
+		p++;
+
+	if (strcmp(word, "setenv") == 0 || strcmp(word, "unsetenv") == 0) {
+		char var[128];
+		int unset = (word[0] == 'u');
+
+		for (i = 0; *p && *p != ' ' && *p != '\t' &&
+		    i < sizeof(var) - 1; i++)
+			var[i] = *p++;
+		var[i] = '\0';
+		if (!var[0]) {
+			snprintf(cmd_msg, sizeof(cmd_msg),
+			    "usage: %.40s VAR%s", word,
+			    unset ? "" : " value");
+			return;
+		}
+		if (unset) {
+			unsetenv(var);
+		} else {
+			char val[320];
+			size_t vlen;
+
+			while (*p == ' ' || *p == '\t')
+				p++;
+			vlen = strlen(p);
+			/* strip one layer of surrounding double quotes */
+			if (vlen >= 2 && p[0] == '"' && p[vlen - 1] == '"') {
+				p++;
+				vlen -= 2;
+			}
+			if (vlen >= sizeof(val))
+				vlen = sizeof(val) - 1;
+			memcpy(val, p, vlen);
+			val[vlen] = '\0';
+			setenv(var, val, 1);
+		}
+		return;
+	}
+
+	if (strcmp(word, "title") == 0) {
+		struct client_window *cw = cwin_focused();
+		size_t tlen = strlen(p);
+
+		if (!cw) {
+			snprintf(cmd_msg, sizeof(cmd_msg), "no window");
+			return;
+		}
+		if (tlen >= 2 && p[0] == '"' && p[tlen - 1] == '"') {
+			p++;
+			tlen -= 2;
+		}
+		if (tlen >= sizeof(cw->title_override))
+			tlen = sizeof(cw->title_override) - 1;
+		/* set a client-side override; an empty argument clears it so
+		 * the program's live VT title shows through again. */
+		memcpy(cw->title_override, p, tlen);
+		cw->title_override[tlen] = '\0';
+		sync_vt_title(cw->id, cw->vt);
+		mconn_sync_winlist();
+		return;
+	}
+
+	if (strcmp(word, "number") == 0 || strcmp(word, "renumber") == 0) {
+		char *end;
+		long target;
+
+		if (!*p) {
+			snprintf(cmd_msg, sizeof(cmd_msg),
+			    "usage: %.20s N", word);
+			return;
+		}
+		target = strtol(p, &end, 10);
+		while (*end == ' ' || *end == '\t')
+			end++;
+		if (end == p || *end || target < 0) {
+			snprintf(cmd_msg, sizeof(cmd_msg),
+			    "invalid number: %.80s", p);
+			return;
+		}
+		if (micro_set_num((int)target) < 0)
+			snprintf(cmd_msg, sizeof(cmd_msg),
+			    "cannot renumber to %ld", target);
+		return;
+	}
+
+	snprintf(cmd_msg, sizeof(cmd_msg), "unknown command: %.90s", word);
+}
+
+static void
+cmdline_hide(void)
+{
+	cmdline_visible = 0;
+	cmd_buf[0] = '\0';
+	cmd_len = 0;
+	cmd_msg[0] = '\0';
+	turbo_need_full = 1;
+	tile_need_full = 1;
+	need_render = 1;
+	need_taskbar = 1;
+}
+
+static void
+cmdline_show(void)
+{
+	cmdline_visible = 1;
+	cmd_buf[0] = '\0';
+	cmd_len = 0;
+	cmd_msg[0] = '\0';
+	cmdline_render();
+	render_move_cursor(renderer, STDOUT_FILENO, cmdline_row(), 1);
+	set_cursor_vis(1);
+	tio_flush(STDOUT_FILENO);
+}
+
+static void
+cmdline_input(const struct tkbd_seq *seq)
+{
+	/* a pending result/error message: any key dismisses or edits */
+	if (cmd_msg[0]) {
+		cmd_msg[0] = '\0';
+		if (seq->key == TKBD_KEY_ESC || seq->key == TKBD_KEY_ENTER) {
+			cmdline_hide();
+			return;
+		}
+	}
+
+	if (seq->key == TKBD_KEY_ESC) {
+		cmdline_hide();
+		return;
+	}
+	if (seq->key == TKBD_KEY_ENTER) {
+		cmdline_execute(cmd_buf);
+		if (!cmd_msg[0]) {
+			cmdline_hide();
+			return;
+		}
+		/* keep the line open to show the message */
+		cmdline_render();
+		set_cursor_vis(0);
+		return;
+	}
+	if (seq->key == TKBD_KEY_BACKSPACE ||
+	    seq->key == TKBD_KEY_BACKSPACE2) {
+		/* drop one UTF-8 character (trailing continuation bytes) */
+		while (cmd_len > 0 &&
+		    (cmd_buf[cmd_len - 1] & 0xC0) == 0x80)
+			cmd_len--;
+		if (cmd_len > 0)
+			cmd_len--;
+		cmd_buf[cmd_len] = '\0';
+	} else if (seq->len > 0 && (unsigned char)seq->data[0] >= 0x20 &&
+	    (unsigned char)seq->data[0] != 0x7F) {
+		/* append the raw bytes (handles UTF-8 input) */
+		if (cmd_len + (size_t)seq->len < sizeof(cmd_buf)) {
+			memcpy(cmd_buf + cmd_len, seq->data, (size_t)seq->len);
+			cmd_len += (size_t)seq->len;
+			cmd_buf[cmd_len] = '\0';
+		}
+	} else {
+		return;	/* ignore other control keys */
+	}
+
+	cmdline_render();
+	render_move_cursor(renderer, STDOUT_FILENO, cmdline_row(),
+	    1 + (int)cmd_len);
+	set_cursor_vis(1);
+	tio_flush(STDOUT_FILENO);
 }
 
 /* ---- action dispatch ---- */
@@ -2234,6 +2938,14 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 		break;
 	case KEYS_ACTION_PREV_WINDOW:
 		micro_cycle_focus(-1);
+		break;
+	case KEYS_ACTION_LAST_WINDOW:
+		{
+			uint32_t prev = mru_prev();
+
+			if (prev)
+				micro_select_window(prev);
+		}
 		break;
 	case KEYS_ACTION_SWAP_NUM_LOWER:
 		micro_swap_num(-1);
@@ -2289,7 +3001,7 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 		if (client_mode != CLIENT_MODE_MINIMAL)
 			picker_show();
 		break;
-	case KEYS_ACTION_STATUS_TOGGLE:
+	case KEYS_ACTION_TASKBAR_TOGGLE:
 		if (client_mode == CLIENT_MODE_MINIMAL)
 			break;
 		{
@@ -2297,7 +3009,7 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 
 			if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) != 0)
 				break;
-			status_visible = !status_visible;
+			taskbar_visible = !taskbar_visible;
 			update_content_size(ws.ws_row, ws.ws_col);
 			render_resize(renderer, content_rows,
 			    content_cols);
@@ -2326,7 +3038,7 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 			}
 			mconn_sync_winlist();
 			need_render = 1;
-			need_status = 1;
+			need_taskbar = 1;
 		}
 		break;
 	case KEYS_ACTION_APPS_MENU:
@@ -2350,7 +3062,7 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 				    tiled_resize_pane_cb, NULL);
 				tile_need_full = 1;
 				need_render = 1;
-				need_status = 1;
+				need_taskbar = 1;
 			}
 		}
 		break;
@@ -2360,7 +3072,7 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 			tile_sync_focus();
 			tile_need_full = 1;
 			need_render = 1;
-			need_status = 1;
+			need_taskbar = 1;
 		}
 		break;
 	case KEYS_ACTION_PREV_PANE:
@@ -2369,7 +3081,7 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 			tile_sync_focus();
 			tile_need_full = 1;
 			need_render = 1;
-			need_status = 1;
+			need_taskbar = 1;
 		}
 		break;
 	case KEYS_ACTION_CLOSE_PANE:
@@ -2384,18 +3096,26 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 			tile_sync_focus();
 			tile_need_full = 1;
 			need_render = 1;
-			need_status = 1;
+			need_taskbar = 1;
 		}
 		break;
 	case KEYS_ACTION_RESIZE_PANE:
-		if (tile_pane_count(tilemgr) > 1)
+		if (tile_pane_count(tilemgr) > 1) {
+			/* pane geometry is about to change under the
+			 * selection; drop it */
+			if (sel_active()) {
+				sel_clear();
+				tile_need_full = 1;
+				need_render = 1;
+			}
 			resize_mode = 1;
+		}
 		break;
 	case KEYS_ACTION_SCROLLBACK:
 		if (!scrollback_mode)
 			scrollback_enter();
 		need_render = 1;
-		need_status = 1;
+		need_taskbar = 1;
 		break;
 	case KEYS_ACTION_WINDOW_COLORS:
 		if (client_mode == CLIENT_MODE_TURBO) {
@@ -2414,7 +3134,7 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 				/* focus next visible window */
 				micro_cycle_focus(1);
 				need_render = 1;
-				need_status = 1;
+				need_taskbar = 1;
 			}
 		}
 		break;
@@ -2461,7 +3181,7 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 				}
 			}
 			need_render = 1;
-			need_status = 1;
+			need_taskbar = 1;
 		}
 		break;
 	case KEYS_ACTION_INPUT_LOCK:
@@ -2488,7 +3208,7 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 				}
 			}
 			need_render = 1;
-			need_status = 1;
+			need_taskbar = 1;
 		}
 		break;
 	case KEYS_ACTION_SESSION_LIST:
@@ -2504,10 +3224,27 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 	case KEYS_ACTION_TOGGLE_MODE:
 		mode_toggle();
 		break;
+	case KEYS_ACTION_COMMAND:
+		cmdline_show();
+		break;
+	case KEYS_ACTION_REDISPLAY:
+		/* re-request every window's screen and force a full local
+		 * repaint, so a pane left stale (e.g. an alt-screen app that
+		 * did not repaint) is resynced on demand */
+		mconn_request_refresh_all();
+		turbo_need_full = 1;
+		tile_need_full = 1;
+		taskbar_invalidate();
+		need_render = 1;
+		need_taskbar = 1;
+		break;
 	case KEYS_ACTION_ARRANGE_GRID:
 		if (client_mode == CLIENT_MODE_TURBO && wmgr) {
 			int gi;
 
+			/* windows are about to move; drop a stale selection */
+			if (sel_active())
+				sel_clear();
 			wm_arrange_grid(wmgr);
 			for (gi = 0; gi < wm_count(wmgr); gi++) {
 				struct wm_window *gw;
@@ -2519,7 +3256,7 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 			turbo_save_layout(session_name);
 			turbo_need_full = 1;
 			need_render = 1;
-			need_status = 1;
+			need_taskbar = 1;
 		}
 		break;
 	default:
@@ -2595,6 +3332,60 @@ sel_paste(void)
 	mconn_ipc_send(mc, IPC_MSG_INPUT, buf, (uint32_t)len);
 	if (focused_wants_bracketed_paste())
 		mconn_ipc_send(mc, IPC_MSG_INPUT, "\033[201~", 6);
+
+	/* the highlighted selection has served its purpose */
+	if (sel_active())
+		sel_clear();
+}
+
+/* feed child output into a window's terminal state.  if the window owns
+ * the active selection and this output scrolls its content, clear the
+ * now-stale selection so the highlight does not linger over new text. */
+static void
+cwin_feed_output(struct client_window *cw, uint32_t win_id,
+    const char *buf, uint32_t len)
+{
+	unsigned gen0 = 0;
+	int watch;
+
+	watch = sel_active() && sel_owner() == cw->id && cw->vt->buf;
+	if (watch)
+		gen0 = vt_buf_scroll_gen(cw->vt->buf);
+
+	predict_confirm(cw->pred, cw->vt, buf, len);
+	vt_parse_feed(cw->parser, buf, len);
+	sync_vt_title(win_id, cw->vt);
+
+	if (watch && vt_buf_scroll_gen(cw->vt->buf) != gen0)
+		sel_clear();
+}
+
+/* left-click on the taskbar, when it is showing the window-list,
+ * switches focus to the clicked tab, the same way the window-select
+ * hotkey does. returns 1 if the click was on the taskbar and has been
+ * fully handled (hit or miss), 0 if the caller should process it as a
+ * normal content-area click. */
+static int
+handle_tabbar_click(int row, int col, const struct tkbd_seq *seq)
+{
+	uint32_t pid;
+	int wcol;
+
+	if (!taskbar_visible || seq->key != TKBD_MOUSE_LEFT ||
+	    (seq->mod & TKBD_MOD_MOTION))
+		return 0;
+	if (row != (taskbar_get_position(taskbar) ? 0 : content_rows))
+		return 0;
+
+	/* the window-list variable is assumed to lead the taskbar format
+	 * (the default), preceded only by the fixed watch-degraded
+	 * warning; a customized taskbar.format with other text before
+	 * ${window-list} will make clicks land on the wrong tab. */
+	wcol = col - (sessdir_watch_degraded ?
+	    (int)strlen("[!watch] ") : 0);
+	if (wcol >= 0 && win_list_hit_test(wcol, &pid))
+		micro_select_window(pid);
+	return 1;
 }
 
 static void
@@ -2607,6 +3398,9 @@ handle_mouse_turbo(struct iox_loop *loop, const struct tkbd_seq *seq)
 	/* tkbd converts SGR 1-based coords to 0-based */
 	row = seq->y;
 	col = seq->x;
+
+	if (handle_tabbar_click(row, col, seq))
+		return;
 
 	/* motion events (button held + move) */
 	if (seq->mod & TKBD_MOD_MOTION) {
@@ -2725,7 +3519,7 @@ handle_mouse_turbo(struct iox_loop *loop, const struct tkbd_seq *seq)
 							scrollback_offset = 0;
 					}
 				}
-				need_status = 1;
+				need_taskbar = 1;
 			}
 			need_render = 1;
 		}
@@ -2755,7 +3549,7 @@ handle_mouse_turbo(struct iox_loop *loop, const struct tkbd_seq *seq)
 				}
 			}
 			need_render = 1;
-			need_status = 1;
+			need_taskbar = 1;
 		} else if (fcw && fcw->vt && focused_wants_mouse()) {
 			struct mconn *mc = mconn_focused();
 
@@ -2782,7 +3576,7 @@ handle_mouse_turbo(struct iox_loop *loop, const struct tkbd_seq *seq)
 			turbo_sync_focus();
 			mconn_sync_winlist();
 			need_render = 1;
-			need_status = 1;
+			need_taskbar = 1;
 		}
 		if (area == WM_HIT_CLOSE) {
 			struct mconn *cmc;
@@ -2805,7 +3599,7 @@ handle_mouse_turbo(struct iox_loop *loop, const struct tkbd_seq *seq)
 			wm_minimize(wmgr, id);
 			micro_cycle_focus(1);
 			need_render = 1;
-			need_status = 1;
+			need_taskbar = 1;
 			return;
 		}
 		if (area == WM_HIT_MAXIMIZE) {
@@ -2851,7 +3645,7 @@ handle_mouse_turbo(struct iox_loop *loop, const struct tkbd_seq *seq)
 						scrollback_offset = 0;
 				}
 				need_render = 1;
-				need_status = 1;
+				need_taskbar = 1;
 			}
 			return;
 		}
@@ -2985,7 +3779,7 @@ handle_mouse_turbo(struct iox_loop *loop, const struct tkbd_seq *seq)
 				}
 			}
 			need_render = 1;
-			need_status = 1;
+			need_taskbar = 1;
 			return;
 		}
 
@@ -3038,6 +3832,9 @@ handle_mouse(struct iox_loop *loop, const struct tkbd_seq *seq)
 
 	row = seq->y;
 	col = seq->x;
+
+	if (handle_tabbar_click(row, col, seq))
+		return;
 
 	/* text selection in tiled/screen mode. clamp the drag point to the
 	 * content area so a stray edge coordinate cannot extend the
@@ -3104,7 +3901,7 @@ handle_mouse(struct iox_loop *loop, const struct tkbd_seq *seq)
 				}
 			}
 			need_render = 1;
-			need_status = 1;
+			need_taskbar = 1;
 		} else if (fcw && fcw->vt && focused_wants_mouse()) {
 			struct mconn *mc = mconn_focused();
 
@@ -3213,6 +4010,14 @@ static char stdin_buf[4096];
 static int stdin_buflen;
 static int in_paste;
 
+/* end any in-progress bracketed paste without requiring a PASTE_END
+ * marker from the outer terminal.  see sel_clear_on_focus_change(). */
+static void
+paste_cancel(void)
+{
+	in_paste = 0;
+}
+
 static void
 dispatch_input(struct iox_loop *loop, const struct tkbd_seq *seq)
 {
@@ -3220,6 +4025,12 @@ dispatch_input(struct iox_loop *loop, const struct tkbd_seq *seq)
 
 	if (seq->type == TKBD_MOUSE) {
 		handle_mouse(loop, seq);
+		return;
+	}
+
+	/* command input line captures all keyboard input while open */
+	if (cmdline_visible) {
+		cmdline_input(seq);
 		return;
 	}
 
@@ -3238,7 +4049,7 @@ dispatch_input(struct iox_loop *loop, const struct tkbd_seq *seq)
 		return;
 	}
 	if (seq->key == TKBD_KEY_PASTE_END) {
-		in_paste = 0;
+		paste_cancel();
 		if (focused_wants_bracketed_paste()) {
 			struct mconn *mc = mconn_focused();
 
@@ -3341,7 +4152,7 @@ dispatch_input(struct iox_loop *loop, const struct tkbd_seq *seq)
 			    tiled_resize_pane_cb, NULL);
 			tile_need_full = 1;
 			need_render = 1;
-			need_status = 1;
+			need_taskbar = 1;
 			return;
 		}
 
@@ -3398,55 +4209,154 @@ dispatch_input(struct iox_loop *loop, const struct tkbd_seq *seq)
 		return;
 	}
 
-	/* scrollback mode: arrow/vim keys to scroll, q/ESC/Enter to exit */
+	/*
+	 * scrollback / copy mode.  a copy cursor moves with hjkl + arrows;
+	 * v/V/Ctrl-V pick char/line/block granularity; Space sets the mark
+	 * then copies; y/Enter yank and exit; Esc aborts a selection or
+	 * exits; q exits.
+	 */
 	if (scrollback_mode) {
 		int handled = 1;
+		int wx, wy, ww, wh, half;
 
-		if (sel_active()) {
-			sel_clear();
-			turbo_need_full = 1;
-			tile_need_full = 1;
+		if (copy_win_rect(&wx, &wy, &ww, &wh) != 0) {
+			wx = 0;
+			wy = 0;
+			ww = content_cols;
+			wh = content_rows;
+		}
+		half = wh / 2 > 0 ? wh / 2 : 1;
+
+		/* Ctrl-modified vim keys: page moves and block mode */
+		if (seq->mod & TKBD_MOD_CTRL) {
+			int i;
+
+			switch (seq->key) {
+			case TKBD_KEY_U:
+				for (i = 0; i < half; i++)
+					copy_move_vert(-1);
+				goto sb_done;
+			case TKBD_KEY_D:
+				for (i = 0; i < half; i++)
+					copy_move_vert(1);
+				goto sb_done;
+			case TKBD_KEY_V:
+				copy_start(SEL_MODE_BLOCK);
+				goto sb_done;
+			default:
+				break;
+			}
 		}
 
 		switch (seq->key) {
 		case TKBD_KEY_UP:
-			scrollback_offset++;
+			copy_move_vert(-1);
 			break;
 		case TKBD_KEY_DOWN:
-			if (scrollback_offset > 0)
-				scrollback_offset--;
+			copy_move_vert(1);
+			break;
+		case TKBD_KEY_LEFT:
+			copy_move_horiz(-1);
+			break;
+		case TKBD_KEY_RIGHT:
+			copy_move_horiz(1);
 			break;
 		case TKBD_KEY_PGUP:
-			scrollback_offset += content_rows / 2;
+			{
+				int i;
+
+				for (i = 0; i < half; i++)
+					copy_move_vert(-1);
+			}
 			break;
 		case TKBD_KEY_PGDN:
-			scrollback_offset -= content_rows / 2;
-			if (scrollback_offset < 0)
-				scrollback_offset = 0;
+			{
+				int i;
+
+				for (i = 0; i < half; i++)
+					copy_move_vert(1);
+			}
 			break;
 		case TKBD_KEY_ESC:
-		case TKBD_KEY_ENTER:
+			if (copy_selecting) {
+				sel_clear();
+				copy_selecting = 0;
+				turbo_need_full = 1;
+				tile_need_full = 1;
+				break;
+			}
 			scrollback_leave();
 			return;
+		case TKBD_KEY_ENTER:
+			copy_yank();
+			return;
 		default:
-			if (seq->ch == 'q') {
+			switch (seq->ch) {
+			case 'q':
 				scrollback_leave();
 				return;
-			}
-			if (seq->ch == 'k') {
-				scrollback_offset++;
-			} else if (seq->ch == 'j') {
-				if (scrollback_offset > 0)
-					scrollback_offset--;
-			} else {
+			case 'y':
+				copy_yank();
+				return;
+			case ' ':
+				if (copy_selecting) {
+					copy_yank();
+					return;
+				}
+				copy_start(SEL_MODE_CHAR);
+				break;
+			case 'v':
+				copy_start(SEL_MODE_CHAR);
+				break;
+			case 'V':
+				copy_start(SEL_MODE_LINE);
+				break;
+			case 'h':
+				copy_move_horiz(-1);
+				break;
+			case 'l':
+				copy_move_horiz(1);
+				break;
+			case 'k':
+				copy_move_vert(-1);
+				break;
+			case 'j':
+				copy_move_vert(1);
+				break;
+			case '0':
+				copy_cur_col = wx;
+				copy_extend();
+				break;
+			case '$':
+				copy_cur_col = wx + ww - 1;
+				copy_extend();
+				break;
+			case 'g':
+				/* jump to top of history */
+				if (!copy_selecting) {
+					scrollback_offset = INT_MAX;
+					copy_scroll(0);	/* clamp to oldest */
+				}
+				copy_cur_row = wy;
+				copy_extend();
+				break;
+			case 'G':
+				if (!copy_selecting)
+					scrollback_offset = 0;
+				copy_cur_row = wy + wh - 1;
+				copy_extend();
+				break;
+			default:
 				handled = 0;
+				break;
 			}
 			break;
 		}
 
+sb_done:
 		if (handled) {
 			need_render = 1;
-			need_status = 1;
+			need_taskbar = 1;
 		}
 		return;
 	}
@@ -3507,8 +4417,15 @@ on_stdin_read(struct iox_loop *loop, int fd, unsigned events, void *arg)
 		seq.ch = TKBD_CH_NONE;
 		consumed = tkbd_parse(&seq, stdin_buf + off,
 		    (size_t)(stdin_buflen - off));
-		if (consumed == 0)
-			break;
+		if (consumed == TKBD_INCOMPLETE)
+			break;			/* wait for the rest */
+		if (consumed == 0) {
+			/* unrecognized byte (e.g. a stray terminal report):
+			 * skip it to resync rather than wedge all input,
+			 * which would swallow the prefix key permanently. */
+			off++;
+			continue;
+		}
 		dispatch_input(loop, &seq);
 		off += consumed;
 	}
@@ -3588,11 +4505,25 @@ mconn_discover(struct iox_loop *lp)
 		 * one bad window cannot hang the whole attach. */
 		sock_set_timeout(fd, MCONN_HANDSHAKE_TIMEOUT);
 
-		/* send ATTACH, receive ATTACH_REPLY with server's
-		 * current VT size so we create a matching client VT */
-		if (ipc_msg_send_empty(fd, IPC_MSG_ATTACH) < 0) {
-			ipc_close(fd);
-			continue;
+		/* send ATTACH carrying our content-area size so the server
+		 * resizes and generates the replay at that size (avoids a
+		 * blank/garbled pane when the server's size differs from
+		 * ours).  receive ATTACH_REPLY with the resulting VT size so
+		 * we create a matching client VT. */
+		{
+			struct ipc_size sz;
+			uint8_t abuf[16];
+			int an;
+
+			sz.rows = (uint16_t)content_rows;
+			sz.cols = (uint16_t)content_cols;
+			an = ipc_size_encode(&sz, abuf, sizeof(abuf));
+			if (an < 0 ||
+			    ipc_msg_send(fd, IPC_MSG_ATTACH, abuf,
+			    (uint32_t)an) < 0) {
+				ipc_close(fd);
+				continue;
+			}
 		}
 		if (ipc_msg_recv(fd, &rtype, rbuf, sizeof(rbuf),
 		    &rlen) != 0 || rtype != IPC_MSG_ATTACH_REPLY) {
@@ -3687,23 +4618,200 @@ start_proxy(const char *user, const char *host, const char *rsession)
 	return sv[0];
 }
 
-static void
-on_proxy_read(struct iox_loop *lp, int fd, unsigned events, void *arg)
+/* decode a hex string of exactly `n` bytes into out.  returns 0 on
+ * success, -1 if the input is malformed or the wrong length. */
+static int
+hex_decode(const char *hex, uint8_t *out, size_t n)
 {
-	uint32_t window_id, type, len;
-	char buf[IPC_MAX_PAYLOAD];
-	int rc;
+	size_t i;
 
-	(void)events;
-	(void)arg;
+	for (i = 0; i < n; i++) {
+		int hi = hex[i * 2], lo = hex[i * 2 + 1];
 
-	rc = proxy_msg_recv(fd, &window_id, &type, buf, sizeof(buf), &len);
-	if (rc != 0) {
-		/* proxy died or pipe closed */
-		iox_loop_stop(lp);
-		return;
+		if (!isxdigit(hi) || !isxdigit(lo))
+			return -1;
+		hi = (hi <= '9') ? hi - '0' : (tolower(hi) - 'a' + 10);
+		lo = (lo <= '9') ? lo - '0' : (tolower(lo) - 'a' + 10);
+		out[i] = (uint8_t)((hi << 4) | lo);
+	}
+	if (hex[n * 2] != '\0' && hex[n * 2] != '\n')
+		return -1;
+	return 0;
+}
+
+/* Wrap fd in an encrypted netchan transport toward peer, authenticated by
+ * psk, and run the handshake.  Takes ownership of fd (closed on failure).
+ * Sets rnet on success.  Returns 0 on success, -1 on error. */
+static int
+net_connect(int fd, const struct nc_addr *peer, const uint8_t *psk)
+{
+	rnet = ipc_transport_netchan_new_crypto(fd, 0, peer, psk);
+	if (!rnet) {
+		close(fd);
+		return -1;
+	}
+	if (ipc_transport_netchan_establish(rnet, 5000) != 0) {
+		ipc_transport_free(rnet);
+		rnet = NULL;
+		return -1;
+	}
+	return 0;
+}
+
+/* Connect to a lumi-net-proxy over an encrypted netchan link.  Reads the
+ * endpoint the proxy published as "net-addr" and the pre-shared key it
+ * published as "net-key" in the local session directory, dials the
+ * endpoint on the loopback interface, and runs the handshake.  Sets rnet
+ * on success.  Returns 0 on success, -1 on error.  Cross-host discovery
+ * (learning the remote endpoint and key over ssh) is a later step; today
+ * this attaches to a net-proxy bridging a session on this host. */
+static int
+start_net_proxy(const char *session)
+{
+	char *addr, *key;
+	uint8_t psk[32];
+	struct sockaddr_in sin;
+	struct nc_addr peer;
+	int port = 0, fd;
+
+	key = sessdir_read_session_file(session, "net-key");
+	if (!key)
+		return -1;
+	if (hex_decode(key, psk, sizeof(psk)) != 0) {
+		free(key);
+		return -1;
+	}
+	free(key);
+
+	addr = sessdir_read_session_file(session, "net-addr");
+	if (!addr)
+		return -1;
+	if (sscanf(addr, "udp %d", &port) != 1 || port <= 0) {
+		free(addr);
+		return -1;
+	}
+	free(addr);
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return -1;
+	memset(&sin, 0, sizeof(sin));
+	sin.sin_family = AF_INET;
+	sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	sin.sin_port = htons((uint16_t)port);
+	if (nc_udp_from_sockaddr(&peer, (struct sockaddr *)&sin,
+	    sizeof(sin)) != 0) {
+		close(fd);
+		return -1;
 	}
 
+	return net_connect(fd, &peer, psk);
+}
+
+/* Reach a lumi-net-proxy on another host.  Runs `lumi net-proxy -d` there
+ * over ssh, which starts (or would start) the proxy, then reports its UDP
+ * port and pre-shared key on one stdout line before detaching.  The key
+ * travels inside the ssh channel, which authenticates the user and
+ * encrypts the transfer.  The endpoint is then dialed directly, so window
+ * I/O flows over the encrypted netchan link rather than through ssh.
+ * Returns 0 on success, -1 on error. */
+static int
+ssh_capture_endpoint(const char *user, const char *host, const char *rsession,
+    int *port, uint8_t *psk)
+{
+	int pfd[2];
+	pid_t pid;
+	char dest[384], line[256], hex[65];
+	size_t off = 0;
+
+	if (user)
+		snprintf(dest, sizeof(dest), "%s@%s", user, host);
+	else
+		snprintf(dest, sizeof(dest), "%s", host);
+
+	if (pipe(pfd) < 0)
+		return -1;
+	pid = fork();
+	if (pid < 0) {
+		close(pfd[0]);
+		close(pfd[1]);
+		return -1;
+	}
+	if (pid == 0) {
+		close(pfd[0]);
+		dup2(pfd[1], STDOUT_FILENO);
+		if (pfd[1] > STDERR_FILENO)
+			close(pfd[1]);
+		lu_umask_restore();
+		execlp("ssh", "ssh", "-T", "-o", "BatchMode=yes", dest,
+		    "lumi", "net-proxy", "-s", rsession, "-b", "0.0.0.0",
+		    "-d", NULL);
+		_exit(127);
+	}
+
+	close(pfd[1]);
+	while (off < sizeof(line) - 1) {
+		ssize_t r = read(pfd[0], line + off, sizeof(line) - 1 - off);
+
+		if (r < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		if (r == 0)
+			break;
+		off += (size_t)r;
+		if (memchr(line, '\n', off))
+			break;
+	}
+	close(pfd[0]);
+	waitpid(pid, NULL, 0);
+	line[off] = '\0';
+
+	if (sscanf(line, "udp %d %64s", port, hex) != 2 || *port <= 0)
+		return -1;
+	return hex_decode(hex, psk, 32);
+}
+
+static int
+start_net_proxy_ssh(const char *user, const char *host, const char *rsession)
+{
+	uint8_t psk[32];
+	struct addrinfo hints, *res = NULL;
+	struct sockaddr_in sin;
+	struct nc_addr peer;
+	int port = 0, fd;
+
+	if (ssh_capture_endpoint(user, host, rsession, &port, psk) != 0)
+		return -1;
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_DGRAM;
+	if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res)
+		return -1;
+	memcpy(&sin, res->ai_addr, sizeof(sin));
+	freeaddrinfo(res);
+	sin.sin_port = htons((uint16_t)port);
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return -1;
+	if (nc_udp_from_sockaddr(&peer, (struct sockaddr *)&sin,
+	    sizeof(sin)) != 0) {
+		close(fd);
+		return -1;
+	}
+	return net_connect(fd, &peer, psk);
+}
+
+/* dispatch one decoded proxy envelope (window_id + type + payload) to the
+ * client's window handlers.  shared by the SSH-pipe reader (on_proxy_read)
+ * and the netchan reader (net_pump_and_drain). */
+static void
+proxy_dispatch(struct iox_loop *lp, uint32_t window_id, uint32_t type,
+    const char *buf, uint32_t len)
+{
 	if (window_id == 0) {
 		/* proxy control messages */
 		const uint8_t *p = (const uint8_t *)buf;
@@ -3734,7 +4842,7 @@ on_proxy_read(struct iox_loop *lp, int fd, unsigned events, void *arg)
 					if (client_mode == CLIENT_MODE_TURBO)
 						turbo_sync_windows();
 					need_render = 1;
-					need_status = 1;
+					need_taskbar = 1;
 				}
 			}
 			break;
@@ -3770,11 +4878,9 @@ on_proxy_read(struct iox_loop *lp, int fd, unsigned events, void *arg)
 				cw = cwin_find(window_id);
 				if (!cw)
 					break;
-				predict_confirm(cw->pred, cw->vt, buf, len);
-				vt_parse_feed(cw->parser, buf, len);
-				sync_vt_title(window_id, cw->vt);
+				cwin_feed_output(cw, window_id, buf, len);
 				need_render = 1;
-				need_status = 1;
+				need_taskbar = 1;
 			}
 			break;
 
@@ -3800,21 +4906,150 @@ on_proxy_read(struct iox_loop *lp, int fd, unsigned events, void *arg)
 	}
 }
 
-static int
-mconn_discover_remote(struct iox_loop *lp)
+static void
+on_proxy_read(struct iox_loop *lp, int fd, unsigned events, void *arg)
 {
 	uint32_t window_id, type, len;
-	uint8_t buf[4096];
-	const uint8_t *p;
+	char buf[IPC_MAX_PAYLOAD];
+	int rc;
+
+	(void)events;
+	(void)arg;
+
+	rc = proxy_msg_recv(fd, &window_id, &type, buf, sizeof(buf), &len);
+	if (rc != 0) {
+		iox_loop_stop(lp);	/* proxy died or pipe closed */
+		return;
+	}
+	proxy_dispatch(lp, window_id, type, buf, len);
+}
+
+/* ---- netchan remote carrier ---- */
+
+static void on_net_timer(struct iox_loop *lp, void *arg);
+static void on_net_proxy_read(struct iox_loop *lp, int fd, unsigned events,
+    void *arg);
+
+/* CLOCK_MONOTONIC in ms, for rate-limiting roam attempts. */
+static uint32_t
+net_now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
+
+/* If the netchan client failed to send because its local address went away
+ * (a network change), swap in a fresh socket and prod the proxy so its
+ * netchan migrates to our new address.  Rate-limited so a genuinely-down
+ * network does not spin creating sockets. */
+static void
+net_maybe_roam(struct iox_loop *lp)
+{
+	uint32_t now;
+	int newfd;
+
+	if (!rnet || !ipc_transport_netchan_roam_pending(rnet))
+		return;
+	now = net_now_ms();
+	if (net_last_roam_ms && now - net_last_roam_ms < NET_ROAM_COOLDOWN_MS)
+		return;
+	net_last_roam_ms = now;
+
+	newfd = ipc_transport_netchan_roam(rnet);
+	if (newfd < 0)
+		return;
+	if (newfd != net_registered_fd) {
+		if (net_registered_fd >= 0)
+			iox_fd_remove(lp, net_registered_fd);
+		iox_fd_add(lp, newfd, IOX_READ, on_net_proxy_read, NULL);
+		net_registered_fd = newfd;
+	}
+	/* a window_id 0 control frame is dropped by the proxy, but it is real
+	 * channel DATA from our new source, which is what makes the proxy's
+	 * netchan validate and accept the migration (a keepalive ping alone
+	 * would not). */
+	proxy_msg_xsend(rnet, 0, IPC_MSG_NOP, NULL, 0);
+}
+
+/* service netchan, then dispatch every complete envelope now buffered.
+ * a dead link stops the loop. */
+static void
+net_pump_and_drain(struct iox_loop *lp)
+{
+	char buf[IPC_MAX_PAYLOAD];
+	uint32_t type, len, wid;
+
+	if (!rnet)
+		return;
+	if (ipc_transport_netchan_pump(rnet) != 0) {
+		iox_loop_stop(lp);
+		return;
+	}
+	for (;;) {
+		int r = ipc_transport_netchan_try_recv(rnet, &type, buf,
+		    sizeof(buf), &len);
+
+		if (r == 1)
+			break;
+		if (r < 0) {
+			iox_loop_stop(lp);
+			return;
+		}
+		if (proxy_msg_xdecode(&wid, buf, &len) != 0)
+			continue;
+		proxy_dispatch(lp, wid, type, buf, len);
+	}
+}
+
+static void
+net_rearm_timer(struct iox_loop *lp)
+{
+	int ms;
+
+	if (!rnet)
+		return;
+	ms = ipc_transport_netchan_timeout(rnet);
+	if (ms < 0 || ms > NET_SERVICE_MS)
+		ms = NET_SERVICE_MS;
+	if (net_service_timer >= 0)
+		iox_timer_remove(lp, net_service_timer);
+	net_service_timer = iox_timer_add(lp, ms, on_net_timer, NULL);
+}
+
+static void
+on_net_timer(struct iox_loop *lp, void *arg)
+{
+	(void)arg;
+	net_service_timer = -1;
+	net_pump_and_drain(lp);
+	if (!iox_loop_stopped(lp)) {
+		net_maybe_roam(lp);
+		net_rearm_timer(lp);
+	}
+}
+
+static void
+on_net_proxy_read(struct iox_loop *lp, int fd, unsigned events, void *arg)
+{
+	(void)fd;
+	(void)events;
+	(void)arg;
+	net_pump_and_drain(lp);
+}
+
+/* parse a PROXY_READY window-list payload (count + per-window records)
+ * into client windows.  shared by the SSH and netchan discovery paths. */
+static void
+proxy_populate_windows(const uint8_t *buf, uint32_t len)
+{
+	const uint8_t *p = buf;
 	uint16_t count;
-	int rc, i;
+	int i;
 
-	rc = proxy_msg_recv(rproxy_fd, &window_id, &type,
-	    buf, sizeof(buf), &len);
-	if (rc != 0 || type != IPC_MSG_PROXY_READY || len < 2)
-		return -1;
-
-	p = buf;
+	if (len < 2)
+		return;
 	memcpy(&count, p, 2);
 	count = BE16(count);
 	p += 2;
@@ -3850,9 +5085,49 @@ mconn_discover_remote(struct iox_loop *lp)
 		p += need;
 		len -= (uint32_t)need;
 	}
+}
+
+static int
+mconn_discover_remote(struct iox_loop *lp)
+{
+	uint32_t window_id, type, len;
+	uint8_t buf[4096];
+	int rc;
+
+	rc = proxy_msg_recv(rproxy_fd, &window_id, &type,
+	    buf, sizeof(buf), &len);
+	if (rc != 0 || type != IPC_MSG_PROXY_READY || len < 2)
+		return -1;
+
+	proxy_populate_windows(buf, len);
 
 	/* register proxy fd for incoming messages */
 	iox_fd_add(lp, rproxy_fd, IOX_READ, on_proxy_read, NULL);
+
+	return mconn_count;
+}
+
+static int
+mconn_discover_remote_net(struct iox_loop *lp)
+{
+	uint32_t type, len, wid;
+	uint8_t buf[4096];
+	int rc;
+
+	/* the proxy sends PROXY_READY first; a blocking recv is fine here,
+	 * before the event loop starts. */
+	rc = ipc_transport_recv(rnet, &type, (char *)buf, sizeof(buf), &len);
+	if (rc != 0)
+		return -1;
+	if (proxy_msg_xdecode(&wid, buf, &len) != 0 || wid != 0 ||
+	    type != IPC_MSG_PROXY_READY || len < 2)
+		return -1;
+
+	proxy_populate_windows(buf, len);
+
+	net_registered_fd = ipc_transport_get_fd(rnet);
+	iox_fd_add(lp, net_registered_fd, IOX_READ, on_net_proxy_read, NULL);
+	net_rearm_timer(lp);
 
 	return mconn_count;
 }
@@ -3868,6 +5143,7 @@ remove_window(struct iox_loop *lp, uint32_t pid)
 
 	cwin_remove(pid);
 	mconn_remove(lp, (pid_t)pid);
+	mru_remove(pid);
 	mconn_sync_winlist();
 
 	if (mconn_count == 0) {
@@ -3877,7 +5153,7 @@ remove_window(struct iox_loop *lp, uint32_t pid)
 			tile_set_window(tilemgr, pid, 0, NULL);
 		vt = NULL;
 		need_render = 0;
-		need_status = 0;
+		need_taskbar = 0;
 		iox_loop_stop(lp);
 		return;
 	}
@@ -3894,8 +5170,9 @@ remove_window(struct iox_loop *lp, uint32_t pid)
 		}
 		if (watching && watched_id == pid) {
 			struct client_window *cw;
+			uint32_t nid = mru_recent_live();
 
-			watched_id = (uint32_t)mconns[0].pid;
+			watched_id = nid ? nid : (uint32_t)mconns[0].pid;
 			watching = 1;
 			cw = cwin_find(watched_id);
 			if (cw)
@@ -3903,7 +5180,7 @@ remove_window(struct iox_loop *lp, uint32_t pid)
 			wm_focus(wmgr, watched_id);
 		}
 		need_render = 1;
-		need_status = 1;
+		need_taskbar = 1;
 		return;
 	}
 
@@ -3916,9 +5193,10 @@ remove_window(struct iox_loop *lp, uint32_t pid)
 		struct client_window *cw = NULL;
 
 		if (mconn_count > 0) {
-			uint32_t nid;
+			uint32_t nid = mru_recent_live();
 
-			nid = (uint32_t)mconns[0].pid;
+			if (!nid)
+				nid = (uint32_t)mconns[0].pid;
 			cw = cwin_find(nid);
 			if (cw) {
 				tile_set_window(tilemgr,
@@ -3933,7 +5211,7 @@ remove_window(struct iox_loop *lp, uint32_t pid)
 	tile_sync_focus();
 	tile_need_full = 1;
 	need_render = 1;
-	need_status = 1;
+	need_taskbar = 1;
 }
 
 static void
@@ -3955,7 +5233,7 @@ on_mserver_read(struct iox_loop *lp, int fd, unsigned events, void *arg)
 	 * small IPC writes (e.g. screen replay) is processed in
 	 * one pass instead of one message per event-loop iteration */
 	for (batch = 0; batch < 4096; batch++) {
-		rc = ipc_msg_recv(fd, &type, buf, sizeof(buf), &len);
+		rc = ipc_transport_recv(mc->t, &type, buf, sizeof(buf), &len);
 		if (rc != 0) {
 			uint32_t pid = (uint32_t)mc->pid;
 			struct client_window *cw = cwin_find(pid);
@@ -3963,7 +5241,8 @@ on_mserver_read(struct iox_loop *lp, int fd, unsigned events, void *arg)
 			if (cw && cwin_should_keep_open(cw)) {
 				cw->dead = 1;
 				iox_fd_remove(lp, fd);
-				ipc_close(fd);
+				ipc_transport_free(mc->t);	/* closes fd */
+				mc->t = NULL;
 				mc->fd = -1;
 				if (client_mode == CLIENT_MODE_TURBO) {
 					struct wm_window *win;
@@ -3976,7 +5255,7 @@ on_mserver_read(struct iox_loop *lp, int fd, unsigned events, void *arg)
 				}
 				mconn_sync_winlist();
 				need_render = 1;
-				need_status = 1;
+				need_taskbar = 1;
 				return;
 			}
 
@@ -3994,12 +5273,9 @@ on_mserver_read(struct iox_loop *lp, int fd, unsigned events, void *arg)
 				if (!cw)
 					break;
 
-				predict_confirm(cw->pred, cw->vt,
-				    buf, len);
-				vt_parse_feed(cw->parser, buf, len);
-				sync_vt_title(win_id, cw->vt);
+				cwin_feed_output(cw, win_id, buf, len);
 				need_render = 1;
-				need_status = 1;
+				need_taskbar = 1;
 			}
 			break;
 
@@ -4137,7 +5413,7 @@ micro_switch_session(struct iox_loop *loop, const char *name)
 	}
 
 	need_render = 1;
-	need_status = 1;
+	need_taskbar = 1;
 	sync_keybinds_title();
 }
 
@@ -4204,7 +5480,7 @@ mconn_refresh(struct iox_loop *lp)
 		if (watching)
 			wm_focus(wmgr, watched_id);
 		need_render = 1;
-		need_status = 1;
+		need_taskbar = 1;
 		return added;
 	}
 
@@ -4270,7 +5546,7 @@ mconn_refresh(struct iox_loop *lp)
 
 	tile_need_full = 1;
 	need_render = 1;
-	need_status = 1;
+	need_taskbar = 1;
 	return added;
 }
 
@@ -4351,7 +5627,7 @@ on_sigwinch(struct iox_loop *loop, int signo, void *arg)
 			tile_need_full = 1;
 		}
 		need_render = 1;
-		need_status = 1;
+		need_taskbar = 1;
 	}
 }
 
@@ -4375,10 +5651,11 @@ static void
 usage(void)
 {
 	fprintf(stderr,
-	    "usage: lumi-attach [-f window] [-m mode] [-s name]\n");
+	    "usage: lumi-attach [-f window] [-m mode] [-n] [-s name]\n");
 	fprintf(stderr,
 	    "  -f window   focus this window (by PID) after startup\n"
 	    "  -m mode     UI mode: screen (default), turbo, minimal\n"
+	    "  -n          connect via the session's net-proxy (netchan)\n"
 	    "  -s name     session name (default: 0)\n");
 }
 
@@ -4391,6 +5668,7 @@ cmd_attach_main(int argc, char **argv)
 	uint32_t focus_window = 0;
 	int rows, cols;
 	int opt;
+	int use_netchan = 0;
 
 	if (getenv("LUMI_SESSION")) {
 		fprintf(stderr,
@@ -4399,13 +5677,16 @@ cmd_attach_main(int argc, char **argv)
 		return 1;
 	}
 
-	while ((opt = getopt(argc, argv, "f:m:s:")) != -1) {
+	while ((opt = getopt(argc, argv, "f:m:ns:")) != -1) {
 		switch (opt) {
 		case 'f':
 			focus_window = (uint32_t)strtoul(optarg, NULL, 10);
 			break;
 		case 'm':
 			mode_str = optarg;
+			break;
+		case 'n':
+			use_netchan = 1;
 			break;
 		case 's':
 			name = optarg;
@@ -4443,7 +5724,34 @@ cmd_attach_main(int argc, char **argv)
 	{
 		const char *ruser, *rhost, *rsess;
 
-		if (parse_session_name(name, &ruser, &rhost, &rsess)) {
+		if (use_netchan && parse_session_name(name, &ruser, &rhost,
+		    &rsess)) {
+			/* remote host: bootstrap the proxy over ssh, then
+			 * dial its endpoint directly over encrypted netchan. */
+			is_remote = 1;
+			remote_netchan = 1;
+			session_name = strdup(rsess);
+			if (start_net_proxy_ssh(ruser, rhost, rsess) < 0) {
+				fprintf(stderr,
+				    "lumi-attach: failed to reach net-proxy "
+				    "on %s\n", name);
+				free(session_name);
+				return 1;
+			}
+		} else if (use_netchan) {
+			/* local host: attach to a proxy already serving the
+			 * session on this machine over loopback. */
+			is_remote = 1;
+			remote_netchan = 1;
+			session_name = strdup(name);
+			if (start_net_proxy(name) < 0) {
+				fprintf(stderr,
+				    "lumi-attach: failed to connect to "
+				    "net-proxy for session '%s'\n", name);
+				free(session_name);
+				return 1;
+			}
+		} else if (parse_session_name(name, &ruser, &rhost, &rsess)) {
 			is_remote = 1;
 			session_name = strdup(rsess);
 			if (start_proxy(ruser, rhost, rsess) < 0) {
@@ -4488,8 +5796,8 @@ cmd_attach_main(int argc, char **argv)
 		keys_load_cfg(keybinds, cfg);
 		keys_set_timeout_cb(keybinds, on_prefix_timeout, NULL);
 
-		statusbar = status_new();
-		status_load_cfg(statusbar, cfg);
+		taskbar = taskbar_new();
+		taskbar_load_cfg(taskbar, cfg);
 
 		theme_load_cfg(cfg);
 
@@ -4511,14 +5819,20 @@ cmd_attach_main(int argc, char **argv)
 			    strcmp(val, "yes") == 0 ||
 			    strcmp(val, "1") == 0))
 				keep_open_default = 1;
+
+			val = cfg_get(cfg, "attach.altscreen-scrollback");
+			if (val && (strcmp(val, "true") == 0 ||
+			    strcmp(val, "yes") == 0 ||
+			    strcmp(val, "1") == 0))
+				altscreen_scrollback = 1;
 		}
 
 		cfg_free(cfg);
 	}
 
-	/* minimal mode: no status bar, use full terminal height */
+	/* minimal mode: no taskbar, use full terminal height */
 	if (client_mode == CLIENT_MODE_MINIMAL) {
-		status_visible = 0;
+		taskbar_visible = 0;
 		update_content_size(rows, cols);
 	}
 
@@ -4579,7 +5893,9 @@ cmd_attach_main(int argc, char **argv)
 
 	{
 		/* discover mservers: remote via proxy, local via sessdir */
-		if (is_remote)
+		if (is_remote && remote_netchan)
+			mconn_discover_remote_net(loop);
+		else if (is_remote)
 			mconn_discover_remote(loop);
 		else
 			mconn_discover(loop);
@@ -4590,10 +5906,12 @@ cmd_attach_main(int argc, char **argv)
 			return 1;
 		}
 
-		/* set initial focus to first window */
-		watched_id = (uint32_t)mconns[0].pid;
+		/* set initial focus to the session's recorded foreground
+		 * window; remote sessions have no local state, so fall back
+		 * to the first discovered connection. */
+		watched_id = is_remote ? (uint32_t)mconns[0].pid
+		    : mconn_initial_focus();
 		watching = 1;
-		mconn_sync_winlist();
 		{
 			struct client_window *cw;
 
@@ -4625,8 +5943,24 @@ cmd_attach_main(int argc, char **argv)
 			screen_fit_all_windows();
 			tile_need_full = 1;
 		}
+
+		/* a restored layout may have moved focus off the initial
+		 * window; sync the winlist now so the highlighted tab
+		 * matches the window actually shown in the foreground. */
+		{
+			struct client_window *cw = cwin_find(watched_id);
+
+			if (cw)
+				vt = cw->vt;
+		}
+		mconn_sync_winlist();
+
+		/* panes are now at their final size; ask each server to
+		 * resync its screen so alt-screen apps are not left blank */
+		mconn_request_refresh_all();
+
 		need_render = 1;
-		need_status = 1;
+		need_taskbar = 1;
 
 		/* watch sessdir for new/removed mservers (local only;
 		 * remote proxy handles its own watch) */
@@ -4679,7 +6013,19 @@ cmd_attach_main(int argc, char **argv)
 	mconn_disconnect_all(NULL);
 
 	/* clean up remote proxy */
-	if (is_remote && rproxy_fd >= 0) {
+	if (remote_netchan) {
+		if (net_service_timer >= 0) {
+			iox_timer_remove(loop, net_service_timer);
+			net_service_timer = -1;
+		}
+		if (rnet) {
+			if (net_registered_fd >= 0)
+				iox_fd_remove(loop, net_registered_fd);
+			net_registered_fd = -1;
+			ipc_transport_free(rnet);	/* closes the UDP fd */
+			rnet = NULL;
+		}
+	} else if (is_remote && rproxy_fd >= 0) {
 		close(rproxy_fd);
 		rproxy_fd = -1;
 		if (rproxy_pid > 0)
@@ -4717,8 +6063,8 @@ cmd_attach_main(int argc, char **argv)
 	tui_term_free(tb);
 	txl_free(txl);
 	keys_free(keybinds);
-	status_free(statusbar);
-	status_free(scrollback_sb);
+	taskbar_free(taskbar);
+	taskbar_free(scrollback_sb);
 	free(session_name);
 
 	return 0;

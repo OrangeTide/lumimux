@@ -46,6 +46,11 @@ int tile_close(struct tile *t, uint32_t pane_id);
 int tile_set_window(struct tile *t, uint32_t pane_id,
     uint32_t window_id, struct vt_state *vt);
 
+/* clear any leaf's cached vt pointer that equals vt, leaving the pane in
+ * place but empty. call just before freeing a vt_state so no leaf can
+ * dereference a dangling pointer during a later composite. */
+void tile_forget_vt(struct tile *t, const struct vt_state *vt);
+
 /* focus */
 void tile_focus(struct tile *t, uint32_t pane_id);
 uint32_t tile_focus_next(struct tile *t);

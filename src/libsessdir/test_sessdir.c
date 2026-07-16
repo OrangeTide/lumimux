@@ -6,6 +6,7 @@
 #include "sessdir_state.h"
 #include "sessdir_watch.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -442,6 +443,30 @@ test_state_window_nums(void)
 	CHECK(sessdir_state_swap_num(st, 100, 999) == -1,
 	    "swap with unknown pid fails");
 
+	/* set_num onto a busy slot swaps the two windows.  after the swap
+	 * above the map is [500 400 300 100] with no spares. */
+	CHECK(sessdir_state_set_num(st, 100, 2) == 0, "set 100 -> slot 2");
+	CHECK(sessdir_state_num(st, 100) == 2, "100 now number 2");
+	CHECK(sessdir_state_num(st, 300) == 3, "300 pushed to slot 3");
+
+	/* set_num to a fresh high slot extends the map, sparing the old
+	 * slot; map becomes [500 400 100 0 0 0 0 300]. */
+	CHECK(sessdir_state_set_num(st, 300, 7) == 0, "set 300 -> slot 7");
+	CHECK(sessdir_state_num(st, 300) == 7, "300 now number 7");
+	n = sessdir_state_nums(st, nums, 16);
+	CHECK(n == 8 && nums[3] == 0, "old slot 3 becomes a spare");
+
+	/* set_num onto a spare slot moves the window, old slot spared */
+	CHECK(sessdir_state_set_num(st, 100, 4) == 0, "set 100 -> spare 4");
+	CHECK(sessdir_state_num(st, 100) == 4, "100 now number 4");
+	n = sessdir_state_nums(st, nums, 16);
+	CHECK(nums[2] == 0, "old slot 2 is now a spare");
+	CHECK(sessdir_state_num(st, 500) == 0, "500 keeps number 0");
+
+	/* out-of-range and unknown-pid targets fail */
+	CHECK(sessdir_state_set_num(st, 100, -1) == -1, "negative fails");
+	CHECK(sessdir_state_set_num(st, 999, 0) == -1, "unknown pid fails");
+
 	sessdir_state_close(st);
 	printf("ok\n");
 }
@@ -457,6 +482,13 @@ test_watch(void)
 	sessdir_session_create("wt1");
 
 	wfd = sessdir_watch_start("wt1");
+	if (wfd < 0 && (errno == EMFILE || errno == ENFILE)) {
+		/* the per-user inotify instance limit is exhausted (a busy
+		 * desktop can hold them all); this is an environment
+		 * condition, not a defect, so skip rather than fail */
+		printf("skipped (inotify instances exhausted)\n");
+		return;
+	}
 	CHECK(wfd >= 0, "watch_start failed");
 
 	if (wfd >= 0) {

@@ -92,12 +92,6 @@ sim_menu_input(const struct tkbd_seq *seq)
 
 	if (seq->ch < 256) {
 		action = keys_get_binding(keybinds, (uint8_t)seq->ch);
-		if (action == KEYS_ACTION_SEND_PREFIX) {
-			menu_visible = 0;
-			keys_reset(keybinds);
-			keys_feed(keybinds, (uint8_t)seq->ch);
-			return;
-		}
 		if (action != KEYS_ACTION_NONE) {
 			keys_reset(keybinds);
 			sim_menu_hide();
@@ -174,8 +168,12 @@ sim_read_batch(const char *bytes, int len)
 		memset(&seq, 0, sizeof(seq));
 		seq.ch = TKBD_CH_NONE;
 		consumed = tkbd_parse(&seq, bytes + off, (size_t)(len - off));
-		if (consumed == 0)
+		if (consumed == TKBD_INCOMPLETE)
 			break;
+		if (consumed == 0) {
+			off++;
+			continue;
+		}
 		sim_dispatch_input(&seq);
 		off += consumed;
 	}
@@ -242,37 +240,56 @@ test_rapid_two_next(void)
 }
 
 static void
-test_split_ctrl_a_then_ctrl_a_space(void)
+test_menu_ctrl_a_then_ctrl_a_space(void)
 {
-	TEST("Ctrl-A alone, then Ctrl-A+space -> NEXT_WINDOW");
+	TEST("menu Ctrl-A: Ctrl-A+space -> LAST_WINDOW, space forwarded");
 	reset_state();
 	sim_read_batch("\x01", 1);
 	ASSERT(menu_visible == 1, "menu should appear from first Ctrl-A");
 	ASSERT(menu_show_count == 1, "one menu_show");
 
+	/* second Ctrl-A while the menu is up bounces to the last window and
+	 * hides the menu; the following space is then an ordinary keystroke
+	 * that reaches the window. */
 	sim_read_batch("\x01 ", 2);
-	ASSERT(action_count == 1, "expected 1 NEXT_WINDOW action");
-	ASSERT(action_log[0] == KEYS_ACTION_NEXT_WINDOW, "expected NEXT_WINDOW");
-	ASSERT(forward_count == 0, "no bytes forwarded to PTY");
+	ASSERT(action_count == 1, "expected 1 LAST_WINDOW action");
+	ASSERT(action_log[0] == KEYS_ACTION_LAST_WINDOW, "expected LAST_WINDOW");
+	ASSERT(menu_visible == 0, "menu hidden after last-window");
+	ASSERT(forward_count == 1, "trailing space forwarded to PTY");
 	PASS();
 }
 
 static void
-test_split_ctrl_a_then_ctrl_a_alone_then_space(void)
+test_menu_ctrl_a_then_ctrl_a_alone(void)
 {
-	TEST("Ctrl-A, Ctrl-A, space in 3 reads -> NEXT_WINDOW");
+	TEST("menu Ctrl-A: second Ctrl-A alone -> LAST_WINDOW");
 	reset_state();
 	sim_read_batch("\x01", 1);
 	ASSERT(menu_visible == 1, "menu from first Ctrl-A");
 
 	sim_read_batch("\x01", 1);
-	ASSERT(keys_get_state(keybinds) == KEYS_STATE_PREFIX,
-	    "should be in PREFIX state");
+	ASSERT(action_count == 1, "expected 1 LAST_WINDOW action");
+	ASSERT(action_log[0] == KEYS_ACTION_LAST_WINDOW, "expected LAST_WINDOW");
+	ASSERT(menu_visible == 0, "menu hidden");
+	ASSERT(keys_get_state(keybinds) == KEYS_STATE_NORMAL,
+	    "prefix state cleared after last-window");
+	ASSERT(forward_count == 0, "action fires, not raw forward");
+	PASS();
+}
 
-	sim_read_batch(" ", 1);
-	ASSERT(action_count == 1, "expected 1 action");
-	ASSERT(action_log[0] == KEYS_ACTION_NEXT_WINDOW, "expected NEXT_WINDOW");
-	ASSERT(forward_count == 0, "no bytes forwarded");
+static void
+test_menu_a_sends_prefix(void)
+{
+	TEST("menu Ctrl-A: 'a' -> SEND_PREFIX");
+	reset_state();
+	sim_read_batch("\x01", 1);
+	ASSERT(menu_visible == 1, "menu from Ctrl-A");
+
+	sim_read_batch("a", 1);
+	ASSERT(action_count == 1, "expected 1 SEND_PREFIX action");
+	ASSERT(action_log[0] == KEYS_ACTION_SEND_PREFIX, "expected SEND_PREFIX");
+	ASSERT(menu_visible == 0, "menu hidden");
+	ASSERT(forward_count == 0, "prefix goes via action, not raw forward");
 	PASS();
 }
 
@@ -313,25 +330,25 @@ test_split_ctrl_a_then_space_ctrl_a_space(void)
 static void
 test_literal_prefix_fast(void)
 {
-	TEST("fast Ctrl-A Ctrl-A -> SEND_PREFIX");
+	TEST("fast Ctrl-A Ctrl-A -> LAST_WINDOW");
 	reset_state();
 	sim_read_batch("\x01\x01", 2);
 	ASSERT(action_count == 1, "expected 1 action");
-	ASSERT(action_log[0] == KEYS_ACTION_SEND_PREFIX, "expected SEND_PREFIX");
+	ASSERT(action_log[0] == KEYS_ACTION_LAST_WINDOW, "expected LAST_WINDOW");
 	ASSERT(forward_count == 0, "no bytes forwarded");
 	PASS();
 }
 
 static void
-test_no_forward_on_prefix_space(void)
+test_menu_command_not_forwarded(void)
 {
-	TEST("prefix+space never forwards raw bytes");
+	TEST("menu command key (space) never forwards raw bytes");
 	reset_state();
 
-	/* worst case: every byte in a separate read */
+	/* every byte in a separate read: prefix shows the menu, then the
+	 * command key must be consumed as the action, never leaked to PTY. */
 	sim_read_batch("\x01", 1);	/* prefix, menu shows */
-	sim_read_batch("\x01", 1);	/* prefix while menu showing */
-	sim_read_batch(" ", 1);		/* command key */
+	sim_read_batch(" ", 1);		/* command key from the menu */
 
 	ASSERT(forward_count == 0, "space must not be forwarded to PTY");
 	ASSERT(action_count == 1, "expected 1 NEXT_WINDOW");
@@ -379,11 +396,11 @@ test_kitty_ctrl_a_space(void)
 static void
 test_kitty_ctrl_a_ctrl_a(void)
 {
-	TEST("kitty CSI 97;5u twice -> SEND_PREFIX");
+	TEST("kitty CSI 97;5u twice -> LAST_WINDOW");
 	reset_state();
 	sim_read_batch("\x1b[97;5u\x1b[97;5u", 14);
 	ASSERT(action_count == 1, "expected 1 action");
-	ASSERT(action_log[0] == KEYS_ACTION_SEND_PREFIX, "expected SEND_PREFIX");
+	ASSERT(action_log[0] == KEYS_ACTION_LAST_WINDOW, "expected LAST_WINDOW");
 	ASSERT(forward_count == 0, "no bytes forwarded");
 	PASS();
 }
@@ -397,6 +414,113 @@ test_kitty_ctrl_a_n(void)
 	ASSERT(action_count == 1, "expected 1 action");
 	ASSERT(action_log[0] == KEYS_ACTION_NEXT_WINDOW, "expected NEXT_WINDOW");
 	ASSERT(forward_count == 0, "no bytes forwarded");
+	PASS();
+}
+
+static void
+test_mok_ctrl_a_space(void)
+{
+	TEST("modifyOtherKeys CSI 27;5;97~ + space -> NEXT_WINDOW");
+	reset_state();
+	/* CSI 27;5;97~ = Ctrl-A in xterm modifyOtherKeys (iTerm2) */
+	sim_read_batch("\x1b[27;5;97~ ", 11);
+	ASSERT(action_count == 1, "expected 1 action");
+	ASSERT(action_log[0] == KEYS_ACTION_NEXT_WINDOW, "expected NEXT_WINDOW");
+	ASSERT(forward_count == 0, "no bytes forwarded");
+	PASS();
+}
+
+static void
+test_mok_ctrl_a_ctrl_a(void)
+{
+	TEST("modifyOtherKeys CSI 27;5;97~ twice -> LAST_WINDOW");
+	reset_state();
+	sim_read_batch("\x1b[27;5;97~\x1b[27;5;97~", 20);
+	ASSERT(action_count == 1, "expected 1 action");
+	ASSERT(action_log[0] == KEYS_ACTION_LAST_WINDOW, "expected LAST_WINDOW");
+	ASSERT(forward_count == 0, "no bytes forwarded");
+	PASS();
+}
+
+static void
+test_mok_ctrl_a_n(void)
+{
+	TEST("modifyOtherKeys CSI 27;5;97~ + n -> NEXT_WINDOW");
+	reset_state();
+	sim_read_batch("\x1b[27;5;97~n", 11);
+	ASSERT(action_count == 1, "expected 1 action");
+	ASSERT(action_log[0] == KEYS_ACTION_NEXT_WINDOW, "expected NEXT_WINDOW");
+	ASSERT(forward_count == 0, "no bytes forwarded");
+	PASS();
+}
+
+static void
+test_report_then_mouse_not_merged(void)
+{
+	TEST("CSI report then SGR mouse: report not merged into mouse");
+	reset_state();
+	/* a DA2 response (two ';' params, ends in 'c') immediately
+	 * followed by a real SGR mouse press. the old whole-buffer scan
+	 * for 'm'/'M' merged both into one bogus mouse event, swallowing
+	 * the report; each must be handled as its own sequence. */
+	sim_read_batch("\x1b[>0;95;0c\x1b[<0;5;5M", 19);
+	ASSERT(action_count == 0, "no key action");
+	ASSERT(forward_count == 1, "report forwarded as one unknown seq");
+	PASS();
+}
+
+static void
+test_report_then_prefix_survives(void)
+{
+	TEST("CSI report with 'M' later then Ctrl-A -> NEXT_WINDOW");
+	reset_state();
+	/* DA2 report, then a real mouse press, then the prefix key: the
+	 * prefix must still reach the state machine (the reported iTerm2
+	 * symptom was the prefix dying after terminal reports). */
+	sim_read_batch("\x1b[>0;95;0c\x1b[<0;5;5M\x01 ", 21);
+	ASSERT(action_count == 1, "expected 1 action");
+	ASSERT(action_log[0] == KEYS_ACTION_NEXT_WINDOW, "expected NEXT_WINDOW");
+	PASS();
+}
+
+static void
+test_sgr_mouse_still_parses(void)
+{
+	TEST("SGR mouse ESC[<0;5;5M parses as a mouse event");
+	reset_state();
+	sim_read_batch("\x1b[<0;5;5M", 8);
+	ASSERT(action_count == 0, "no key action for mouse");
+	ASSERT(forward_count == 0, "mouse not forwarded as key");
+	PASS();
+}
+
+static void
+test_incomplete_csi_waits(void)
+{
+	struct tkbd_seq seq;
+	int r;
+
+	TEST("incomplete CSI returns TKBD_INCOMPLETE, not shredded");
+	memset(&seq, 0, sizeof(seq));
+	seq.ch = TKBD_CH_NONE;
+	/* ESC [ 1 ; 5 -- a CSI with no final byte yet */
+	r = tkbd_parse(&seq, "\x1b[1;5", 5);
+	ASSERT(r == TKBD_INCOMPLETE, "expected TKBD_INCOMPLETE");
+	PASS();
+}
+
+static void
+test_lone_esc_is_esc_key(void)
+{
+	struct tkbd_seq seq;
+	int r;
+
+	TEST("lone ESC parses as ESC key, not incomplete");
+	memset(&seq, 0, sizeof(seq));
+	seq.ch = TKBD_CH_NONE;
+	r = tkbd_parse(&seq, "\x1b", 1);
+	ASSERT(r == 1, "ESC consumed as 1 byte");
+	ASSERT(seq.key == TKBD_KEY_ESC, "expected ESC key");
 	PASS();
 }
 
@@ -414,17 +538,26 @@ main(void)
 	test_fast_ctrl_a_n();
 	test_slow_ctrl_a_then_space();
 	test_rapid_two_next();
-	test_split_ctrl_a_then_ctrl_a_space();
-	test_split_ctrl_a_then_ctrl_a_alone_then_space();
+	test_menu_ctrl_a_then_ctrl_a_space();
+	test_menu_ctrl_a_then_ctrl_a_alone();
+	test_menu_a_sends_prefix();
 	test_split_rapid_alternating();
 	test_split_ctrl_a_then_space_ctrl_a_space();
 	test_literal_prefix_fast();
-	test_no_forward_on_prefix_space();
+	test_menu_command_not_forwarded();
 	test_fast_ctrl_a_ctrl_space();
 	test_fast_ctrl_a_ctrl_n();
 	test_kitty_ctrl_a_space();
 	test_kitty_ctrl_a_ctrl_a();
 	test_kitty_ctrl_a_n();
+	test_mok_ctrl_a_space();
+	test_mok_ctrl_a_ctrl_a();
+	test_mok_ctrl_a_n();
+	test_report_then_mouse_not_merged();
+	test_report_then_prefix_survives();
+	test_sgr_mouse_still_parses();
+	test_incomplete_csi_waits();
+	test_lone_esc_is_esc_key();
 
 	keys_free(keybinds);
 

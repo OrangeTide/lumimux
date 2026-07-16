@@ -24,7 +24,7 @@ enum {
 };
 
 #define VT_MAX_PARAMS	16
-#define VT_OSC_MAX	256
+#define VT_OSC_MAX	4096
 #define VT_DCS_INIT	4096
 #define VT_DCS_MAX	(16 * 1024 * 1024)	/* 16 MB cap */
 
@@ -43,6 +43,8 @@ struct vt_parse {
 	/* OSC string accumulation */
 	char		osc_buf[VT_OSC_MAX];
 	int		osc_len;
+	vt_parse_osc_cb	osc_cb;
+	void		*osc_ctx;
 
 	/* DCS passthrough accumulation */
 	char		*dcs_buf;
@@ -85,6 +87,13 @@ vt_parse_set_dcs_cb(struct vt_parse *p, vt_parse_dcs_cb cb, void *ctx)
 }
 
 void
+vt_parse_set_osc_cb(struct vt_parse *p, vt_parse_osc_cb cb, void *ctx)
+{
+	p->osc_cb = cb;
+	p->osc_ctx = ctx;
+}
+
+void
 vt_parse_reset(struct vt_parse *p)
 {
 	const struct vt_ops *ops = p->ops;
@@ -93,6 +102,8 @@ vt_parse_reset(struct vt_parse *p)
 	size_t dcs_cap = p->dcs_cap;
 	vt_parse_dcs_cb dcs_cb = p->dcs_cb;
 	void *dcs_ctx = p->dcs_ctx;
+	vt_parse_osc_cb osc_cb = p->osc_cb;
+	void *osc_ctx = p->osc_ctx;
 
 	memset(p, 0, sizeof(*p));
 	p->ops = ops;
@@ -101,6 +112,8 @@ vt_parse_reset(struct vt_parse *p)
 	p->dcs_cap = dcs_cap;
 	p->dcs_cb = dcs_cb;
 	p->dcs_ctx = dcs_ctx;
+	p->osc_cb = osc_cb;
+	p->osc_ctx = osc_ctx;
 	p->state = ST_GROUND;
 }
 
@@ -160,13 +173,14 @@ emit_esc(struct vt_parse *p, int final)
 static void
 emit_osc(struct vt_parse *p)
 {
-	if (p->ops->osc) {
-		/* trim trailing bytes of a truncated UTF-8 sequence */
-		p->osc_buf[p->osc_len] = '\0';
-		p->osc_len = (int)utf8_trunc(p->osc_buf,
-		    (size_t)p->osc_len + 1);
+	/* trim trailing bytes of a truncated UTF-8 sequence */
+	p->osc_buf[p->osc_len] = '\0';
+	p->osc_len = (int)utf8_trunc(p->osc_buf, (size_t)p->osc_len + 1);
+
+	if (p->ops->osc)
 		p->ops->osc(p->ctx, p->osc_buf, (size_t)p->osc_len);
-	}
+	if (p->osc_cb)
+		p->osc_cb(p->osc_ctx, p->osc_buf, (size_t)p->osc_len);
 }
 
 static void

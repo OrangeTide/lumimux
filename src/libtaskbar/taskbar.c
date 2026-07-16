@@ -1,9 +1,9 @@
-/* status.c : status line template expansion */
+/* taskbar.c : taskbar template expansion */
 /* Copyright (c) 2026 Jon Mayo
  * Licensed under MIT-0 OR PUBLIC DOMAIN */
 
-#include "status.h"
-#include "status_int.h"
+#include "taskbar.h"
+#include "taskbar_int.h"
 #include "cfg.h"
 #include "utf8.h"
 #include "rune_width.h"
@@ -23,15 +23,15 @@
 
 /* ---- variable storage ---- */
 
-struct status_var {
+struct taskbar_var {
 	char	*name;
 	char	*value;
 };
 
-struct status {
+struct taskbar {
 	char		*format;
 	int		 top;
-	struct status_var *vars;
+	struct taskbar_var *vars;
 	int		 var_count;
 	int		 var_alloc;
 	char		**shell_allow;
@@ -47,13 +47,13 @@ struct status {
 /* ---- arena ---- */
 
 static void
-arena_reset(struct status *s)
+arena_reset(struct taskbar *s)
 {
 	s->arena_off = 0;
 }
 
 static void
-arena_ensure(struct status *s, int need)
+arena_ensure(struct taskbar *s, int need)
 {
 	if (s->arena_size >= need)
 		return;
@@ -63,7 +63,7 @@ arena_ensure(struct status *s, int need)
 }
 
 char *
-status_arena_alloc(struct status *s, int size)
+taskbar_arena_alloc(struct taskbar *s, int size)
 {
 	char *p;
 
@@ -75,25 +75,25 @@ status_arena_alloc(struct status *s, int size)
 }
 
 char *
-status_arena_strdup(struct status *s, const char *str)
+taskbar_arena_strdup(struct taskbar *s, const char *str)
 {
 	int len;
 	char *p;
 
 	if (!str)
-		return status_arena_alloc(s, 1);
+		return taskbar_arena_alloc(s, 1);
 	len = (int)strlen(str);
-	p = status_arena_alloc(s, len + 1);
+	p = taskbar_arena_alloc(s, len + 1);
 	memcpy(p, str, (size_t)len + 1);
 	return p;
 }
 
 char *
-status_arena_strndup(struct status *s, const char *str, int n)
+taskbar_arena_strndup(struct taskbar *s, const char *str, int n)
 {
 	char *p;
 
-	p = status_arena_alloc(s, n + 1);
+	p = taskbar_arena_alloc(s, n + 1);
 	memcpy(p, str, (size_t)n);
 	p[n] = '\0';
 	return p;
@@ -101,10 +101,10 @@ status_arena_strndup(struct status *s, const char *str, int n)
 
 /* ---- public API ---- */
 
-struct status *
-status_new(void)
+struct taskbar *
+taskbar_new(void)
 {
-	struct status *s;
+	struct taskbar *s;
 
 	s = xcalloc(1, sizeof(*s));
 	s->format = xstrdup(DEFAULT_FORMAT);
@@ -113,7 +113,7 @@ status_new(void)
 }
 
 void
-status_free(struct status *s)
+taskbar_free(struct taskbar *s)
 {
 	int i;
 
@@ -133,26 +133,26 @@ status_free(struct status *s)
 }
 
 void
-status_set_format(struct status *s, const char *fmt)
+taskbar_set_format(struct taskbar *s, const char *fmt)
 {
 	free(s->format);
 	s->format = xstrdup(fmt);
 }
 
 void
-status_set_position(struct status *s, int top)
+taskbar_set_position(struct taskbar *s, int top)
 {
 	s->top = top ? 1 : 0;
 }
 
 int
-status_get_position(const struct status *s)
+taskbar_get_position(const struct taskbar *s)
 {
 	return s->top;
 }
 
 void
-status_set(struct status *s, const char *name, const char *value)
+taskbar_set(struct taskbar *s, const char *name, const char *value)
 {
 	int i;
 
@@ -174,7 +174,7 @@ status_set(struct status *s, const char *name, const char *value)
 }
 
 static const char *
-var_get(const struct status *s, const char *name)
+var_get(const struct taskbar *s, const char *name)
 {
 	int i;
 
@@ -186,7 +186,7 @@ var_get(const struct status *s, const char *name)
 }
 
 void
-status_add_shell_allow(struct status *s, const char *pattern)
+taskbar_add_shell_allow(struct taskbar *s, const char *pattern)
 {
 	if (s->shell_count >= s->shell_alloc) {
 		s->shell_alloc = s->shell_alloc ? s->shell_alloc * 2 : 4;
@@ -197,7 +197,7 @@ status_add_shell_allow(struct status *s, const char *pattern)
 }
 
 int
-status_shell_allowed(const struct status *s, const char *cmd)
+taskbar_shell_allowed(const struct taskbar *s, const char *cmd)
 {
 	int i;
 
@@ -209,22 +209,22 @@ status_shell_allowed(const struct status *s, const char *cmd)
 }
 
 void
-status_load_cfg(struct status *s, const struct cfg *c)
+taskbar_load_cfg(struct taskbar *s, const struct cfg *c)
 {
 	const char *val, *p, *end;
 
 	if (!c)
 		return;
 
-	val = cfg_get(c, "status.format");
+	val = cfg_get(c, "taskbar.format");
 	if (val)
-		status_set_format(s, val);
+		taskbar_set_format(s, val);
 
-	val = cfg_get(c, "status.position");
+	val = cfg_get(c, "taskbar.position");
 	if (val && strcmp(val, "top") == 0)
-		status_set_position(s, 1);
+		taskbar_set_position(s, 1);
 
-	val = cfg_get(c, "status.shell_allow");
+	val = cfg_get(c, "taskbar.shell_allow");
 	if (val) {
 		/* comma-separated list of fnmatch patterns */
 		p = val;
@@ -248,7 +248,7 @@ status_load_cfg(struct status *s, const struct cfg *c)
 					pat = xmalloc((size_t)(e - p) + 1);
 					memcpy(pat, p, (size_t)(e - p));
 					pat[e - p] = '\0';
-					status_add_shell_allow(s, pat);
+					taskbar_add_shell_allow(s, pat);
 					free(pat);
 				}
 			}
@@ -260,7 +260,7 @@ status_load_cfg(struct status *s, const struct cfg *c)
 /* ---- expander ---- */
 
 /* forward declaration */
-static char *expand(struct status *s, const char *fmt, int depth);
+static char *expand(struct taskbar *s, const char *fmt, int depth);
 
 /* check if char is valid in a variable name */
 static int
@@ -273,14 +273,14 @@ is_name_char(int c)
 
 /* ${var#pattern} -- remove shortest prefix match */
 static const char *
-mod_trim_prefix_short(struct status *s, const char *val, const char *pat)
+mod_trim_prefix_short(struct taskbar *s, const char *val, const char *pat)
 {
 	int len, i;
 	char *tmp;
 
 	len = (int)strlen(val);
 	for (i = 1; i <= len; i++) {
-		tmp = status_arena_strndup(s, val, i);
+		tmp = taskbar_arena_strndup(s, val, i);
 		if (fnmatch(pat, tmp, 0) == 0)
 			return val + i;
 	}
@@ -289,14 +289,14 @@ mod_trim_prefix_short(struct status *s, const char *val, const char *pat)
 
 /* ${var##pattern} -- remove longest prefix match */
 static const char *
-mod_trim_prefix_long(struct status *s, const char *val, const char *pat)
+mod_trim_prefix_long(struct taskbar *s, const char *val, const char *pat)
 {
 	int len, i;
 	char *tmp;
 
 	len = (int)strlen(val);
 	for (i = len; i >= 1; i--) {
-		tmp = status_arena_strndup(s, val, i);
+		tmp = taskbar_arena_strndup(s, val, i);
 		if (fnmatch(pat, tmp, 0) == 0)
 			return val + i;
 	}
@@ -305,7 +305,7 @@ mod_trim_prefix_long(struct status *s, const char *val, const char *pat)
 
 /* ${var%pattern} -- remove shortest suffix match */
 static const char *
-mod_trim_suffix_short(struct status *s, const char *val, const char *pat)
+mod_trim_suffix_short(struct taskbar *s, const char *val, const char *pat)
 {
 	int len, i;
 
@@ -313,28 +313,28 @@ mod_trim_suffix_short(struct status *s, const char *val, const char *pat)
 	len = (int)strlen(val);
 	for (i = len - 1; i >= 0; i--) {
 		if (fnmatch(pat, val + i, 0) == 0)
-			return status_arena_strndup(s, val, i);
+			return taskbar_arena_strndup(s, val, i);
 	}
 	return val;
 }
 
 /* ${var%%pattern} -- remove longest suffix match */
 static const char *
-mod_trim_suffix_long(struct status *s, const char *val, const char *pat)
+mod_trim_suffix_long(struct taskbar *s, const char *val, const char *pat)
 {
 	int len, i;
 
 	len = (int)strlen(val);
 	for (i = 0; i < len; i++) {
 		if (fnmatch(pat, val + i, 0) == 0)
-			return status_arena_strndup(s, val, i);
+			return taskbar_arena_strndup(s, val, i);
 	}
 	return val;
 }
 
 /* parse ${...} with modifiers, return expanded string (arena-allocated) */
 static char *
-expand_braced_var(struct status *s, const char **pp, int depth)
+expand_braced_var(struct taskbar *s, const char **pp, int depth)
 {
 	const char *p, *name_start, *val;
 	char *name;
@@ -355,16 +355,16 @@ expand_braced_var(struct status *s, const char **pp, int depth)
 		if (*p == '}')
 			p++;
 		*pp = p;
-		return status_arena_strdup(s, "");
+		return taskbar_arena_strdup(s, "");
 	}
 
-	name = status_arena_strndup(s, name_start, name_len);
+	name = taskbar_arena_strndup(s, name_start, name_len);
 	val = var_get(s, name);
 
 	if (*p == '}') {
 		/* simple ${var} */
 		*pp = p + 1;
-		return status_arena_strdup(s, val ? val : "");
+		return taskbar_arena_strdup(s, val ? val : "");
 	}
 
 	if (*p == ':' && p[1] == '-') {
@@ -401,7 +401,7 @@ expand_braced_var(struct status *s, const char **pp, int depth)
 			free(def_text);
 			return result;
 		}
-		return status_arena_strdup(s, val);
+		return taskbar_arena_strdup(s, val);
 	}
 
 	if (*p == ':' && isdigit((unsigned char)p[1])) {
@@ -432,8 +432,8 @@ expand_braced_var(struct status *s, const char **pp, int depth)
 			p++;
 		*pp = p;
 		if (!val)
-			return status_arena_strdup(s, "");
-		return status_arena_strndup(s, val + offset, length);
+			return taskbar_arena_strdup(s, "");
+		return taskbar_arena_strndup(s, val + offset, length);
 	}
 
 	if (*p == '#') {
@@ -451,17 +451,17 @@ expand_braced_var(struct status *s, const char **pp, int depth)
 		scan = p;
 		while (*scan && *scan != '}')
 			scan++;
-		pat = status_arena_strndup(s, pat_start, (int)(scan - pat_start));
+		pat = taskbar_arena_strndup(s, pat_start, (int)(scan - pat_start));
 		if (*scan == '}')
 			scan++;
 		*pp = scan;
 		if (!val || !val[0])
-			return status_arena_strdup(s, "");
+			return taskbar_arena_strdup(s, "");
 		if (longest)
 			result = mod_trim_prefix_long(s, val, pat);
 		else
 			result = mod_trim_prefix_short(s, val, pat);
-		return status_arena_strdup(s, result);
+		return taskbar_arena_strdup(s, result);
 	}
 
 	if (*p == '%') {
@@ -479,17 +479,17 @@ expand_braced_var(struct status *s, const char **pp, int depth)
 		scan = p;
 		while (*scan && *scan != '}')
 			scan++;
-		pat = status_arena_strndup(s, pat_start, (int)(scan - pat_start));
+		pat = taskbar_arena_strndup(s, pat_start, (int)(scan - pat_start));
 		if (*scan == '}')
 			scan++;
 		*pp = scan;
 		if (!val || !val[0])
-			return status_arena_strdup(s, "");
+			return taskbar_arena_strdup(s, "");
 		if (longest)
 			result = mod_trim_suffix_long(s, val, pat);
 		else
 			result = mod_trim_suffix_short(s, val, pat);
-		return status_arena_strdup(s, result);
+		return taskbar_arena_strdup(s, result);
 	}
 
 	/* unknown modifier -- skip to } */
@@ -498,7 +498,7 @@ expand_braced_var(struct status *s, const char **pp, int depth)
 	if (*p == '}')
 		p++;
 	*pp = p;
-	return status_arena_strdup(s, val ? val : "");
+	return taskbar_arena_strdup(s, val ? val : "");
 }
 
 /* scan to matching ) with nesting awareness */
@@ -520,7 +520,7 @@ scan_to_close_paren(const char *p)
 
 /* expand $(func args) -- p points after $( */
 static char *
-expand_func(struct status *s, const char **pp, int depth)
+expand_func(struct taskbar *s, const char **pp, int depth)
 {
 	const char *p, *name_start, *args_start, *close;
 	char *name, *args_raw, *args_expanded;
@@ -533,7 +533,7 @@ expand_func(struct status *s, const char **pp, int depth)
 	while (*p && *p != ' ' && *p != '\t' && *p != ')' && *p != ',')
 		p++;
 	name_len = (int)(p - name_start);
-	name = status_arena_strndup(s, name_start, name_len);
+	name = taskbar_arena_strndup(s, name_start, name_len);
 
 	/* skip whitespace after name */
 	while (*p == ' ' || *p == '\t')
@@ -542,7 +542,7 @@ expand_func(struct status *s, const char **pp, int depth)
 	/* collect arguments to matching ) */
 	args_start = p;
 	close = scan_to_close_paren(p);
-	args_raw = status_arena_strndup(s, args_start, (int)(close - args_start));
+	args_raw = taskbar_arena_strndup(s, args_start, (int)(close - args_start));
 	if (*close == ')')
 		close++;
 	*pp = close;
@@ -551,13 +551,13 @@ expand_func(struct status *s, const char **pp, int depth)
 	args_expanded = expand(s, args_raw, depth + 1);
 
 	/* dispatch */
-	for (i = 0; i < status_func_count; i++) {
-		if (strcmp(name, status_func_table[i].name) == 0)
-			return status_func_table[i].func(s, args_expanded);
+	for (i = 0; i < taskbar_func_count; i++) {
+		if (strcmp(name, taskbar_func_table[i].name) == 0)
+			return taskbar_func_table[i].func(s, args_expanded);
 	}
 
 	/* unknown function -- empty */
-	return status_arena_strdup(s, "");
+	return taskbar_arena_strdup(s, "");
 }
 
 /* ---- main expand ---- */
@@ -568,7 +568,7 @@ expand_func(struct status *s, const char **pp, int depth)
  * by sub-expansions. The result is copied into the arena before returning.
  */
 static char *
-expand(struct status *s, const char *fmt, int depth)
+expand(struct taskbar *s, const char *fmt, int depth)
 {
 	const char *p;
 	char *out;
@@ -576,7 +576,7 @@ expand(struct status *s, const char *fmt, int depth)
 	char *result;
 
 	if (depth > MAX_RECURSE)
-		return status_arena_strdup(s, "");
+		return taskbar_arena_strdup(s, "");
 
 	outlen = 256;
 	out = xmalloc((size_t)outlen);
@@ -626,7 +626,7 @@ expand(struct status *s, const char *fmt, int depth)
 			p++;
 			while (*p && is_name_char(*p))
 				p++;
-			name = status_arena_strndup(s, ns, (int)(p - ns));
+			name = taskbar_arena_strndup(s, ns, (int)(p - ns));
 			val = var_get(s, name);
 			if (val)
 				EMIT_STR(val);
@@ -644,7 +644,7 @@ expand(struct status *s, const char *fmt, int depth)
 #undef EMIT_STR
 
 	/* copy result into arena and free the temp buffer */
-	result = status_arena_strdup(s, out);
+	result = taskbar_arena_strdup(s, out);
 	free(out);
 	return result;
 }
@@ -736,7 +736,7 @@ ansi_copy(char *dst, int dstsz, const char *src, int srclen,
 /* ---- public expand ---- */
 
 int
-status_expand(struct status *s, char *buf, size_t bufsz, int cols)
+taskbar_expand(struct taskbar *s, char *buf, size_t bufsz, int cols)
 {
 	char *raw;
 	char *fill_pos;

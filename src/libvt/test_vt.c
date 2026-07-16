@@ -102,8 +102,19 @@ test_buf_scroll_up(void)
 	vt_buf_cell(buf, 1, 0)->codepoint = '1';
 	vt_buf_cell(buf, 2, 0)->codepoint = '2';
 
-	/* scroll up 1 line -- row 0 goes to scrollback */
-	vt_buf_scroll(buf, 0, 3, 1);
+	/* a no-op scroll must not bump the generation counter */
+	{
+		unsigned gen0 = vt_buf_scroll_gen(buf);
+
+		vt_buf_scroll(buf, 0, 3, 0);
+		ASSERT(vt_buf_scroll_gen(buf) == gen0,
+		    "no-op scroll bumped gen");
+
+		/* scroll up 1 line -- row 0 goes to scrollback */
+		vt_buf_scroll(buf, 0, 3, 1);
+		ASSERT(vt_buf_scroll_gen(buf) != gen0,
+		    "real scroll did not bump gen");
+	}
 
 	c = vt_buf_cell(buf, 0, 0);
 	ASSERT(c->codepoint == '1', "row 0 should be old row 1");
@@ -273,6 +284,60 @@ test_state_altscreen(void)
 	/* primary should still have 'P' */
 	c = vt_buf_cell(st->buf, 0, 0);
 	ASSERT(c->codepoint == 'P', "primary content lost");
+
+	vt_state_free(st);
+	PASS();
+}
+
+static void
+test_state_altscreen_scrollback(void)
+{
+	struct vt_state *st;
+	struct vt_row *sr;
+
+	TEST("state altscreen scrollback capture");
+	st = vt_state_new(24, 80, 100);
+	ASSERT(st != NULL, "state new failed");
+	vt_state_set_altscreen_scrollback(st, 1);
+
+	/* nothing in scrollback yet */
+	ASSERT(vt_buf_scrollback_lines(st->targets[VT_TARGET_PRIMARY]) == 0,
+	    "scrollback not empty at start");
+
+	vt_state_altscreen_enter(st);
+	vt_state_putchar(st, 'A', 1);
+	vt_state_putchar(st, 'L', 1);
+	vt_state_putchar(st, 'T', 1);
+	vt_state_altscreen_leave(st);
+
+	/* the one non-blank alt row is now history; trailing blanks trimmed. */
+	ASSERT(vt_buf_scrollback_lines(st->targets[VT_TARGET_PRIMARY]) == 1,
+	    "alt content not captured as one scrollback line");
+	sr = vt_buf_scrollback_row(st->targets[VT_TARGET_PRIMARY], -1);
+	ASSERT(sr != NULL, "captured scrollback row is NULL");
+	ASSERT(sr->cells[0].codepoint == 'A', "captured cell 0 wrong");
+	ASSERT(sr->cells[2].codepoint == 'T', "captured cell 2 wrong");
+
+	vt_state_free(st);
+	PASS();
+}
+
+static void
+test_state_altscreen_scrollback_off(void)
+{
+	struct vt_state *st;
+
+	TEST("state altscreen scrollback off by default");
+	st = vt_state_new(24, 80, 100);
+	ASSERT(st != NULL, "state new failed");
+
+	vt_state_altscreen_enter(st);
+	vt_state_putchar(st, 'A', 1);
+	vt_state_altscreen_leave(st);
+
+	/* default: alt content is discarded, scrollback untouched. */
+	ASSERT(vt_buf_scrollback_lines(st->targets[VT_TARGET_PRIMARY]) == 0,
+	    "alt content captured while feature disabled");
 
 	vt_state_free(st);
 	PASS();
@@ -729,6 +794,52 @@ test_dcs_empty(void)
 	PASS();
 }
 
+/* ---- OSC observation callback ---- */
+
+static char osc_cb_data[4096];
+static size_t osc_cb_len;
+static int osc_cb_count;
+
+static void
+test_osc_cb(void *ctx, const char *data, size_t len)
+{
+	(void)ctx;
+	if (len > sizeof(osc_cb_data))
+		len = sizeof(osc_cb_data);
+	memcpy(osc_cb_data, data, len);
+	osc_cb_len = len;
+	osc_cb_count++;
+}
+
+static void
+test_osc_cb_notify(void)
+{
+	struct vt_parse *p;
+
+	TEST("OSC callback observes notification payloads");
+	p = vt_parse_new(&test_ops, NULL);
+	ASSERT(p != NULL, "parse new failed");
+	vt_parse_set_osc_cb(p, test_osc_cb, NULL);
+
+	/* OSC 9 simple notification, BEL-terminated */
+	osc_cb_count = 0;
+	osc_cb_len = 0;
+	vt_parse_feed(p, "\033]9;hello\007", 10);
+	ASSERT(osc_cb_count == 1, "callback should fire once");
+	ASSERT(osc_cb_len == 7, "wrong payload length");
+	ASSERT(memcmp(osc_cb_data, "9;hello", 7) == 0, "wrong payload");
+
+	/* OSC 99 kitty notification, ST-terminated */
+	osc_cb_count = 0;
+	vt_parse_feed(p, "\033]99;i=1;done\033\\", 15);
+	ASSERT(osc_cb_count == 1, "callback should fire for OSC 99");
+	ASSERT(memcmp(osc_cb_data, "99;i=1;done", 11) == 0,
+	    "wrong OSC 99 payload");
+
+	vt_parse_free(p);
+	PASS();
+}
+
 static void
 test_dcs_normal_after(void)
 {
@@ -1099,6 +1210,8 @@ main(void)
 	test_state_putchar();
 	test_state_autowrap();
 	test_state_altscreen();
+	test_state_altscreen_scrollback();
+	test_state_altscreen_scrollback_off();
 	test_state_cursor_save_restore();
 	test_state_tabs();
 
@@ -1120,6 +1233,7 @@ main(void)
 	test_dcs_apc();
 	test_dcs_empty();
 	test_dcs_normal_after();
+	test_osc_cb_notify();
 
 	/* integrated */
 	test_integrated_cursor_movement();

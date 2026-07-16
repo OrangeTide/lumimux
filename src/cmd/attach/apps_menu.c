@@ -128,7 +128,7 @@ app_show(int index)
 	app_context.be_ctx = tui_term_ctx(tb);
 	app_context.base = vt->buf;
 	app_context.theme = theme;
-	app_context.input_fd = mconn_focused_fd();
+	app_context.input_t = mconn_focused_transport();
 	app_context.screen_rows = ws.ws_row;
 	app_context.screen_cols = ws.ws_col;
 	app_context.pad = p;

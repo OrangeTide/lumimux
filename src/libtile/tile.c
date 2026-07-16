@@ -353,6 +353,28 @@ tile_set_window(struct tile *t, uint32_t pane_id,
 	return 0;
 }
 
+static void
+node_forget_vt(struct tile_node *n, const struct vt_state *vt)
+{
+	if (!n)
+		return;
+	if (n->type == TILE_LEAF) {
+		if (n->vt == vt)
+			n->vt = NULL;
+		return;
+	}
+	node_forget_vt(n->a, vt);
+	node_forget_vt(n->b, vt);
+}
+
+void
+tile_forget_vt(struct tile *t, const struct vt_state *vt)
+{
+	if (!t || !vt)
+		return;
+	node_forget_vt(t->root, vt);
+}
+
 /* ---- focus ---- */
 
 void

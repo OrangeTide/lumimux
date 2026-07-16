@@ -16,6 +16,7 @@ struct vt_buf {
 	int		ring_cap;	/* total ring capacity */
 	int		ring_len;	/* current lines in ring */
 	int		ring_head;	/* next write position */
+	unsigned	scroll_gen;	/* bumped on each actual scroll */
 };
 
 static struct vt_row *
@@ -178,6 +179,12 @@ vt_buf_scrollback_lines(const struct vt_buf *buf)
 	return buf->ring_len;
 }
 
+unsigned
+vt_buf_scroll_gen(const struct vt_buf *buf)
+{
+	return buf->scroll_gen;
+}
+
 struct vt_row *
 vt_buf_scrollback_row(struct vt_buf *buf, int offset)
 {
@@ -217,6 +224,8 @@ vt_buf_scroll(struct vt_buf *buf, int top, int bottom, int count)
 		bottom = buf->rows;
 	if (top >= bottom || count == 0)
 		return;
+
+	buf->scroll_gen++;
 
 	if (count > 0) {
 		/* scroll up: lines at top go to scrollback */
@@ -282,6 +291,34 @@ vt_buf_dirty_all(struct vt_buf *buf)
 
 	for (i = 0; i < buf->rows; i++)
 		buf->grid[i]->flags |= VT_ROW_DIRTY;
+}
+
+void
+vt_buf_push_rows(struct vt_buf *dst, struct vt_buf *src, int from, int count)
+{
+	int i, j, cc, n;
+
+	if (!dst || !src || dst->ring_cap == 0 || count <= 0)
+		return;
+	if (from < 0)
+		from = 0;
+	n = count;
+	if (from + n > src->rows)
+		n = src->rows - from;
+	if (n <= 0)
+		return;
+
+	cc = (src->cols < dst->cols) ? src->cols : dst->cols;
+	for (i = 0; i < n; i++) {
+		struct vt_row *sr = src->grid[from + i];
+		struct vt_row *r = row_alloc(dst->cols);
+
+		for (j = 0; j < cc; j++)
+			r->cells[j] = sr->cells[j];
+		r->flags = VT_ROW_DIRTY;
+		ring_push(dst, r);	/* takes ownership of r */
+	}
+	dst->scroll_gen++;
 }
 
 /* resolve a line index in the virtual [scrollback][visible] history */

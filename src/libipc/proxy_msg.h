@@ -32,4 +32,19 @@ int proxy_msg_send(int fd, uint32_t window_id, uint32_t type,
 int proxy_msg_recv(int fd, uint32_t *window_id, uint32_t *type,
     void *buf, size_t bufsz, uint32_t *len);
 
+struct ipc_transport;
+
+/*
+ * The same proxy envelope carried over an ipc_transport (the netchan
+ * carrier) instead of a raw fd.  window_id rides as a 4-byte big-endian
+ * prefix on the transport payload; the transport header carries the type.
+ * proxy_msg_xsend frames and sends one message.  proxy_msg_xdecode splits
+ * the window_id off a buffer already received via ipc_transport_recv or
+ * ipc_transport_netchan_try_recv, updating *len to the inner length.
+ * Returns 0 on success, -1 on error.
+ */
+int proxy_msg_xsend(struct ipc_transport *t, uint32_t window_id, uint32_t type,
+    const void *payload, uint32_t len);
+int proxy_msg_xdecode(uint32_t *window_id, void *buf, uint32_t *len);
+
 #endif /* PROXY_MSG_H */

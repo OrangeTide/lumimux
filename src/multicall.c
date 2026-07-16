@@ -34,6 +34,7 @@ static const struct {
 	{ "mserver",	cmd_mserver_main },
 	{ "new",	cmd_new_main },
 	{ "new-window",	cmd_new_window_main },
+	{ "net-proxy",	cmd_net_proxy_main },
 	{ "proxy",	cmd_proxy_main },
 	{ "reload",	cmd_reload_main },
 	{ "send-input",	cmd_send_input_main },

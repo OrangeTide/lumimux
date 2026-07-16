@@ -36,4 +36,15 @@ typedef void (*vt_parse_dcs_cb)(void *ctx, int introducer,
  * pass NULL to disable. */
 void vt_parse_set_dcs_cb(struct vt_parse *p, vt_parse_dcs_cb cb, void *ctx);
 
+/* OSC observation callback.
+ * invoked when a complete OSC sequence (ESC ] ... ST/BEL) is received,
+ * in addition to the ops->osc dispatch.  data/len contain the bytes
+ * between the introducer and the terminator (the "N;..." payload).
+ * used to pass desktop-notification OSCs through to the outer terminal. */
+typedef void (*vt_parse_osc_cb)(void *ctx, const char *data, size_t len);
+
+/* set an OSC observation callback with its own context.
+ * pass NULL to disable. */
+void vt_parse_set_osc_cb(struct vt_parse *p, vt_parse_osc_cb cb, void *ctx);
+
 #endif /* VT_PARSE_H */

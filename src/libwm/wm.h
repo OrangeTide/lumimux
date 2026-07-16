@@ -69,6 +69,10 @@ void wm_resize(struct wm *wm, int rows, int cols);
 int wm_add(struct wm *wm, uint32_t id, struct vt_state *vt,
     int x, int y, int w, int h);
 void wm_remove(struct wm *wm, uint32_t id);
+/* clear any window's cached vt pointer that equals vt. call just before
+ * freeing a vt_state so no window can dereference a dangling pointer
+ * during a later composite. */
+void wm_forget_vt(struct wm *wm, const struct vt_state *vt);
 struct wm_window *wm_find(struct wm *wm, uint32_t id);
 int wm_count(const struct wm *wm);
 struct wm_window *wm_window_at(struct wm *wm, int index);

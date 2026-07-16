@@ -4,6 +4,7 @@
 
 #include "ipc.h"
 #include "ipc_msg.h"
+#include "ipc_transport.h"
 #include "lumi_msg.h"
 #include "proxy_msg.h"
 #include "sessdir.h"
@@ -23,7 +24,8 @@
 #define PCONN_MAX 64
 
 struct pconn {
-	int		fd;
+	int		fd;		/* raw fd, kept for the event loop */
+	struct ipc_transport *t;	/* carries messages to/from the mserver */
 	uint32_t	id;		/* mserver PID = window ID */
 	uint16_t	rows;
 	uint16_t	cols;
@@ -76,6 +78,7 @@ pconn_add(uint32_t id, int fd, const char *title,
 		return NULL;
 	pc = &pconns[pconn_count++];
 	pc->fd = fd;
+	pc->t = ipc_transport_unix_new(fd);
 	pc->id = id;
 	pc->rows = rows;
 	pc->cols = cols;
@@ -100,7 +103,8 @@ pconn_remove(uint32_t id)
 		if (pconns[i].id == id) {
 			if (loop)
 				iox_fd_remove(loop, pconns[i].fd);
-			ipc_close(pconns[i].fd);
+			ipc_transport_free(pconns[i].t);	/* closes fd */
+			pconns[i].t = NULL;
 			pconns[i] = pconns[--pconn_count];
 			return;
 		}
@@ -250,8 +254,9 @@ on_mserver_read(struct iox_loop *lp, int fd, unsigned events, void *arg)
 	int rc;
 
 	(void)events;
+	(void)fd;
 
-	rc = ipc_msg_recv(fd, &type, buf, sizeof(buf), &len);
+	rc = ipc_transport_recv(pc->t, &type, buf, sizeof(buf), &len);
 	if (rc != 0) {
 		/* mserver died or error */
 		uint32_t wid = pc->id;
@@ -298,7 +303,7 @@ on_client_read(struct iox_loop *lp, int fd, unsigned events, void *arg)
 	if (!pc)
 		return;
 
-	ipc_msg_send(pc->fd, type, buf, len);
+	ipc_transport_send(pc->t, type, buf, len);
 }
 
 /* sessdir watch -> discover new/dead mservers */
@@ -378,8 +383,9 @@ cleanup(void)
 	int i;
 
 	for (i = 0; i < pconn_count; i++) {
-		ipc_msg_send_empty(pconns[i].fd, IPC_MSG_DETACH);
-		ipc_close(pconns[i].fd);
+		ipc_transport_send_empty(pconns[i].t, IPC_MSG_DETACH);
+		ipc_transport_free(pconns[i].t);	/* closes fd */
+		pconns[i].t = NULL;
 	}
 	pconn_count = 0;
 

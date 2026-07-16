@@ -262,6 +262,21 @@ wm_remove(struct wm *wm, uint32_t id)
 	}
 }
 
+void
+wm_forget_vt(struct wm *wm, const struct vt_state *vt)
+{
+	int i;
+
+	if (!wm || !vt)
+		return;
+	for (i = 0; i < wm->count; i++) {
+		if (wm->windows[i].vt == vt) {
+			wm->windows[i].vt = NULL;
+			wm->composite_needed = 1;
+		}
+	}
+}
+
 struct wm_window *
 wm_find(struct wm *wm, uint32_t id)
 {

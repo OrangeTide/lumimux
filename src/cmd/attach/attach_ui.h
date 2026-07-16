@@ -7,7 +7,7 @@
 
 #include "app.h"
 #include "keys.h"
-#include "status.h"
+#include "taskbar.h"
 #include "tui_pad.h"
 #include "tui_theme.h"
 #include "txl.h"
@@ -24,7 +24,7 @@ struct iox_loop;
 enum client_mode {
 	CLIENT_MODE_SCREEN,	/* GNU Screen-like single window */
 	CLIENT_MODE_TURBO,	/* Turbo Vision overlapping windows */
-	CLIENT_MODE_MINIMAL,	/* bare passthrough, no status/mouse */
+	CLIENT_MODE_MINIMAL,	/* bare passthrough, no taskbar/mouse */
 };
 
 /* core subsystem handles */
@@ -32,9 +32,9 @@ extern enum client_mode client_mode;
 extern struct vt_state *vt;
 extern struct txl *txl;
 extern struct keys *keybinds;
-extern struct status *statusbar;
+extern struct taskbar *taskbar;
 extern const struct tui_theme *theme;
-extern int status_visible;
+extern int taskbar_visible;
 extern int content_rows, content_cols;
 extern int sessdir_watch_degraded;	/* nonzero: live window watch is off */
 
@@ -62,10 +62,11 @@ void overlay_erase_all(void);
  * single window's buffer, not the composited screen). */
 extern void (*overlay_repaint_fn)(void);
 
-void render_status_line(int fd, int rows, int cols);
-void status_line_invalidate(void);
+void render_taskbar(int fd, int rows, int cols);
+void taskbar_invalidate(void);
 
-int mconn_focused_fd(void);
+struct ipc_transport;
+struct ipc_transport *mconn_focused_transport(void);
 void micro_select_window(uint32_t id);
 const char *micro_current_session(void);
 void micro_switch_session(struct iox_loop *loop, const char *name);

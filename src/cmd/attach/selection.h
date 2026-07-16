@@ -15,6 +15,7 @@ enum sel_mode {
 	SEL_MODE_CHAR,
 	SEL_MODE_WORD,
 	SEL_MODE_LINE,
+	SEL_MODE_BLOCK,
 };
 
 /* start a new character-level selection at screen coordinate (row, col).
@@ -28,6 +29,11 @@ void sel_begin_word(uint32_t win_id, int row, int col, int win_x, int win_w,
 
 /* start a full-line selection on row. */
 void sel_begin_line(uint32_t win_id, int row, int win_x, int win_w);
+
+/* start a rectangular block selection anchored at (row, col).
+ * extend with sel_update; highlight and extract cover the column
+ * range between anchor and end on every spanned row. */
+void sel_begin_block(uint32_t win_id, int row, int col, int win_x, int win_w);
 
 /* extend the selection to (row, col) during drag. */
 void sel_update(int row, int col);
@@ -51,6 +57,9 @@ void sel_clear(void);
 
 /* returns 1 if a selection is in progress or visible. */
 int sel_active(void);
+
+/* window id the current selection belongs to (0 if none/tiled). */
+uint32_t sel_owner(void);
 
 /* toggle VT_ATTR_REVERSE on selected cells in the composited screen buffer.
  * call after composite, before render. */

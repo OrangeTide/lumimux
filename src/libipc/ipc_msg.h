@@ -24,7 +24,11 @@
 #define IPC_MAX_PAYLOAD	(64 * 1024)
 
 /* 0x00xx: session / connection control */
-#define IPC_MSG_ATTACH		0x0001	/* client -> server: attach */
+#define IPC_MSG_ATTACH		0x0001	/* client -> server: attach.
+					 * optional ipc_size payload = client's
+					 * desired size; server resizes to it
+					 * before replaying so the replay is
+					 * generated at the final size */
 #define IPC_MSG_ATTACH_REPLY	0x0006	/* server -> client: size (rows, cols) */
 #define IPC_MSG_DETACH		0x0002	/* either direction: detach */
 #define IPC_MSG_KILL		0x0003	/* client -> server: kill server */
@@ -35,6 +39,8 @@
 #define IPC_MSG_INPUT		0x0100	/* client -> server: keyboard input */
 #define IPC_MSG_OUTPUT		0x0101	/* server -> client: PTY output */
 #define IPC_MSG_FLOW_CTRL	0x0102	/* client -> server: 1=pause 0=resume */
+#define IPC_MSG_REFRESH		0x0103	/* client -> server: resend screen
+					 * replay at the current size */
 
 /* 0x02xx: window / PTY management */
 #define IPC_MSG_PTY_FLAGS	0x0201	/* server -> client: PTY flags (1 byte) */
@@ -60,6 +66,8 @@
 #define IPC_MSG_PROXY_READY	0x0400	/* proxy -> client: initial window list */
 #define IPC_MSG_PROXY_WIN_ADDED	0x0401	/* proxy -> client: new window */
 #define IPC_MSG_PROXY_WIN_REMOVED 0x0402 /* proxy -> client: window died */
+#define IPC_MSG_NOP		0x0403	/* client -> proxy: ignored; used as a
+					 * migration nudge after roaming */
 
 /* send a complete message (header + payload). blocks until sent.
  * returns 0 on success, -1 on error. */

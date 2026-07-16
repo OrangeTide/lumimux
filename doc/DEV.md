@@ -19,7 +19,7 @@ Information for developers working on lumimux.
 | src/libsessdir/      | Filesystem session directory for micro-server discovery (inotify) |
 | src/libsession/      | Window lifecycle management (PTY + VT state per window)   |
 | src/libsplash/       | ANSI art splash screen scenes with viewport cropping      |
-| src/libstatus/       | Status line with shell-like template expansion            |
+| src/libtaskbar/      | Taskbar with shell-like template expansion                |
 | src/libtermlib/      | Vendored terminfo parser (aux01/termlib, MIT)             |
 | src/libtile/         | Binary split-pane compositor for screen mode splits       |
 | src/libtio/          | Terminal raw mode, 8KB buffered writes, restore on exit   |
@@ -76,7 +76,7 @@ lumi-attach (client)         mserver 1   mserver 2   mserver 3
  |   cwins[2]: vt+parser |
  |                       |
  | renderer (shadow diff) |
- | status line           |
+ | taskbar               |
  +-----------------------+
 ```
 
@@ -138,7 +138,7 @@ The client supports three UI modes selected by `-m`:
 - **turbo** -- Turbo Vision / DESQview style overlapping windows. Watches
   all windows, composites them via libwm, supports mouse-driven move,
   resize, close, and focus.
-- **minimal** -- bare passthrough with no status bar, no mouse tracking,
+- **minimal** -- bare passthrough with no taskbar, no mouse tracking,
   no popup menus. Prefix key bindings still work for detach and window
   switching. Content uses the full terminal height.
 
@@ -419,10 +419,10 @@ single character. Action names match `keys_action_to_name()` output.
 
 Values are indexed terminal colors (0-255).
 
-### Status Line
+### Taskbar
 
 ```ini
-[status]
+[taskbar]
     format = : ${window-list}
     position = bottom
 ```
@@ -475,7 +475,7 @@ via `_TESTCMD` in module.mk files.
 | test_sessdir   | libsessdir | 55    |
 | test_keys      | libkeys    | 31    |
 | test_cfg       | libcfg     | 39    |
-| test_status    | libstatus  | 27    |
+| test_taskbar   | libtaskbar | 27    |
 | test_splash    | libsplash  | 131   |
 | test_utf8      | libutf8    | 48    |
 | test_tui       | libtui     | 27    |
@@ -491,7 +491,7 @@ via `_TESTCMD` in module.mk files.
 lumi-mserver: libiox, libsessdir, libsession, libipc, libpty, libvt,
               libutf8, libcore
 lumi-attach:  libiox, libsessdir, libipc, libtio, librender, libtxl,
-              libtermlib, libvt, libutf8, libkeys, libcfg, libstatus,
+              libtermlib, libvt, libutf8, libkeys, libcfg, libtaskbar,
               libcore, libtui, libtui_term, libwm, libtile, libattr
 lumi-proxy:   libiox, libsessdir, libipc, libcore
 libwm:        libvt, libtui, libutf8

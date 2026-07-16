@@ -57,6 +57,9 @@ struct vt_state {
 
 	unsigned	modes;
 
+	/* capture alt-screen content into primary scrollback on leave */
+	int		capture_alt_scroll;
+
 	/* current SGR state applied to new cells */
 	uint16_t	attrs;
 	struct vt_color	fg;
@@ -113,6 +116,10 @@ void vt_state_cursor_clamp(struct vt_state *st);
 /* set the fd for DSR/DA reply writes (-1 to disable) */
 void vt_state_set_reply_fd(struct vt_state *st, int fd);
 
+/* enable/disable capturing alt-screen content into primary scrollback when
+ * an application leaves the alternate screen (default disabled). */
+void vt_state_set_altscreen_scrollback(struct vt_state *st, int on);
+
 /* kitty keyboard protocol flag stack (CSI > u push, CSI < u pop,
  * CSI = u set top); kitty_kbd_flags tracks the current top entry */
 void vt_state_kitty_push(struct vt_state *st, int flags);
@@ -121,6 +128,9 @@ void vt_state_kitty_set(struct vt_state *st, int flags, int mode);
 
 /* window title (set by OSC 0/2, NULL if never set) */
 const char *vt_state_title(const struct vt_state *st);
+
+/* replace the window title (NULL or "" clears it). */
+void vt_state_set_title(struct vt_state *st, const char *title);
 
 /* xterm title stack (CSI 22/23 t) */
 void vt_state_title_push(struct vt_state *st);

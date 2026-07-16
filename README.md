@@ -47,7 +47,7 @@ lumi new -s work
 #   Ctrl-A k       kill current window
 #   Ctrl-A d       detach (session keeps running)
 #   Ctrl-A w       window picker
-#   Ctrl-A s       toggle status line
+#   Ctrl-A s       toggle taskbar
 #   Ctrl-A [       scrollback mode (mouse wheel, Page Up/Down)
 #   Ctrl-A t       toggle between turbo and screen modes
 #   Ctrl-A U       session picker
@@ -94,8 +94,8 @@ lumi kill -s work
   restored on reattach.
 - **Per-window customization:** color picker, scroll lock, input lock.
 - **Themes:** 9 built-in themes; user-defined themes via config file.
-- **Config-driven:** gitconfig-style `lumi.conf` for key bindings, status
-  line format, menu colors, and UI theme.
+- **Config-driven:** gitconfig-style `lumi.conf` for key bindings, taskbar
+  format, menu colors, and UI theme.
 - **Single static binary:** 330 KB stripped musl build with no runtime
   dependencies.
 
@@ -128,6 +128,58 @@ export PATH=/opt/lumi-*/bin:$PATH
 The dispatcher finds sub-commands relative to its own binary, so no
 additional environment variables are needed.
 
+## Terminal Configuration
+
+lumi runs inside a host ("outer") terminal and depends on it to deliver
+modified keys, forward advanced escape sequences, and report a usable
+`TERM`. The GNU Screen-compatible defaults (Ctrl-A prefix, arrows, Page
+Up/Down) work in every terminal without changes. The settings below unlock
+the rest: Meta/Alt bindings, unambiguous modified keys via the kitty
+keyboard protocol, and SIXEL graphics forwarded through DCS pass-through.
+
+Three things matter:
+
+- **Meta/Alt keys.** On macOS the Option key usually inserts accented
+  characters instead of sending a Meta prefix. Configure it to send
+  `Esc+` (Meta) so Alt-key bindings and Alt-driven apps inside lumi work.
+- **Kitty keyboard protocol.** Terminals that support it report modified
+  keys (Shift/Alt/Ctrl combined with Enter, Tab, etc.) unambiguously.
+  lumi recognizes the prefix in both the traditional byte encoding and
+  the kitty CSI u encoding, and forwards enhancement flags to child apps.
+- **SIXEL / DCS pass-through.** lumi forwards SIXEL and other DCS
+  sequences to the outer terminal when a single pane is focused, so the
+  outer terminal must itself support SIXEL for graphics to appear.
+
+### Per-terminal setup
+
+- **[iTerm2][10]** (macOS): Settings -> Profiles -> Keys -> General, set
+  *Left Option key* (and *Right Option key*) to **Esc+**. SIXEL and the
+  kitty keyboard protocol are supported out of the box. Consider a
+  separate profile if you still want Option to compose characters
+  elsewhere.
+- **[kitty][11]**: kitty keyboard protocol and SIXEL are native, no setup
+  needed. On macOS set `macos_option_as_alt yes` in `kitty.conf` to make
+  Option send Meta.
+- **[WezTerm][12]**: kitty protocol and SIXEL supported. On macOS add
+  `send_composed_key_when_left_alt_is_pressed = false` to `wezterm.lua`
+  so Left-Alt sends Meta.
+- **[Alacritty][13]**: recent versions speak the kitty keyboard protocol.
+  On macOS set `window.option_as_alt: Both` in `alacritty.toml`. Alacritty
+  does not implement SIXEL, so graphics pass-through will not render.
+- **[GNOME Terminal][14]** / other VTE terminals: Alt sends Meta by
+  default. SIXEL renders only when VTE was built with SIXEL support
+  (most current distributions enable it). The kitty keyboard protocol is
+  not supported, so lumi falls back to the traditional prefix encoding.
+- **[xterm][15]**: add `XTerm*metaSendsEscape: true` to `~/.Xresources`
+  (then `xrdb -merge ~/.Xresources`) so Alt sends Meta. For SIXEL, start
+  xterm with `-ti vt340` or set `XTerm*decTerminalID: vt340`.
+- **[Windows Terminal][16]**: Alt/Meta and, in current releases, SIXEL
+  work without configuration.
+
+To confirm your terminal reaches lumi, run a session and press a bound
+Alt key or a modified Enter; if nothing happens, the outer terminal is
+swallowing the modifier and needs the setting above.
+
 ## Architecture
 
 lumimux uses a micro-server architecture. Each window runs as an independent
@@ -142,7 +194,7 @@ lumi-attach (client)           lumi-mserver (per window)
  +------------------+          +--------+  +--------+  +--------+
  | stdin -> tkbd    |--INPUT-->| PTY+VT |  | PTY+VT |  | PTY+VT |
  | vt_parse+render  |<-OUTPUT--+--------+  +--------+  +--------+
- | status line      |           mserver 0   mserver 1   mserver 2
+ | taskbar          |           mserver 0   mserver 1   mserver 2
  +------------------+                  |         |         |
         ^            sessdir discovery |         |         |
         +------------------------------+---------+---------+
@@ -189,3 +241,10 @@ MIT-0 OR Public Domain.
 [7]: https://en.wikipedia.org/wiki/DESQview
 [8]: https://en.wikipedia.org/wiki/Turbo_Vision
 [9]: https://github.com/magiblot/tvterm
+[10]: https://iterm2.com/
+[11]: https://sw.kovidgoyal.net/kitty/
+[12]: https://wezterm.org/
+[13]: https://alacritty.org/
+[14]: https://wiki.gnome.org/Apps/Terminal
+[15]: https://invisible-island.net/xterm/
+[16]: https://github.com/microsoft/terminal

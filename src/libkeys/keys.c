@@ -145,8 +145,9 @@ keys_default(struct keys *k)
 
 	memset(lay->bindings, 0, sizeof(lay->bindings));
 
-	/* Ctrl-A Ctrl-A or Ctrl-A a: send literal prefix */
-	lay->bindings[k->prefix] = KEYS_ACTION_SEND_PREFIX;
+	/* Ctrl-A Ctrl-A: bounce to the last-used window (GNU Screen's
+	 * "other" key).  Ctrl-A a still sends a literal prefix. */
+	lay->bindings[k->prefix] = KEYS_ACTION_LAST_WINDOW;
 	lay->bindings['a'] = KEYS_ACTION_SEND_PREFIX;
 
 	/* window creation/destruction */
@@ -187,8 +188,8 @@ keys_default(struct keys *k)
 	lay->bindings['"'] = KEYS_ACTION_WINDOW_LIST;
 	lay->bindings['w'] = KEYS_ACTION_WINDOW_LIST;
 
-	/* status toggle */
-	lay->bindings['s'] = KEYS_ACTION_STATUS_TOGGLE;
+	/* taskbar toggle */
+	lay->bindings['s'] = KEYS_ACTION_TASKBAR_TOGGLE;
 
 	/* quick apps menu */
 	lay->bindings['q'] = KEYS_ACTION_APPS_MENU;
@@ -227,6 +228,13 @@ keys_default(struct keys *k)
 	/* clipboard */
 	lay->bindings[']'] = KEYS_ACTION_PASTE;
 	lay->bindings['y'] = KEYS_ACTION_CLIPBOARD_SYNC;
+
+	/* command input line */
+	lay->bindings[':'] = KEYS_ACTION_COMMAND;
+
+	/* resync and fully repaint the screen (GNU Screen: C-a l / C-a C-l) */
+	lay->bindings['l'] = KEYS_ACTION_REDISPLAY;
+	lay->bindings[0x0C] = KEYS_ACTION_REDISPLAY;	/* Ctrl-L */
 }
 
 void
@@ -429,6 +437,7 @@ static const struct {
 	{ "new-window",		KEYS_ACTION_NEW_WINDOW },
 	{ "next-window",	KEYS_ACTION_NEXT_WINDOW },
 	{ "prev-window",	KEYS_ACTION_PREV_WINDOW },
+	{ "last-window",	KEYS_ACTION_LAST_WINDOW },
 	{ "swap-num-lower",	KEYS_ACTION_SWAP_NUM_LOWER },
 	{ "swap-num-higher",	KEYS_ACTION_SWAP_NUM_HIGHER },
 	{ "select-0",		KEYS_ACTION_SELECT_0 },
@@ -444,7 +453,7 @@ static const struct {
 	{ "kill-window",	KEYS_ACTION_KILL_WINDOW },
 	{ "detach",		KEYS_ACTION_DETACH },
 	{ "window-list",	KEYS_ACTION_WINDOW_LIST },
-	{ "status-toggle",	KEYS_ACTION_STATUS_TOGGLE },
+	{ "taskbar-toggle",	KEYS_ACTION_TASKBAR_TOGGLE },
 	{ "apps-menu",		KEYS_ACTION_APPS_MENU },
 	{ "split-h",		KEYS_ACTION_SPLIT_H },
 	{ "split-v",		KEYS_ACTION_SPLIT_V },
@@ -463,6 +472,8 @@ static const struct {
 	{ "clipboard-sync",	KEYS_ACTION_CLIPBOARD_SYNC },
 	{ "toggle-mode",	KEYS_ACTION_TOGGLE_MODE },
 	{ "arrange-grid",	KEYS_ACTION_ARRANGE_GRID },
+	{ "command",		KEYS_ACTION_COMMAND },
+	{ "redisplay",		KEYS_ACTION_REDISPLAY },
 	{ "none",		KEYS_ACTION_NONE },
 };
 

@@ -100,8 +100,10 @@ int tkbd_read(struct tkbd_stream *s, struct tkbd_seq *seq)
 	assert(buf+len <= s->buf+sizeof(s->buf));
 
 	int n = tkbd_parse(seq, buf, len);
-	s->bufpos += n;
-	s->buflen -= n;
+	if (n > 0) {
+		s->bufpos += n;
+		s->buflen -= n;
+	}
 
 	return n;
 }
@@ -430,6 +432,30 @@ static int parse_linux_seq(struct tkbd_seq *seq, const char *p, int len)
 	return 4;
 }
 
+// Map a Unicode keycode (as carried by the kitty "CSI code;mods u" form and
+// the xterm modifyOtherKeys "CSI 27;mods;code ~" form) to a TKBD_KEY_* value.
+static void map_csi_keycode(struct tkbd_seq *seq, int code)
+{
+	switch (code) {
+	case 8:		seq->key = TKBD_KEY_BACKSPACE; break;
+	case 9:		seq->key = TKBD_KEY_TAB; break;
+	case 13:	seq->key = TKBD_KEY_ENTER; break;
+	case 27:	seq->key = TKBD_KEY_ESC; break;
+	case 32:	seq->key = TKBD_KEY_SPACE; break;
+	case 127:	seq->key = TKBD_KEY_BACKSPACE2; break;
+	default:
+		if (code >= 'a' && code <= 'z')
+			seq->key = TKBD_KEY_A + (code - 'a');
+		else if (code >= '0' && code <= '9')
+			seq->key = code;
+		else if (code >= 0x20 && code <= 0x7E)
+			seq->key = code;
+		else
+			seq->key = TKBD_KEY_UNKNOWN;
+		break;
+	}
+}
+
 // Parse a special keyboard sequence and fill the zeroed seq structure.
 // No more than len bytes will be read from buf.
 //
@@ -505,10 +531,18 @@ static int parse_special_seq(struct tkbd_seq *seq, const char *buf, int len)
 	if (seqtype == '[' && finalbyte == '~') {
 		// ESC [ KEY ; MOD ~
 		// Ex: \E[5;3~ = ALT+PGUP
-		int parms[2] = {0};
+		//
+		// KEY == 27 is the xterm modifyOtherKeys form
+		// "CSI 27 ; MOD ; CODE ~" (formatOtherKeys=0), which
+		// iTerm2 emits for keys like Ctrl-A once that mode is
+		// enabled. The real key is the third parameter; decode
+		// it like the CSI u form so it maps to the same key.
+		int parms[3] = {0};
 		parse_seq_params(parms, ARRAYLEN(parms), parmdata);
 
-		if (parms[0] == 200)
+		if (parms[0] == 27)
+			map_csi_keycode(seq, parms[2]);
+		else if (parms[0] == 200)
 			seq->key = TKBD_KEY_PASTE_BEGIN;
 		else if (parms[0] == 201)
 			seq->key = TKBD_KEY_PASTE_END;
@@ -575,24 +609,7 @@ static int parse_special_seq(struct tkbd_seq *seq, const char *buf, int len)
 		int parms[2] = {0};
 		parse_seq_params(parms, ARRAYLEN(parms), parmdata);
 
-		switch (parms[0]) {
-		case 8:		seq->key = TKBD_KEY_BACKSPACE; break;
-		case 9:		seq->key = TKBD_KEY_TAB; break;
-		case 13:	seq->key = TKBD_KEY_ENTER; break;
-		case 27:	seq->key = TKBD_KEY_ESC; break;
-		case 32:	seq->key = TKBD_KEY_SPACE; break;
-		case 127:	seq->key = TKBD_KEY_BACKSPACE2; break;
-		default:
-			if (parms[0] >= 'a' && parms[0] <= 'z')
-				seq->key = TKBD_KEY_A + (parms[0] - 'a');
-			else if (parms[0] >= '0' && parms[0] <= '9')
-				seq->key = parms[0];
-			else if (parms[0] >= 0x20 && parms[0] <= 0x7E)
-				seq->key = parms[0];
-			else
-				seq->key = TKBD_KEY_UNKNOWN;
-			break;
-		}
+		map_csi_keycode(seq, parms[0]);
 
 		if (parms[1])
 			seq->mod = parms[1] - 1;
@@ -673,9 +690,6 @@ static int parse_mouse_seq(struct tkbd_seq *seq, const char *buf, int len)
 		case 3:
 			seq->key = TKBD_MOUSE_RELEASE;
 			break;
-		default:
-			// TODO: unknown sequence type instead of neg return
-			return -6;
 		}
 		seq->type = TKBD_MOUSE; // TBKB_KEY by default
 		if ((b & 32) != 0)
@@ -694,63 +708,55 @@ static int parse_mouse_seq(struct tkbd_seq *seq, const char *buf, int len)
 
 		return 6;
 	} else {
-		// xterm 1006 extended mode or urxvt 1015 extended mode
-		// xterm: \033 [ < Cb ; Cx ; Cy (M or m)
-		// urxvt: \033 [ Cb ; Cx ; Cy M
-		int i, mi = -1, starti = -1;
-		int isM, isU, s1 = -1, s2 = -1;
-		int n1 = 0, n2 = 0, n3 = 0;
+		// xterm 1006 (SGR): \033 [ < Cb ; Cx ; Cy (M or m)
+		// urxvt 1015:        \033 [ Cb ; Cx ; Cy M
+		//
+		// Scan only this sequence's parameter region (digits and
+		// ';'). A mouse report ends in 'M'/'m' immediately after
+		// exactly three numeric parameters. Any other terminator
+		// means this is some other CSI (a device report, focus
+		// event, ...): decline so parse_special_seq can handle it,
+		// and never scan past the sequence looking for a stray M.
+		int i, starti, isM, s1 = -1, s2 = -1, semis = 0;
+		int n1, n2, n3;
 
-		for (i = 0; i < len; i++) {
-			// We search the first (s1) and the last (s2) ';'
-			if (buf[i] == ';') {
+		starti = (buf[2] == '<') ? 3 : 2;
+
+		for (i = starti; i < len; i++) {
+			char c = buf[i];
+
+			if (c >= '0' && c <= '9')
+				continue;
+			if (c == ';') {
 				if (s1 == -1)
 					s1 = i;
 				s2 = i;
+				semis++;
+				continue;
 			}
-
-			// We search for the first 'm' or 'M'
-			if ((buf[i] == 'm' || buf[i] == 'M') && mi == -1) {
-				mi = i;
-				break;
-			}
+			break;
 		}
-		if (mi == -1)
-			return 0;
+		if (i >= len)
+			return 0;	// incomplete: caller waits for more
+		if ((buf[i] != 'M' && buf[i] != 'm') || semis != 2)
+			return 0;	// not a mouse report
 
-		// whether it's a capital M or not
-		isM = (buf[mi] == 'M');
-
-		if (buf[2] == '<') {
-			isU = 0;
-			starti = 3;
-		} else {
-			isU = 1;
-			starti = 2;
-		}
-
-		if (s1 == -1 || s2 == -1 || s1 == s2)
-			return 0;
-
+		isM = (buf[i] == 'M');
 		n1 = strtoul(&buf[starti], NULL, 10);
 		n2 = strtoul(&buf[s1 + 1], NULL, 10);
 		n3 = strtoul(&buf[s2 + 1], NULL, 10);
 
-		if (isU)
+		if (buf[2] != '<')	// urxvt encodes the button value +32
 			n1 -= 32;
 
 		switch (n1 & 3) {
 		case 0:
-			if ((n1&64) != 0)
-				seq->key = TKBD_MOUSE_WHEEL_UP;
-			else
-				seq->key = TKBD_MOUSE_LEFT;
+			seq->key = (n1 & 64) ?
+			    TKBD_MOUSE_WHEEL_UP : TKBD_MOUSE_LEFT;
 			break;
 		case 1:
-			if ((n1&64) != 0)
-				seq->key = TKBD_MOUSE_WHEEL_DOWN;
-			else
-				seq->key = TKBD_MOUSE_MIDDLE;
+			seq->key = (n1 & 64) ?
+			    TKBD_MOUSE_WHEEL_DOWN : TKBD_MOUSE_MIDDLE;
 			break;
 		case 2:
 			seq->key = TKBD_MOUSE_RIGHT;
@@ -758,8 +764,6 @@ static int parse_mouse_seq(struct tkbd_seq *seq, const char *buf, int len)
 		case 3:
 			seq->key = TKBD_MOUSE_RELEASE;
 			break;
-		default:
-			return mi + 1;
 		}
 
 		if (!isM) // on xterm mouse release is signaled by lowercase m
@@ -775,13 +779,51 @@ static int parse_mouse_seq(struct tkbd_seq *seq, const char *buf, int len)
 		seq->x = n2 > 0 ? n2 - 1 : 0;
 		seq->y = n3 > 0 ? n3 - 1 : 0;
 
-		seq->len = MIN((size_t)(mi + 1), TKBD_SEQ_MAX);
+		seq->len = MIN((size_t)(i + 1), TKBD_SEQ_MAX);
 		memcpy(seq->data, buf, seq->len);
 
-		return mi + 1;
+		return i + 1;
 	}
 
 	return 0;
+}
+
+// True when buf holds the unterminated start of a CSI or SS3 control
+// sequence (ESC [ ... or ESC O ...), or a truncated X10 mouse report,
+// with no terminating byte yet. A lone ESC is intentionally not treated
+// as incomplete: it is dispatched as the ESC key so it responds promptly
+// instead of stalling until the next keystroke.
+static int esc_seq_incomplete(const char *buf, int len)
+{
+	int i;
+
+	if (len < 2 || buf[0] != '\033')
+		return 0;
+	if (buf[1] != '[' && buf[1] != 'O')
+		return 0;
+
+	// X10 mouse: ESC [ M is followed by three coordinate bytes.
+	if (buf[1] == '[' && len >= 3 && buf[2] == 'M')
+		return len < 6;
+
+	// parameter/private bytes are 0x20-0x3F; a final byte (0x40-0x7E)
+	// terminates the sequence. running out first means incomplete.
+	for (i = 2; i < len; i++) {
+		unsigned char c = (unsigned char)buf[i];
+
+		if (c >= 0x20 && c <= 0x3F)
+			continue;
+		return 0;	// final or unexpected byte: not incomplete
+	}
+	return 1;
+}
+
+// True when buf ends partway through a multi-byte UTF-8 character.
+static int utf8_incomplete(const char *buf, int len)
+{
+	if (len < 1)
+		return 0;
+	return utf8_length[(unsigned char)buf[0]] > len;
 }
 
 // Parse mouse, special key, alt key, or ctrl key sequence and fill seq struct.
@@ -794,12 +836,23 @@ int tkbd_parse(struct tkbd_seq *seq, const char *buf, size_t sz)
 		return n;
 	if ((n = parse_special_seq(seq, buf, sz)))
 		return n;
+
+	// A truncated CSI/SS3 introducer (ESC [ or ESC O with no final
+	// byte yet) would otherwise be shredded by parse_alt_seq into
+	// ALT+[ plus stray characters. Ask for more bytes instead.
+	if (esc_seq_incomplete(buf, (int)sz))
+		return TKBD_INCOMPLETE;
+
 	if ((n = parse_alt_seq(seq, buf, sz)))
 		return n;
 	if ((n = parse_ctrl_seq(seq, buf, sz)))
 		return n;
 	if ((n = parse_char_seq(seq, buf, sz)))
 		return n;
+
+	// A partial multi-byte UTF-8 character at the tail needs more bytes.
+	if (utf8_incomplete(buf, (int)sz))
+		return TKBD_INCOMPLETE;
 
 	return 0;
 }

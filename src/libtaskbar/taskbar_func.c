@@ -1,8 +1,8 @@
-/* status_func.c : built-in functions for status line expansion */
+/* taskbar_func.c : built-in functions for taskbar expansion */
 /* Copyright (c) 2026 Jon Mayo
  * Licensed under MIT-0 OR PUBLIC DOMAIN */
 
-#include "status_int.h"
+#include "taskbar_int.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,7 +23,7 @@ split_num_arg(const char *args, const char **text)
 }
 
 static char *
-func_firstword(struct status *s, const char *args)
+func_firstword(struct taskbar *s, const char *args)
 {
 	const char *p, *start;
 
@@ -33,11 +33,11 @@ func_firstword(struct status *s, const char *args)
 	start = p;
 	while (*p && *p != ' ' && *p != '\t')
 		p++;
-	return status_arena_strndup(s, start, (int)(p - start));
+	return taskbar_arena_strndup(s, start, (int)(p - start));
 }
 
 static char *
-func_lastword(struct status *s, const char *args)
+func_lastword(struct taskbar *s, const char *args)
 {
 	const char *p, *last_start, *last_end;
 
@@ -55,20 +55,20 @@ func_lastword(struct status *s, const char *args)
 		last_end = p;
 	}
 	if (!last_start)
-		return status_arena_strdup(s, "");
-	return status_arena_strndup(s, last_start,
+		return taskbar_arena_strdup(s, "");
+	return taskbar_arena_strndup(s, last_start,
 	    (int)(last_end - last_start));
 }
 
 static char *
-func_word(struct status *s, const char *args)
+func_word(struct taskbar *s, const char *args)
 {
 	int n, cur;
 	const char *text, *start, *end;
 
 	n = split_num_arg(args, &text);
 	if (n < 1)
-		return status_arena_strdup(s, "");
+		return taskbar_arena_strdup(s, "");
 
 	cur = 0;
 	start = text;
@@ -82,15 +82,15 @@ func_word(struct status *s, const char *args)
 			end++;
 		cur++;
 		if (cur == n)
-			return status_arena_strndup(s, start,
+			return taskbar_arena_strndup(s, start,
 			    (int)(end - start));
 		start = end;
 	}
-	return status_arena_strdup(s, "");
+	return taskbar_arena_strdup(s, "");
 }
 
 static char *
-func_words(struct status *s, const char *args)
+func_words(struct taskbar *s, const char *args)
 {
 	int count;
 	const char *p;
@@ -108,18 +108,18 @@ func_words(struct status *s, const char *args)
 			p++;
 	}
 	snprintf(buf, sizeof(buf), "%d", count);
-	return status_arena_strdup(s, buf);
+	return taskbar_arena_strdup(s, buf);
 }
 
 static char *
-func_strip(struct status *s, const char *args)
+func_strip(struct taskbar *s, const char *args)
 {
 	const char *p;
 	char *out;
 	int len, pos, in_space;
 
 	len = (int)strlen(args);
-	out = status_arena_alloc(s, len + 1);
+	out = taskbar_arena_alloc(s, len + 1);
 	pos = 0;
 	in_space = 1; /* suppress leading */
 	p = args;
@@ -143,7 +143,7 @@ func_strip(struct status *s, const char *args)
 }
 
 static char *
-func_truncate(struct status *s, const char *args)
+func_truncate(struct taskbar *s, const char *args)
 {
 	int n;
 	const char *text;
@@ -154,12 +154,12 @@ func_truncate(struct status *s, const char *args)
 		n = 0;
 	len = (int)strlen(text);
 	if (len <= n)
-		return status_arena_strdup(s, text);
-	return status_arena_strndup(s, text, n);
+		return taskbar_arena_strdup(s, text);
+	return taskbar_arena_strndup(s, text, n);
 }
 
 static char *
-func_left(struct status *s, const char *args)
+func_left(struct taskbar *s, const char *args)
 {
 	int n, len, i;
 	const char *text;
@@ -169,7 +169,7 @@ func_left(struct status *s, const char *args)
 	if (n < 0)
 		n = 0;
 	len = (int)strlen(text);
-	out = status_arena_alloc(s, n + 1);
+	out = taskbar_arena_alloc(s, n + 1);
 	for (i = 0; i < n; i++) {
 		if (i < len)
 			out[i] = text[i];
@@ -181,7 +181,7 @@ func_left(struct status *s, const char *args)
 }
 
 static char *
-func_right(struct status *s, const char *args)
+func_right(struct taskbar *s, const char *args)
 {
 	int n, len, pad, i;
 	const char *text;
@@ -191,7 +191,7 @@ func_right(struct status *s, const char *args)
 	if (n < 0)
 		n = 0;
 	len = (int)strlen(text);
-	out = status_arena_alloc(s, n + 1);
+	out = taskbar_arena_alloc(s, n + 1);
 	pad = n - len;
 	if (pad < 0)
 		pad = 0;
@@ -204,7 +204,7 @@ func_right(struct status *s, const char *args)
 }
 
 static char *
-func_center(struct status *s, const char *args)
+func_center(struct taskbar *s, const char *args)
 {
 	int n, len, lpad, rpad, i, pos;
 	const char *text;
@@ -215,10 +215,10 @@ func_center(struct status *s, const char *args)
 		n = 0;
 	len = (int)strlen(text);
 	if (len >= n)
-		return status_arena_strndup(s, text, n);
+		return taskbar_arena_strndup(s, text, n);
 	lpad = (n - len) / 2;
 	rpad = n - len - lpad;
-	out = status_arena_alloc(s, n + 1);
+	out = taskbar_arena_alloc(s, n + 1);
 	pos = 0;
 	for (i = 0; i < lpad; i++)
 		out[pos++] = ' ';
@@ -233,31 +233,31 @@ func_center(struct status *s, const char *args)
 #define FILL_SENTINEL '\x01'
 
 static char *
-func_fill(struct status *s, const char *args)
+func_fill(struct taskbar *s, const char *args)
 {
 	char *out;
 
 	(void)args;
-	out = status_arena_alloc(s, 2);
+	out = taskbar_arena_alloc(s, 2);
 	out[0] = FILL_SENTINEL;
 	out[1] = '\0';
 	return out;
 }
 
 static char *
-func_shell(struct status *s, const char *cmd)
+func_shell(struct taskbar *s, const char *cmd)
 {
 	FILE *fp;
 	char buf[256];
 	char *out;
 	int len;
 
-	if (!status_shell_allowed(s, cmd))
-		return status_arena_strdup(s, "");
+	if (!taskbar_shell_allowed(s, cmd))
+		return taskbar_arena_strdup(s, "");
 
 	fp = popen(cmd, "r");
 	if (!fp)
-		return status_arena_strdup(s, "");
+		return taskbar_arena_strdup(s, "");
 
 	len = 0;
 	while (len < (int)sizeof(buf) - 1) {
@@ -273,11 +273,11 @@ func_shell(struct status *s, const char *cmd)
 	while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
 		len--;
 	buf[len] = '\0';
-	out = status_arena_strdup(s, buf);
+	out = taskbar_arena_strdup(s, buf);
 	return out;
 }
 
-const struct status_func_entry status_func_table[] = {
+const struct taskbar_func_entry taskbar_func_table[] = {
 	{ "firstword",	func_firstword },
 	{ "lastword",	func_lastword },
 	{ "word",	func_word },
@@ -291,5 +291,5 @@ const struct status_func_entry status_func_table[] = {
 	{ "shell",	func_shell },
 };
 
-const int status_func_count =
-    (int)(sizeof(status_func_table) / sizeof(status_func_table[0]));
+const int taskbar_func_count =
+    (int)(sizeof(taskbar_func_table) / sizeof(taskbar_func_table[0]));

@@ -79,7 +79,7 @@ test_dotted_shorthand(void)
 
 	path = write_tmp(
 	    "core.shell = /bin/zsh\n"
-	    "status.position = bottom\n"
+	    "taskbar.position = bottom\n"
 	);
 	CHECK(path != NULL, "tmpfile created");
 	if (!path)
@@ -89,8 +89,8 @@ test_dotted_shorthand(void)
 	CHECK(cfg_load(c, path) == 0, "load succeeds");
 	CHECK(strcmp(cfg_get(c, "core.shell"), "/bin/zsh") == 0,
 	    "dotted: core.shell = /bin/zsh");
-	CHECK(strcmp(cfg_get(c, "status.position"), "bottom") == 0,
-	    "dotted: status.position = bottom");
+	CHECK(strcmp(cfg_get(c, "taskbar.position"), "bottom") == 0,
+	    "dotted: taskbar.position = bottom");
 
 	cfg_free(c);
 	unlink(path);
@@ -254,7 +254,7 @@ test_merge_files(void)
 	char *p1, *p2;
 
 	p1 = write_tmp("[core]\nshell = /bin/sh\n");
-	p2 = write_tmp("[status]\nposition = top\n");
+	p2 = write_tmp("[taskbar]\nposition = top\n");
 	CHECK(p1 != NULL && p2 != NULL, "tmpfiles created");
 	if (!p1 || !p2) {
 		free(p1);
@@ -267,7 +267,7 @@ test_merge_files(void)
 	CHECK(cfg_load(c, p2) == 0, "second load merges");
 	CHECK(strcmp(cfg_get(c, "core.shell"), "/bin/sh") == 0,
 	    "key from first file");
-	CHECK(strcmp(cfg_get(c, "status.position"), "top") == 0,
+	CHECK(strcmp(cfg_get(c, "taskbar.position"), "top") == 0,
 	    "key from second file");
 
 	cfg_free(c);

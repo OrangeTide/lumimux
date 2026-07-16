@@ -6,6 +6,7 @@
 #include "tui_pad.h"
 #include "tui_list.h"
 #include "ipc_msg.h"
+#include "ipc_transport.h"
 #include "utf8.h"
 #include "tkbd.h"
 
@@ -252,8 +253,8 @@ emo_insert(struct app_ctx *ctx)
 
 	e = &emoji_table[emo.filtered[emo.list.sel]];
 	len = utf8_encode(utf8, e->codepoint);
-	if (len > 0)
-		ipc_msg_send(ctx->input_fd, IPC_MSG_INPUT,
+	if (len > 0 && ctx->input_t)
+		ipc_transport_send(ctx->input_t, IPC_MSG_INPUT,
 		    utf8, (uint32_t)len);
 }
 

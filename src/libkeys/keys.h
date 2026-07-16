@@ -21,6 +21,7 @@ enum keys_action {
 	KEYS_ACTION_NEW_WINDOW,
 	KEYS_ACTION_NEXT_WINDOW,
 	KEYS_ACTION_PREV_WINDOW,
+	KEYS_ACTION_LAST_WINDOW,	/* bounce to most-recently-used window */
 	KEYS_ACTION_SELECT_0,
 	KEYS_ACTION_SELECT_1,
 	KEYS_ACTION_SELECT_2,
@@ -34,7 +35,7 @@ enum keys_action {
 	KEYS_ACTION_KILL_WINDOW,
 	KEYS_ACTION_DETACH,
 	KEYS_ACTION_WINDOW_LIST,
-	KEYS_ACTION_STATUS_TOGGLE,
+	KEYS_ACTION_TASKBAR_TOGGLE,
 	KEYS_ACTION_APPS_MENU,
 	KEYS_ACTION_SPLIT_H,
 	KEYS_ACTION_SPLIT_V,
@@ -55,6 +56,8 @@ enum keys_action {
 	KEYS_ACTION_ARRANGE_GRID,
 	KEYS_ACTION_SWAP_NUM_LOWER,	/* swap number with next lower window */
 	KEYS_ACTION_SWAP_NUM_HIGHER,	/* swap number with next higher window */
+	KEYS_ACTION_COMMAND,		/* open the command input line */
+	KEYS_ACTION_REDISPLAY,		/* resync + fully repaint the screen */
 };
 
 /* state of the prefix key state machine */

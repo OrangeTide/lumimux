@@ -4,6 +4,7 @@
 
 #include "app.h"
 #include "ipc_msg.h"
+#include "ipc_transport.h"
 #include "tui_pad.h"
 #include "tui_box.h"
 #include "tui_sep.h"
@@ -52,8 +53,8 @@ calc_format(double v)
 static void
 calc_insert(struct app_ctx *ctx, const char *display, int len)
 {
-	if (len > 0)
-		ipc_msg_send(ctx->input_fd, IPC_MSG_INPUT, display, len);
+	if (len > 0 && ctx->input_t)
+		ipc_transport_send(ctx->input_t, IPC_MSG_INPUT, display, len);
 }
 
 static double

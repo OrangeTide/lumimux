@@ -78,7 +78,7 @@ Pressing the prefix key shows a guided menu of all available actions.
 | **0**--**9** | Select window by number |
 | **d**, **D** | Detach from session |
 | **w**, **"** | Window list |
-| **s** | Toggle status bar |
+| **s** | Toggle taskbar |
 | **q** | Applications menu |
 | **[**, **Escape** | Enter scrollback mode |
 | **h** | Split pane horizontally |
@@ -119,7 +119,7 @@ full specification.
 
 Key configuration sections: **[attach]** (mode), **[keys]** (prefix),
 **[bind]** (key bindings and layers), **[menu]** (colors),
-**[status]** (format and position), **[ui]** (theme).
+**[taskbar]** (format and position), **[ui]** (theme).
 
 # QUICK START
 
@@ -189,7 +189,7 @@ socket, and routes input/output by file descriptor.
      +------------------+          +--------+ +--------+ +--------+
      | stdin -> tkbd    |--INPUT-->| PTY+VT | | PTY+VT | | PTY+VT |
      | vt_parse+render  |<-OUTPUT--+--------+ +--------+ +--------+
-     | status line      |          mserver 0  mserver 1  mserver 2
+     | taskbar          |          mserver 0  mserver 1  mserver 2
      +------------------+                 |        |        |
             ^           sessdir discovery |        |        |
             +-----------------------------+--------+--------+

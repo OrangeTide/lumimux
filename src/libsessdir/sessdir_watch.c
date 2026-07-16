@@ -4,6 +4,7 @@
 #include "sessdir_watch.h"
 #include "sessdir.h"
 
+#include <errno.h>
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -39,15 +40,19 @@ sessdir_watch_start(const char *session)
 
 	kq = kqueue();
 	if (kq < 0) {
+		int saved = errno;
 		close(dirfd);
+		errno = saved;
 		return -1;
 	}
 
 	EV_SET(&ev, dirfd, EVFILT_VNODE, EV_ADD | EV_CLEAR,
 	    NOTE_WRITE | NOTE_DELETE | NOTE_RENAME, 0, NULL);
 	if (kevent(kq, &ev, 1, NULL, 0, NULL) < 0) {
+		int saved = errno;
 		close(kq);
 		close(dirfd);
+		errno = saved;
 		return -1;
 	}
 
@@ -106,7 +111,9 @@ sessdir_watch_start(const char *session)
 	    IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO);
 	free(path);
 	if (wd < 0) {
+		int saved = errno;
 		close(fd);
+		errno = saved;
 		return -1;
 	}
 

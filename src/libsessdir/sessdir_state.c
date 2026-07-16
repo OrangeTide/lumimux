@@ -569,3 +569,54 @@ sessdir_state_swap_num(struct sessdir_state *st, pid_t a, pid_t b)
 	flock(st->fd, LOCK_UN);
 	return rc;
 }
+
+int
+sessdir_state_set_num(struct sessdir_state *st, pid_t pid, int target)
+{
+	struct parse_ctx ctx;
+	int i, sa = -1, rc;
+	int cap = (int)(sizeof(ctx.nums) / sizeof(ctx.nums[0]));
+
+	if (target < 0 || target >= cap)
+		return -1;
+
+	flock(st->fd, LOCK_EX);
+	state_parse(st, &ctx);
+
+	for (i = 0; i < ctx.nnums; i++) {
+		if (ctx.nums[i] == pid) {
+			sa = i;
+			break;
+		}
+	}
+	if (sa < 0) {
+		flock(st->fd, LOCK_UN);
+		return -1;
+	}
+	if (target == sa) {
+		flock(st->fd, LOCK_UN);
+		return 0;
+	}
+
+	if (target < ctx.nnums) {
+		/* target slot exists: swap with its occupant (a real pid or
+		 * a spare), so a busy target renumbers like GNU screen. */
+		pid_t tmp = ctx.nums[target];
+
+		ctx.nums[target] = pid;
+		ctx.nums[sa] = tmp;
+	} else {
+		/* extend the map with spares up to target, then move the
+		 * window there and leave its old slot a spare. */
+		for (i = ctx.nnums; i < target; i++)
+			ctx.nums[i] = 0;
+		ctx.nums[target] = pid;
+		ctx.nums[sa] = 0;
+		ctx.nnums = target + 1;
+	}
+
+	rc = state_write(st, ctx.focus, ctx.order, ctx.norder,
+	    ctx.nums, ctx.nnums);
+	flock(st->fd, LOCK_UN);
+	return rc;
+}

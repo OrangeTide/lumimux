@@ -42,7 +42,7 @@ action_label(enum keys_action action)
 	case KEYS_ACTION_KILL_WINDOW:	return "Kill window";
 	case KEYS_ACTION_DETACH:	return "Detach";
 	case KEYS_ACTION_WINDOW_LIST:	return "Window list";
-	case KEYS_ACTION_STATUS_TOGGLE:	return "Toggle status";
+	case KEYS_ACTION_TASKBAR_TOGGLE:	return "Toggle taskbar";
 	case KEYS_ACTION_APPS_MENU:	return "Quick Apps";
 	case KEYS_ACTION_SPLIT_H:	return "Split horiz";
 	case KEYS_ACTION_SPLIT_V:	return "Split vert";
@@ -51,6 +51,7 @@ action_label(enum keys_action action)
 	case KEYS_ACTION_CLOSE_PANE:	return "Close pane";
 	case KEYS_ACTION_RESIZE_PANE:	return "Resize pane";
 	case KEYS_ACTION_WINDOW_COLORS:	return "Window colors";
+	case KEYS_ACTION_REDISPLAY:	return "Redisplay";
 	default:			return NULL;
 	}
 }
@@ -290,17 +291,6 @@ menu_input(struct iox_loop *loop, const struct tkbd_seq *seq)
 		enum keys_action action;
 
 		action = keys_get_binding(keybinds, (uint8_t)seq->ch);
-		if (action == KEYS_ACTION_SEND_PREFIX) {
-			/* prefix key while menu is visible -- restart
-			 * prefix sequence so the next key determines the
-			 * action.  The main loop sees keys state PREFIX
-			 * and handles the timeout. */
-			menu_visible = 0;
-			overlay_pop();
-			keys_reset(keybinds);
-			keys_feed(keybinds, (uint8_t)seq->ch);
-			return;
-		}
 		if (action == KEYS_ACTION_WINDOW_LIST) {
 			keys_reset(keybinds);
 			if (menu_acc >= 0) {

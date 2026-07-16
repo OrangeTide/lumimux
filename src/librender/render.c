@@ -821,3 +821,14 @@ render_move_cursor(struct render *r, int fd, int row, int col)
 	r->cur_row = row;
 	r->cur_col = col;
 }
+
+/* Forget the tracked cursor position so the next render_move_cursor()
+ * always emits an absolute move.  Callers that write bytes directly to
+ * the terminal (bypassing this renderer) must invalidate afterward, or
+ * the cache goes stale and a subsequent move is wrongly skipped. */
+void
+render_invalidate_cursor(struct render *r)
+{
+	r->cur_row = -1;
+	r->cur_col = -1;
+}

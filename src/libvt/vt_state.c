@@ -78,6 +78,12 @@ vt_state_set_reply_fd(struct vt_state *st, int fd)
 	st->reply_fd = fd;
 }
 
+void
+vt_state_set_altscreen_scrollback(struct vt_state *st, int on)
+{
+	st->capture_alt_scroll = on ? 1 : 0;
+}
+
 /* push a new entry onto the kitty keyboard flag stack; when the stack is
  * full the oldest entry is dropped, matching the kitty protocol */
 void
@@ -126,6 +132,13 @@ const char *
 vt_state_title(const struct vt_state *st)
 {
 	return st->title;
+}
+
+void
+vt_state_set_title(struct vt_state *st, const char *title)
+{
+	free(st->title);
+	st->title = (title && title[0]) ? strdup(title) : NULL;
 }
 
 #define TITLE_STACK_MAX 16
@@ -231,6 +244,30 @@ vt_state_altscreen_enter(struct vt_state *st)
 	st->scroll_bot = rows;
 }
 
+/* number of alt rows up to and including the last one with visible text,
+ * so trailing blank rows are not pushed into scrollback as empty history. */
+static int
+alt_content_rows(struct vt_buf *b)
+{
+	int rows = vt_buf_rows(b);
+	int cols = vt_buf_cols(b);
+	int r, c, last = -1;
+
+	for (r = 0; r < rows; r++) {
+		struct vt_row *row = vt_buf_row(b, r);
+
+		for (c = 0; c < cols; c++) {
+			uint32_t cp = row->cells[c].codepoint;
+
+			if (cp != ' ' && cp != 0) {
+				last = r;
+				break;
+			}
+		}
+	}
+	return last + 1;
+}
+
 void
 vt_state_altscreen_leave(struct vt_state *st)
 {
@@ -238,6 +275,17 @@ vt_state_altscreen_leave(struct vt_state *st)
 		return;
 
 	st->modes &= ~VT_MODE_ALTSCREEN;
+
+	/* preserve the alt-screen content as scrollback history before the
+	 * alt buffer is destroyed (no-op unless enabled and primary has a
+	 * scrollback ring). */
+	if (st->capture_alt_scroll && st->targets[VT_TARGET_ALT]) {
+		int n = alt_content_rows(st->targets[VT_TARGET_ALT]);
+
+		if (n > 0)
+			vt_buf_push_rows(st->targets[VT_TARGET_PRIMARY],
+			    st->targets[VT_TARGET_ALT], 0, n);
+	}
 
 	/* destroy alt screen */
 	vt_buf_free(st->targets[VT_TARGET_ALT]);
@@ -516,11 +564,15 @@ vt_state_dump(struct vt_state *st, vt_dump_fn emit, void *ctx)
 	int esc_len;
 
 	/* reset terminal state */
-	emit(ctx, "\033[0m\033[2J\033[H", 12);
+	emit(ctx, "\033[0m\033[2J\033[H", 11);
 
-	/* alt screen mode if active */
+	/* select the correct screen.  emit the mode explicitly (not only
+	 * when alt is active) so a replay fed into an existing client VT
+	 * that is already on the other screen is corrected either way. */
 	if (st->modes & VT_MODE_ALTSCREEN)
 		emit(ctx, "\033[?1049h", 8);
+	else
+		emit(ctx, "\033[?1049l", 8);
 
 	/* restore window title */
 	if (st->title && st->title[0]) {

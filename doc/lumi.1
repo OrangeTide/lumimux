@@ -79,6 +79,7 @@ Attach to an existing session.
 .B lumi attach
 .RB [ "\-f window" ]
 .RB [ "\-m mode" ]
+.RB [ \-n ]
 .RB [ "\-s name" ]
 .RI [ name ]
 .TP
@@ -90,6 +91,34 @@ UI mode:
 .BR screen " (default),"
 .BR turbo ,
 .BR minimal .
+.TP
+.B \-n
+Connect through the session's
+.B lumi net-proxy
+over an encrypted netchan link instead of the local Unix sockets.
+.RB "With a local " name ,
+the proxy must already be running for the session (see
+.BR "lumi net-proxy" );
+the endpoint and pre-shared key are read from the
+.I net-addr
+and
+.I net-key
+files the proxy published in the session directory and dialed on the
+loopback interface.
+.RB "With an scp-style remote " name " (" host : session ),
+.B lumi attach
+starts the proxy on
+.I host
+over
+.BR ssh (1)
+with
+.BR "lumi net-proxy \-d" ,
+reads the endpoint and key it reports back through the ssh channel, and
+then dials that endpoint directly.
+Window I/O flows over the encrypted netchan link rather than through ssh.
+.IP
+The link roams: if the client's network changes, the session follows the
+new address automatically without reattaching.
 .TP
 .BI \-s " name"
 Session name (default:
@@ -258,13 +287,63 @@ and watches for new or removed windows.
 .TP
 .BI \-s " session"
 Session name (required).
+.SS lumi net-proxy
+Networked equivalent of
+.B lumi proxy
+that bridges a session over a reliable UDP (netchan) transport instead of
+an SSH pipe.
+It binds a UDP endpoint, publishes it as
+.I net-addr
+in the session directory, accepts one client, and multiplexes the I/O of
+all micro-servers in the session over a single reliable channel.
+.PP
+The link is encrypted (X25519 handshake, XChaCha20-Poly1305 per packet).
+The proxy mints a random pre-shared key at startup and publishes it as
+.I net-key
+in the session directory, readable only by the owner.
+A client both encrypts with and authenticates against this key, so an
+attacker who cannot read the session directory cannot connect.
+Both files are removed when the proxy exits.
+This is part of the networked-connections work and is not yet launched
+automatically by
+.BR "lumi attach" .
+Connect to it with
+.BR "lumi attach \-n" .
+.PP
+.B lumi net-proxy
+.B \-s
+.I session
+.RB [ \-b
+.IR addr ]
+.RB [ \-p
+.IR port ]
+.RB [ \-d ]
+.TP
+.BI \-s " session"
+Session name (required).
+.TP
+.BI \-b " addr"
+Bind address for the UDP endpoint (default: all interfaces).
+.TP
+.BI \-p " port"
+UDP port to listen on (default: an ephemeral port, reported in
+.IR net-addr ).
+.TP
+.B \-d
+Daemon bootstrap for the cross-host attach path.
+Print one line,
+.RI \(dq "udp " port " " key \(dq,
+on standard output reporting the bound port and the hex-encoded
+pre-shared key, then detach and keep serving in the background.
+.B lumi attach \-n
+runs this over ssh to learn where and how to connect.
 .SH KEY BINDINGS
 All key bindings use a prefix key (default:
 .BR Ctrl\-A )
 followed by a second key.
-Press the prefix key twice, or press
-.BR a ,
-to send a literal
+Press
+.B a
+after the prefix to send a literal
 .B Ctrl\-A
 to the terminal.
 .PP
@@ -276,12 +355,13 @@ c, C	Create new window
 k, K	Kill current window
 n, Space, Ctrl\-Space, Ctrl\-N	Next window
 p, Ctrl\-P	Previous window
+Ctrl\-A	Last window (most recently used)
 0\-9	Select window by number
 ,	Swap number with next lower window
 .	Swap number with next higher window
 d, D	Detach from session
 w, "	Window list
-s	Toggle status bar
+s	Toggle taskbar
 q	Applications menu
 [, Escape	Enter scrollback mode
 h	Split pane horizontally
@@ -299,6 +379,8 @@ I	Toggle input lock
 U	Session picker
 ]	Paste from internal clipboard
 y	Sync internal clipboard to system
+:	Open the command input line
+l, Ctrl\-L	Redisplay (resync and repaint the screen)
 .TE
 .PP
 Window numbers are stable: closing a window does not renumber the
@@ -311,6 +393,17 @@ and
 .B .
 to swap the current window's number with the next lower or higher
 numbered window.
+.PP
+.B Next window
+and
+.B Previous window
+step through windows in numeric order.
+.B Last window
+.RB ( "Ctrl\-A Ctrl\-A" )
+instead jumps to the most recently used window, so pressing it
+repeatedly toggles between the two most recent windows.
+Closing the current window returns to the most recently used of the
+windows that remain, rather than to the lowest-numbered one.
 .SH CONFIGURATION
 The configuration file is loaded from:
 .PP
@@ -346,7 +439,7 @@ Dotted shorthand may be used outside a section block:
 .PP
 .RS 4
 .nf
-status.position = bottom
+taskbar.position = bottom
 .fi
 .RE
 .PP
@@ -354,7 +447,7 @@ is equivalent to:
 .PP
 .RS 4
 .nf
-[status]
+[taskbar]
 position = bottom
 .fi
 .RE
@@ -369,6 +462,18 @@ Overridden by the
 .B \-m
 command-line flag.
 .TP
+.B attach.altscreen-scrollback
+When
+.BR true ", " yes ", or " 1 ,
+content shown by full-screen applications (those using the alternate
+screen, such as editors and pagers) is copied into the window's scrollback
+when the application exits, so
+.B Ctrl\-A [
+can review it.
+Trailing blank lines are trimmed.
+Default: off, because applications that toggle the alternate screen often
+(for example during startup) can leave confusing partial history.
+.TP
 .B keys.prefix
 Change the prefix key.
 Accepts
@@ -379,20 +484,37 @@ below).
 Default:
 .BR C\-a .
 .TP
-.B status.format
-Status bar format string.
+.B taskbar.format
+Taskbar format string.
 Supports variable expansion and built-in functions.
+.IP
+When the session directory watch is unavailable, the taskbar is
+prefixed with a fixed
+.B [!watch]
+marker.
+This marker means
+.B lumi attach
+could not subscribe to live window changes (for example, the system ran
+out of
+.BR inotify (7)
+instances).
+Windows you create yourself still appear, but windows created or closed
+by other clients attached to the same session will not update live until
+the next rescan.
+The marker is shown independently of
+.B taskbar.format
+so the degraded state is always visible.
 .TP
-.B status.position
-Status bar position:
+.B taskbar.position
+Taskbar position:
 .BR top " or " bottom .
 Default:
 .BR top .
 .TP
-.B status.shell_allow
+.B taskbar.shell_allow
 Comma-separated
 .BR fnmatch (3)
-patterns for shell commands allowed in status bar
+patterns for shell commands allowed in taskbar
 .B $(shell ...)
 expansions.
 .TP
@@ -484,7 +606,7 @@ swap\-num\-higher	Swap number with next higher window
 kill\-window	Kill current window
 detach	Detach from session
 window\-list	Show window list
-status\-toggle	Toggle status bar
+taskbar\-toggle	Toggle taskbar
 apps\-menu	Applications menu
 split\-h	Split horizontally
 split\-v	Split vertically
@@ -502,7 +624,9 @@ input\-lock	Toggle input lock
 session\-list	Session picker
 paste	Paste from internal clipboard
 clipboard\-sync	Sync internal clipboard to system
+command	Open the command input line
 arrange\-grid	Arrange windows in grid (turbo mode)
+redisplay	Resync and repaint the screen
 none	Unbind key
 .TE
 .SH SCROLLBACK MODE
@@ -510,10 +634,35 @@ Enter scrollback mode with
 .B Ctrl\-A [
 or
 .BR "Ctrl\-A Escape" .
-In scrollback mode:
+Scrollback mode presents a movable copy cursor and vi-style keyboard
+selection.
 .TP
-.BR "Up" ", " "Down" ", " "Page Up" ", " "Page Down"
-Scroll through history.
+.BR "h" ", " "j" ", " "k" ", " "l" ", arrows"
+Move the copy cursor left, down, up, and right.
+Moving past the top or bottom edge scrolls the history.
+.TP
+.BR "0" ", " "$"
+Move to the start or end of the line.
+.TP
+.BR "g" ", " "G"
+Jump to the oldest history line or the live bottom.
+.TP
+.BR "Page Up" ", " "Page Down" ", " "Ctrl\-U" ", " "Ctrl\-D"
+Move a half page up or down.
+.TP
+.BR "v" ", " "V" ", " "Ctrl\-V"
+Begin a character, line, or rectangular block selection at the copy
+cursor.
+Movement then extends the selection.
+.TP
+.B Space
+Set the selection mark, or, if a selection is active, copy it and exit.
+.TP
+.BR y ", " Enter
+Copy the selection to the internal clipboard and exit scrollback mode.
+.TP
+.B Escape
+Cancel an active selection, or exit scrollback mode when none is active.
 .TP
 .B Mouse wheel
 Scroll up and down.
@@ -522,11 +671,60 @@ Scroll up and down.
 Select text.
 Selected text is copied to the internal clipboard on mouse release.
 .TP
-.BR q ", " Escape
+.B q
 Exit scrollback mode.
 .PP
 A scrollbar is displayed on the right edge of the window in turbo mode.
-Selection highlighting is constrained to the visible window bounds.
+Selection highlighting is constrained to the visible window bounds; a
+keyboard selection is likewise limited to the currently visible screen.
+Use
+.B Ctrl\-A ]
+to paste the copied text into the focused window.
+.SH COMMAND LINE
+.B Ctrl\-A :
+opens a one-line command prompt at the bottom of the screen, similar to
+the same binding in GNU screen.
+Type a directive and press Enter to run it, or Escape to cancel.
+The following directives are recognized:
+.TP
+.BI setenv " VAR value"
+Set an environment variable used when creating new windows.
+The value may be double-quoted to include spaces
+.RI ( "setenv G \(dqhello world\(dq" ).
+Existing windows are unaffected.
+.TP
+.BI unsetenv " VAR"
+Remove a variable from the environment used for new windows.
+.TP
+.BI title " text"
+Override the current window's displayed title with
+.IR text .
+The override is client-side and takes precedence over the title the
+running program sets via OSC 0/2, so it does not get clobbered when the
+program updates its own title.
+The text may be double-quoted to include leading or trailing spaces.
+Run
+.B title
+with no argument to clear the override and let the program's live
+title show through again.
+.TP
+.BI number " N"
+Renumber the current window to the stable window number
+.IR N .
+If another window already holds
+.IR N ,
+the two windows exchange numbers; otherwise the window moves into that
+slot and its old number becomes a spare.
+.B renumber
+is an accepted alias.
+See also
+.B Ctrl\-A ,
+and
+.B Ctrl\-A .
+which bump the current window's number to the adjacent slot.
+.PP
+An unrecognized or malformed directive leaves the prompt open with an
+error message; any key dismisses it.
 .SH MOUSE
 In
 .B turbo
@@ -547,6 +745,9 @@ Focus window and deliver click to the application.
 In all modes, mouse text selection copies to the internal clipboard.
 Double-click selects a word; triple-click selects a full line.
 Dragging after a double- or triple-click extends by word or line units.
+A visible selection is dismissed when the foreground window changes,
+when scrollback mode is entered or left, and when windows are moved or
+rearranged, since it is pinned to screen coordinates.
 Use
 .B Ctrl\-A ]
 to paste and
@@ -579,6 +780,12 @@ terminal.
 .B DCS pass-through
 SIXEL graphics and other DCS sequences are passed through to the
 outer terminal when a single pane is focused in screen mode.
+.TP
+.B Desktop notifications
+Notification escape sequences emitted by child applications
+(kitty OSC 99, the simple OSC 9 form, and OSC 777) are passed through
+to the outer terminal so pop-ups reach the user, regardless of which
+window is in the foreground.
 .TP
 .B Cursor shape
 DECSCUSR (CSI Ps SP q) cursor shape changes are forwarded.

@@ -17,9 +17,9 @@ enum client_mode client_mode;
 struct vt_state *vt;
 struct txl *txl;
 struct keys *keybinds;
-struct status *statusbar;
+struct taskbar *taskbar;
 const struct tui_theme *theme;
-int status_visible = 1;
+int taskbar_visible = 1;
 int content_rows, content_cols;
 
 struct tui_stack overlay;
@@ -34,7 +34,7 @@ struct app_ctx app_context;
 
 void (*overlay_repaint_fn)(void);
 
-static int status_line_dirty = 1;
+static int taskbar_dirty = 1;
 
 /* ---- overlay helpers ---- */
 
@@ -76,13 +76,13 @@ overlay_merge_prev(int *r1, int *c1, int *r2, int *c2)
 }
 
 static void
-overlay_repaint_status(void)
+overlay_repaint_taskbar(void)
 {
 	struct winsize ws;
 
-	if (status_visible && ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0) {
-		status_line_dirty = 1;
-		render_status_line(STDOUT_FILENO, ws.ws_row, ws.ws_col);
+	if (taskbar_visible && ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0) {
+		taskbar_dirty = 1;
+		render_taskbar(STDOUT_FILENO, ws.ws_row, ws.ws_col);
 	}
 }
 
@@ -147,7 +147,7 @@ overlay_pop(void)
 	}
 
 	if (!overlay_visible && !overlay_repaint_fn)
-		overlay_repaint_status();
+		overlay_repaint_taskbar();
 }
 
 void
@@ -172,13 +172,13 @@ overlay_erase_all(void)
 	}
 
 	if (!overlay_repaint_fn)
-		overlay_repaint_status();
+		overlay_repaint_taskbar();
 }
 
-/* ---- status line ---- */
+/* ---- taskbar ---- */
 
 void
-render_status_line(int fd, int rows, int cols)
+render_taskbar(int fd, int rows, int cols)
 {
 	static char last_content[1024];
 	static int last_row;
@@ -192,16 +192,16 @@ render_status_line(int fd, int rows, int cols)
 	char cup[24];
 	int cuplen;
 
-	if (!status_visible)
+	if (!taskbar_visible)
 		return;
 
-	row = status_get_position(statusbar) ? 1 : rows;
+	row = taskbar_get_position(taskbar) ? 1 : rows;
 
 	max = (row == rows) ? cols - 1 : cols;
 	{
 		/* prepend a fixed marker when the live window watch is off, so
 		 * the degraded state is visible regardless of the user's
-		 * status format (independent of status_expand). */
+		 * taskbar format (independent of taskbar_expand). */
 		const char *warn = sessdir_watch_degraded ? "[!watch] " : "";
 		int wlen = (int)strlen(warn);
 
@@ -209,17 +209,17 @@ render_status_line(int fd, int rows, int cols)
 			wlen = 0;
 			warn = "";
 		}
-		status_expand(statusbar, content + wlen,
+		taskbar_expand(taskbar, content + wlen,
 		    sizeof(content) - (size_t)wlen, max - wlen);
 		if (wlen > 0)
 			memcpy(content, warn, (size_t)wlen);
 	}
 
 	/* skip if nothing changed since last draw */
-	if (!status_line_dirty && row == last_row && cols == last_cols &&
+	if (!taskbar_dirty && row == last_row && cols == last_cols &&
 	    strcmp(content, last_content) == 0)
 		return;
-	status_line_dirty = 0;
+	taskbar_dirty = 0;
 	memcpy(last_content, content, sizeof(last_content));
 	last_row = row;
 	last_cols = cols;
@@ -297,7 +297,7 @@ render_status_line(int fd, int rows, int cols)
 }
 
 void
-status_line_invalidate(void)
+taskbar_invalidate(void)
 {
-	status_line_dirty = 1;
+	taskbar_dirty = 1;
 }

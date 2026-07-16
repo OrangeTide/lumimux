@@ -122,14 +122,41 @@ test_send_prefix(void)
 	struct keys *k;
 	enum keys_action a;
 
-	TEST("prefix + prefix = send literal");
+	TEST("prefix + a = send literal, prefix + prefix = last window");
 
 	k = keys_new(0x01);
 	keys_default(k);
 
 	keys_feed(k, 0x01);
+	a = keys_feed(k, 'a');
+	ASSERT(a == KEYS_ACTION_SEND_PREFIX, "Ctrl-A a = SEND_PREFIX");
+
+	keys_feed(k, 0x01);
 	a = keys_feed(k, 0x01);
-	ASSERT(a == KEYS_ACTION_SEND_PREFIX, "Ctrl-A Ctrl-A = SEND_PREFIX");
+	ASSERT(a == KEYS_ACTION_LAST_WINDOW, "Ctrl-A Ctrl-A = LAST_WINDOW");
+
+	keys_free(k);
+	PASS();
+}
+
+static void
+test_command_binding(void)
+{
+	struct keys *k;
+	enum keys_action a;
+
+	TEST("prefix + : = command line");
+
+	ASSERT(keys_action_from_name("command") == KEYS_ACTION_COMMAND,
+	    "'command' should map to KEYS_ACTION_COMMAND");
+
+	k = keys_new(0x01);
+	keys_default(k);
+
+	keys_feed(k, 0x01); /* prefix */
+	a = keys_feed(k, ':');
+	ASSERT(a == KEYS_ACTION_COMMAND, "Ctrl-A : should be COMMAND");
+	ASSERT(keys_get_state(k) == KEYS_STATE_NORMAL, "back to NORMAL");
 
 	keys_free(k);
 	PASS();
@@ -910,6 +937,7 @@ main(void)
 	test_prefix_consumed();
 	test_prefix_then_action();
 	test_send_prefix();
+	test_command_binding();
 	test_navigation();
 	test_select_by_number();
 	test_detach();

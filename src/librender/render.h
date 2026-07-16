@@ -37,4 +37,9 @@ int render_cells_diff(struct render *r, int fd, const struct vt_cell *cells,
  * Does not flush -- caller is responsible for flushing when ready. */
 void render_move_cursor(struct render *r, int fd, int row, int col);
 
+/* Forget the tracked cursor position; the next render_move_cursor()
+ * will emit an absolute move.  Use after writing bytes to the terminal
+ * outside this renderer, which leaves the tracked position stale. */
+void render_invalidate_cursor(struct render *r);
+
 #endif /* RENDER_H */

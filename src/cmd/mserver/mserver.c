@@ -562,6 +562,12 @@ on_client_read(struct iox_loop *lp, int fd, unsigned events, void *arg)
 		}
 		break;
 
+	case IPC_MSG_REFRESH:
+		/* client asked us to re-send the screen; used to resync a
+		 * newly-sized pane without relying on the child to repaint */
+		send_replay(fd);
+		break;
+
 	case IPC_MSG_DETACH:
 		disconnect_client();
 		break;
@@ -627,6 +633,17 @@ on_new_client(struct iox_loop *lp, int fd, unsigned events, void *arg)
 
 	client_fd = new_fd;
 	iox_fd_add(lp, client_fd, IOX_READ, on_client_read, NULL);
+
+	/* if the client sent its desired size in the ATTACH payload,
+	 * resize the PTY/VT to it now so the replay below is generated
+	 * at the final size.  otherwise keep the current size. */
+	{
+		struct ipc_size sz;
+
+		if (ipc_size_decode(&sz, (const uint8_t *)buf, (int)len) >= 0 &&
+		    sz.rows > 0 && sz.cols > 0)
+			window_resize(win, sz.rows, sz.cols);
+	}
 
 	/* tell client our current VT size, then send screen replay.
 	 * the client creates its VT at this size so replay matches.
@@ -744,19 +761,18 @@ do_cleanup(void)
 
 static const char *shell;
 
+/* (re)build this server's on-disk presence: the session directory, this
+ * server's directory, its listening socket, its descriptor files, and its
+ * entry in the session state file. 'win' must already exist. called at
+ * startup and again from on_sighup() when the session directory was removed
+ * out from under a still-running server. on success listen_fd holds the new
+ * listener; on failure returns ERR with listen_fd unchanged. */
 static int
-server(void)
+register_server(void)
 {
 	struct sessdir_state *st;
 	char *dir;
 	const char *pty_path;
-
-	rune_width_init();
-
-	/* a client dropping mid-write must not kill the server -- ignore
-	 * SIGPIPE so writes to a gone client return EPIPE and we drop just
-	 * that client instead of terminating the whole window. */
-	signal(SIGPIPE, SIG_IGN);
 
 	/* create session directory (idempotent) */
 	if (sessdir_session_create(session_name) < 0) {
@@ -764,21 +780,9 @@ server(void)
 		return ERR;
 	}
 
-	/* prevent recursive attach inside this session --
-	 * must be set before window_new forks the shell */
-	setenv("LUMI_SESSION", session_name, 1);
-
-	/* create the window (forks the shell) */
-	win = window_new(shell, 24, 80);
-	if (!win) {
-		log_err("failed to create window");
-		return ERR;
-	}
-
 	/* register in session directory */
 	if (sessdir_server_create(session_name, getpid()) < 0) {
 		log_err("failed to create server directory");
-		do_cleanup();
 		return ERR;
 	}
 
@@ -786,21 +790,18 @@ server(void)
 	dir = sessdir_server_path(session_name, getpid());
 	if (!dir) {
 		log_err("failed to get server path");
-		do_cleanup();
 		return ERR;
 	}
 	if (snprintf(socket_path, sizeof(socket_path), "%s/socket",
 	    dir) >= (int)sizeof(socket_path)) {
 		log_err("socket path too long");
 		free(dir);
-		do_cleanup();
 		return ERR;
 	}
 	if (snprintf(attrs_path, sizeof(attrs_path), "%s/attrs",
 	    dir) >= (int)sizeof(attrs_path)) {
 		log_err("attrs path too long");
 		free(dir);
-		do_cleanup();
 		return ERR;
 	}
 	free(dir);
@@ -808,13 +809,8 @@ server(void)
 	listen_fd = ipc_listen(socket_path);
 	if (listen_fd < 0) {
 		log_err("failed to listen on %s", socket_path);
-		do_cleanup();
 		return ERR;
 	}
-
-	/* initialize attribute store */
-	attr_store_init(&attrs);
-	attr_store_load(&attrs, attrs_path);
 
 	/* write descriptor files */
 	pty_path = ptsname(window_master_fd(win));
@@ -831,6 +827,73 @@ server(void)
 		sessdir_state_close(st);
 	}
 
+	return OK;
+}
+
+/* SIGHUP: our session directory was removed while we kept running (an
+ * attach client tore it down, or it was cleaned up after that client
+ * crashed). the listening socket is still open but its pathname is gone,
+ * so no client can reach us. rebuild the directory and a fresh socket so
+ * "lumi attach" can rediscover and relink this window. */
+static void
+on_sighup(struct iox_loop *lp, int signo, void *arg)
+{
+	(void)signo;
+	(void)arg;
+
+	/* still reachable on disk: nothing to do. */
+	if (listen_fd >= 0 && socket_path[0] &&
+	    access(socket_path, F_OK) == 0)
+		return;
+
+	/* the old listener is bound to a now-nameless path; drop it. */
+	if (listen_fd >= 0) {
+		iox_fd_remove(lp, listen_fd);
+		ipc_close(listen_fd);
+		listen_fd = -1;
+	}
+
+	if (register_server() != OK) {
+		log_err("re-registration after SIGHUP failed");
+		return;
+	}
+
+	iox_fd_add(lp, listen_fd, IOX_READ, on_new_client, NULL);
+	log_info("re-registered session directory after SIGHUP");
+}
+
+static int
+server(void)
+{
+	rune_width_init();
+
+	/* a client dropping mid-write must not kill the server -- ignore
+	 * SIGPIPE so writes to a gone client return EPIPE and we drop just
+	 * that client instead of terminating the whole window. */
+	signal(SIGPIPE, SIG_IGN);
+
+	/* prevent recursive attach inside this session --
+	 * must be set before window_new forks the shell */
+	setenv("LUMI_SESSION", session_name, 1);
+
+	/* create the window (forks the shell) */
+	win = window_new(shell, 24, 80);
+	if (!win) {
+		log_err("failed to create window");
+		return ERR;
+	}
+
+	/* build our on-disk presence: session dir, server dir, socket,
+	 * descriptor files, and session-state entry */
+	if (register_server() != OK) {
+		do_cleanup();
+		return ERR;
+	}
+
+	/* initialize attribute store */
+	attr_store_init(&attrs);
+	attr_store_load(&attrs, attrs_path);
+
 	/* set up event loop */
 	loop = iox_loop_new();
 	if (!loop) {
@@ -844,6 +907,7 @@ server(void)
 	    on_master_read, NULL);
 	iox_signal_add(loop, SIGCHLD, on_sigchld, NULL);
 	iox_signal_add(loop, SIGTERM, on_sigterm, NULL);
+	iox_signal_add(loop, SIGHUP, on_sighup, NULL);
 
 	iox_loop_run(loop);
 
