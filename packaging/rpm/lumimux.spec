@@ -22,7 +22,8 @@ Single static binary with no runtime dependencies.
 make CC=musl-gcc LDFLAGS=-static TARGET_TRIPLET=x86_64-linux-musl RELEASE=1 lumi
 
 %install
-install -Dm 755 _out/x86_64-linux-musl/bin/lumi %{buildroot}%{_bindir}/lumi
+install -Dm 755 _out/x86_64-linux-musl/release/bin/lumi \
+    %{buildroot}%{_bindir}/lumi
 for cmd in attach mserver new list version kill detach new-window \
            reload send-input send-keys splash; do
     ln -sf lumi %{buildroot}%{_bindir}/lumi-$cmd

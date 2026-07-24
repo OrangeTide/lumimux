@@ -25,8 +25,12 @@ TRIPLET="$(cc -dumpmachine 2>/dev/null || echo x86_64-linux-gnu)"
 # Find binary
 if [ -n "$1" ]; then
 	BINARY="$1"
+elif [ -f "$REPO/_out/x86_64-linux-musl/release/bin/lumi" ]; then
+	BINARY="$REPO/_out/x86_64-linux-musl/release/bin/lumi"
 elif [ -f "$REPO/_out/x86_64-linux-musl/bin/lumi" ]; then
 	BINARY="$REPO/_out/x86_64-linux-musl/bin/lumi"
+elif [ -f "$REPO/_out/$TRIPLET/release/bin/lumi" ]; then
+	BINARY="$REPO/_out/$TRIPLET/release/bin/lumi"
 elif [ -f "$REPO/_out/$TRIPLET/bin/lumi" ]; then
 	BINARY="$REPO/_out/$TRIPLET/bin/lumi"
 else

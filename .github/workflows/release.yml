@@ -15,6 +15,9 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      # RELEASE=1 adds a "release" variant directory to the output path.
+      LUMI_BIN: _out/x86_64-linux-musl/release/bin/lumi
     strategy:
       matrix:
         include:
@@ -40,15 +43,17 @@ jobs:
       - name: Run tests
         run: >
           make CC=musl-gcc LDFLAGS=-static
-          TARGET_TRIPLET=x86_64-linux-musl run-tests
+          TARGET_TRIPLET=x86_64-linux-musl
+          RELEASE=1 RELEASE_MARCH=${{ matrix.march }}
+          run-tests
 
       - name: Strip binary
-        run: strip _out/x86_64-linux-musl/bin/lumi
+        run: strip "$LUMI_BIN"
 
       - name: Verify static linkage
         run: |
-          file _out/x86_64-linux-musl/bin/lumi | grep -q "statically linked"
-          _out/x86_64-linux-musl/bin/lumi version
+          file "$LUMI_BIN" | grep -q "statically linked"
+          "$LUMI_BIN" version
 
       - name: Package tarball
         id: package
@@ -57,7 +62,7 @@ jobs:
           PREFIX="lumi-${VER}-linux-${{ matrix.arch }}"
           STAGE="${{ runner.temp }}/${PREFIX}"
           mkdir -p "${STAGE}/bin"
-          cp _out/x86_64-linux-musl/bin/lumi "${STAGE}/bin/"
+          cp "$LUMI_BIN" "${STAGE}/bin/"
           for cmd in attach mserver new list version kill detach \
                      new-window reload send-input send-keys splash; do
             ln -sf lumi "${STAGE}/bin/lumi-${cmd}"
@@ -68,14 +73,14 @@ jobs:
       - name: Build .deb
         id: deb
         run: |
-          sh packaging/debian/build-deb.sh
+          sh packaging/debian/build-deb.sh "$LUMI_BIN"
           echo "deb=$(ls lumimux_*.deb)" >> "$GITHUB_OUTPUT"
 
       - name: Upload bare binary
         uses: actions/upload-artifact@v4
         with:
           name: lumi-linux-${{ matrix.arch }}
-          path: _out/x86_64-linux-musl/bin/lumi
+          path: ${{ env.LUMI_BIN }}
 
       - name: Upload tarball
         uses: actions/upload-artifact@v4
