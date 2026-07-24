@@ -21,6 +21,9 @@
 #include "ipc_msg.h"
 #include "ipc_transport.h"
 #include "ipc_transport_netchan.h"
+#include "keystore.h"
+#include "nc_crypto.h"
+#include "nc_auth.h"
 #include "lumi_msg.h"
 #include "proxy_msg.h"
 #include "sessdir.h"
@@ -30,6 +33,7 @@
 #include "byte_order.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -38,9 +42,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #define NET_PSK_LEN	32
+#define NET_KEY_LEN	32
 
 #define PCONN_MAX	64
 #define PROXY_TICK_MS	200
@@ -256,6 +263,15 @@ udp_bind(const char *bindaddr, int port, uint16_t *bound_port)
 	fd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (fd < 0)
 		return -1;
+	/* A direct-connect listener (-L) rebinds the same fixed port between
+	 * clients; allow the immediate rebind rather than failing on a port
+	 * the kernel has not fully released. */
+	{
+		int one = 1;
+
+		(void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one,
+		    sizeof(one));
+	}
 	memset(&sin, 0, sizeof(sin));
 	sin.sin_family = AF_INET;
 	sin.sin_port = htons((uint16_t)port);
@@ -275,6 +291,100 @@ udp_bind(const char *bindaddr, int port, uint16_t *bound_port)
 }
 
 /* ---- pre-shared key ---- */
+
+/* Build ~/.config/lumi/<name> (honoring XDG_CONFIG_HOME) into buf, creating
+ * the directory if needed.  Returns 0 on success, -1 on no home dir,
+ * truncation, or a directory that cannot be created. */
+static int
+lumi_config_path(char *buf, size_t sz, const char *name)
+{
+	const char *xdg = getenv("XDG_CONFIG_HOME");
+	const char *home = getenv("HOME");
+	char dir[256];
+	int n;
+
+	if (xdg && *xdg)
+		n = snprintf(dir, sizeof(dir), "%s/lumi", xdg);
+	else if (home && *home)
+		n = snprintf(dir, sizeof(dir), "%s/.config/lumi", home);
+	else
+		return -1;
+	if (n <= 0 || (size_t)n >= sizeof(dir))
+		return -1;
+
+	if (mkdir(dir, 0700) != 0 && errno != EEXIST)
+		return -1;
+
+	n = snprintf(buf, sz, "%s/%s", dir, name);
+	return (n > 0 && (size_t)n < sz) ? 0 : -1;
+}
+
+/* Load (or generate on first use) the server's long-term X25519 identity
+ * secret from ~/.config/lumi/host_key, and derive its public half.  Returns
+ * 0 on success, -1 on error. */
+static int
+load_host_key(uint8_t sk[NET_KEY_LEN], uint8_t pk[NET_KEY_LEN])
+{
+	char path[256];
+
+	if (lumi_config_path(path, sizeof(path), "host_key") != 0)
+		return -1;
+	if (ks_host_key(path, sk) != 0)
+		return -1;
+	nc_crypto_identity_public(pk, sk);
+	return 0;
+}
+
+/* ---- direct-connect user authentication (nc_auth server side) ---- */
+
+static char authkeys_path[256];
+static char passwd_path[256];
+static int have_authkeys;		/* ~/.config/lumi/authorized_keys exists */
+static int have_passwd;			/* ~/.config/lumi/passwd exists */
+
+/* Resolve the server credential stores.  Returns 0 if at least one usable
+ * store is present, -1 if the paths cannot be built or none exists. */
+static int
+setup_authstore(void)
+{
+	if (lumi_config_path(authkeys_path, sizeof(authkeys_path),
+	    "authorized_keys") != 0 ||
+	    lumi_config_path(passwd_path, sizeof(passwd_path), "passwd") != 0)
+		return -1;
+	have_authkeys = (access(authkeys_path, R_OK) == 0);
+	have_passwd = (access(passwd_path, R_OK) == 0);
+	return (have_authkeys || have_passwd) ? 0 : -1;
+}
+
+/* Offer the same methods for every name, so the handshake cannot be used to
+ * probe which accounts exist. */
+static unsigned
+ua_methods(void *ctx, const char *user)
+{
+	unsigned m = 0;
+
+	(void)ctx;
+	(void)user;
+	if (have_authkeys)
+		m |= NC_AUTH_M_PUBKEY;
+	if (have_passwd)
+		m |= NC_AUTH_M_PASSWORD;
+	return m;
+}
+
+static int
+ua_check_key(void *ctx, const char *user, const uint8_t pk[32])
+{
+	(void)ctx;
+	return have_authkeys && ks_authorized_key(authkeys_path, user, pk);
+}
+
+static int
+ua_check_password(void *ctx, const char *user, const char *password)
+{
+	(void)ctx;
+	return have_passwd && ks_check_password(passwd_path, user, password);
+}
 
 /* draw NET_PSK_LEN random bytes from the OS. returns 0 on success. */
 static int
@@ -349,15 +459,55 @@ write_net_key(const uint8_t *psk)
  * descriptors pointed at /dev/null.  Returns 0 in the surviving child, and
  * does not return in the parent (it _exit()s once the line is written).
  * Returns -1 on fork failure. */
+/* publish the host public key as hex in the session dir (mode 0600) so a
+ * local `attach -n -V` can pin it without an ssh bootstrap.  returns 0 on
+ * success. */
 static int
-daemonize_and_report(uint16_t bound, const uint8_t *psk)
+write_net_hostkey(const uint8_t *pk)
+{
+	char hex[NET_KEY_LEN * 2 + 1];
+	char *dir, path[256];
+	int fd;
+
+	ks_hex_encode(hex, pk, NET_KEY_LEN);
+
+	dir = sessdir_session_path(session_name);
+	if (!dir)
+		return -1;
+	if (snprintf(path, sizeof(path), "%s/net-hostkey", dir) >=
+	    (int)sizeof(path)) {
+		free(dir);
+		return -1;
+	}
+	free(dir);
+
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0)
+		return -1;
+	if (write(fd, hex, sizeof(hex) - 1) != (ssize_t)(sizeof(hex) - 1)) {
+		close(fd);
+		unlink(path);
+		return -1;
+	}
+	close(fd);
+	return 0;
+}
+
+static int
+daemonize_and_report(uint16_t bound, const uint8_t *psk, const uint8_t *hostpk)
 {
 	char hex[NET_PSK_LEN * 2 + 1];
+	char hkhex[NET_KEY_LEN * 2 + 1];
 	pid_t pid;
 	int nfd;
 
 	psk_to_hex(psk, hex);
-	printf("udp %u %s\n", (unsigned)bound, hex);
+	if (hostpk) {
+		ks_hex_encode(hkhex, hostpk, NET_KEY_LEN);
+		printf("udp %u %s %s\n", (unsigned)bound, hex, hkhex);
+	} else {
+		printf("udp %u %s\n", (unsigned)bound, hex);
+	}
 	fflush(stdout);
 
 	pid = fork();
@@ -555,8 +705,12 @@ bridge_loop(void)
 
 /* ---- lifecycle ---- */
 
+/* Tear down everything tied to one served client: detach from the session's
+ * mservers and stop the sessdir watch.  Safe to call when nothing is attached.
+ * The session itself and any published files are left alone, so a persistent
+ * listener can serve the next client. */
 static void
-cleanup(void)
+detach_pconns(void)
 {
 	int i;
 
@@ -571,6 +725,13 @@ cleanup(void)
 		sessdir_watch_stop(watch_fd);
 		watch_fd = -1;
 	}
+}
+
+static void
+cleanup(void)
+{
+	detach_pconns();
+
 	if (session_name) {
 		char *dir = sessdir_session_path(session_name);
 
@@ -589,20 +750,161 @@ cleanup(void)
 	}
 }
 
+/* Serve exactly one client on udp_fd (ownership transferred; freed with the
+ * transport): wait for its first datagram, run the crypto handshake and, when
+ * `auth` requests it, the user-authentication phase, bridge every window until
+ * the client disconnects, then detach from the session.  Returns 0 when a
+ * client was served and left, -1 on a setup or handshake failure. */
 static int
-net_proxy_run(const char *bindaddr, int port, int daemonize)
+serve_one_client(int udp_fd, const struct ipc_netchan_auth *auth)
 {
 	uint8_t ready_buf[4096];
-	uint8_t psk[NET_PSK_LEN];
-	uint16_t bound = 0;
 	struct pollfd wait_fd;
-	char addrbuf[64];
 	pid_t pids[PCONN_MAX];
-	int udp_fd, ready_len, n, i;
+	int ready_len, n, i;
+
+	wait_fd.fd = udp_fd;
+	wait_fd.events = POLLIN;
+	for (;;) {
+		int pr = poll(&wait_fd, 1, PROXY_TICK_MS);
+
+		if (stop_flag) {
+			close(udp_fd);
+			return 0;
+		}
+		if (pr < 0)
+			continue;
+		if (pr > 0)
+			break;
+	}
+
+	client = ipc_transport_netchan_new_crypto_auth(udp_fd, 1, NULL, auth);
+	if (!client) {
+		close(udp_fd);
+		return -1;
+	}
+	if (ipc_transport_netchan_establish(client, 5000) != 0) {
+		log_err("client handshake or authentication failed");
+		ipc_transport_free(client);
+		client = NULL;
+		return -1;
+	}
+
+	/* discover and attach to all mservers. */
+	sessdir_cleanup_stale(session_name);
+	n = sessdir_list_servers(session_name, pids, PCONN_MAX);
+	if (n < 0) {
+		log_err("failed to list servers for session '%s'",
+		    session_name);
+		ipc_transport_free(client);
+		client = NULL;
+		return -1;
+	}
+	for (i = 0; i < n; i++)
+		attach_mserver(pids[i]);
+
+	/* send the initial window list. */
+	ready_len = encode_ready_payload(ready_buf, sizeof(ready_buf));
+	if (ready_len < 0 ||
+	    proxy_msg_xsend(client, 0, IPC_MSG_PROXY_READY, ready_buf,
+	    (uint32_t)ready_len) != 0) {
+		log_err("failed to send ready message");
+		detach_pconns();
+		ipc_transport_free(client);
+		client = NULL;
+		return -1;
+	}
+
+	watch_fd = sessdir_watch_start(session_name);
+	bridge_loop();
+
+	detach_pconns();
+	ipc_transport_free(client);	/* closes udp_fd */
+	client = NULL;
+	return 0;
+}
+
+/*
+ * Direct-connect deployment: listen persistently on a fixed port and serve
+ * clients one at a time, each authenticating itself over netchan with no ssh
+ * bootstrap.  The connection is encrypted and the server is pinned by its host
+ * key; the user proves identity with a key or password from ~/.config/lumi.
+ * There is no PSK: the endpoint is public and every client authenticates.
+ */
+static int
+net_proxy_listen(const char *bindaddr, int port)
+{
+	uint8_t host_sk[NET_KEY_LEN], host_pk[NET_KEY_LEN];
+	char hex[NET_KEY_LEN * 2 + 1];
+
+	if (port == 0) {
+		log_err("listen mode (-L) requires a fixed port (-p)");
+		return 1;
+	}
+	if (load_host_key(host_sk, host_pk) != 0) {
+		log_err("failed to load host key");
+		return 1;
+	}
+	if (setup_authstore() != 0) {
+		log_err("no authorized_keys or passwd under ~/.config/lumi; "
+		    "refusing to listen with no way to authenticate a user");
+		return 1;
+	}
+
+	signal(SIGTERM, on_signal);
+	signal(SIGINT, on_signal);
+	signal(SIGPIPE, SIG_IGN);
+
+	ks_hex_encode(hex, host_pk, NET_KEY_LEN);
+	log_info("lumi-net-proxy direct-connect on %s:%d for session '%s'",
+	    bindaddr ? bindaddr : "*", port, session_name);
+	log_info("host key: %s", hex);
+
+	while (!stop_flag) {
+		struct ipc_netchan_userauth ua = {
+			.methods = ua_methods,
+			.check_key = ua_check_key,
+			.check_password = ua_check_password,
+		};
+		struct ipc_netchan_auth auth = {
+			.static_sk = host_sk,
+			.userauth = &ua,
+		};
+		uint16_t bound = 0;
+		int udp_fd = udp_bind(bindaddr, port, &bound);
+
+		if (udp_fd < 0) {
+			log_err("failed to bind udp/%d", port);
+			return 1;
+		}
+		/* serve_one_client owns and closes udp_fd, freeing the port for
+		 * the next accept. */
+		(void)serve_one_client(udp_fd, &auth);
+	}
+	return 0;
+}
+
+static int
+net_proxy_run(const char *bindaddr, int port, int daemonize, int use_hostkey)
+{
+	uint8_t psk[NET_PSK_LEN];
+	uint8_t host_sk[NET_KEY_LEN], host_pk[NET_KEY_LEN];
+	uint16_t bound = 0;
+	char addrbuf[64];
+	int udp_fd;
 
 	udp_fd = udp_bind(bindaddr, port, &bound);
 	if (udp_fd < 0) {
 		log_err("failed to bind UDP endpoint");
+		return 1;
+	}
+
+	/* load our long-term identity key so a client can pin it across
+	 * restarts, and publish its public half beside the endpoint. */
+	if (use_hostkey && (load_host_key(host_sk, host_pk) != 0 ||
+	    write_net_hostkey(host_pk) != 0)) {
+		log_err("failed to load or publish host key");
+		close(udp_fd);
 		return 1;
 	}
 
@@ -627,7 +929,8 @@ net_proxy_run(const char *bindaddr, int port, int daemonize)
 	    (unsigned)bound, session_name);
 
 	/* cross-host bootstrap: report the endpoint and key, then detach. */
-	if (daemonize && daemonize_and_report(bound, psk) != 0) {
+	if (daemonize && daemonize_and_report(bound, psk,
+	    use_hostkey ? host_pk : NULL) != 0) {
 		log_err("failed to daemonize");
 		close(udp_fd);
 		cleanup();
@@ -638,78 +941,25 @@ net_proxy_run(const char *bindaddr, int port, int daemonize)
 	signal(SIGINT, on_signal);
 	signal(SIGPIPE, SIG_IGN);
 
-	/* wait for the first client datagram, then run the handshake. */
-	wait_fd.fd = udp_fd;
-	wait_fd.events = POLLIN;
-	for (;;) {
-		int pr = poll(&wait_fd, 1, PROXY_TICK_MS);
+	{
+		struct ipc_netchan_auth auth = { .psk = psk };
+		int rc;
 
-		if (stop_flag) {
-			close(udp_fd);
-			cleanup();
-			return 0;
-		}
-		if (pr < 0)
-			continue;
-		if (pr > 0)
-			break;
-	}
-
-	client = ipc_transport_netchan_new_crypto(udp_fd, 1, NULL, psk);
-	if (!client) {
-		close(udp_fd);
+		if (use_hostkey)
+			auth.static_sk = host_sk;
+		rc = serve_one_client(udp_fd, &auth);
 		cleanup();
-		return 1;
+		return rc == 0 ? 0 : 1;
 	}
-	if (ipc_transport_netchan_establish(client, 5000) != 0) {
-		log_err("client handshake failed");
-		ipc_transport_free(client);
-		client = NULL;
-		cleanup();
-		return 1;
-	}
-
-	/* discover and attach to all mservers. */
-	sessdir_cleanup_stale(session_name);
-	n = sessdir_list_servers(session_name, pids, PCONN_MAX);
-	if (n < 0) {
-		log_err("failed to list servers for session '%s'",
-		    session_name);
-		ipc_transport_free(client);
-		client = NULL;
-		cleanup();
-		return 1;
-	}
-	for (i = 0; i < n; i++)
-		attach_mserver(pids[i]);
-
-	/* send the initial window list. */
-	ready_len = encode_ready_payload(ready_buf, sizeof(ready_buf));
-	if (ready_len < 0 ||
-	    proxy_msg_xsend(client, 0, IPC_MSG_PROXY_READY, ready_buf,
-	    (uint32_t)ready_len) != 0) {
-		log_err("failed to send ready message");
-		ipc_transport_free(client);
-		client = NULL;
-		cleanup();
-		return 1;
-	}
-
-	watch_fd = sessdir_watch_start(session_name);
-
-	bridge_loop();
-
-	ipc_transport_free(client);	/* closes udp_fd */
-	client = NULL;
-	cleanup();
-	return 0;
 }
 
 static void
 usage(void)
 {
 	fprintf(stderr,
-	    "usage: lumi net-proxy -s <session> [-b addr] [-p port] [-d]\n");
+	    "usage: lumi net-proxy -s <session> [-b addr] [-p port] [-d] "
+	    "[-k]\n"
+	    "       lumi net-proxy -s <session> -L -p <port> [-b addr]\n");
 	exit(1);
 }
 
@@ -717,9 +967,9 @@ int
 cmd_net_proxy_main(int argc, char **argv)
 {
 	const char *bindaddr = NULL;
-	int port = 0, daemonize = 0, opt;
+	int port = 0, daemonize = 0, use_hostkey = 0, listen_mode = 0, opt;
 
-	while ((opt = getopt(argc, argv, "s:b:p:d")) != -1) {
+	while ((opt = getopt(argc, argv, "s:b:p:dkL")) != -1) {
 		switch (opt) {
 		case 's':
 			session_name = optarg;
@@ -733,6 +983,12 @@ cmd_net_proxy_main(int argc, char **argv)
 		case 'd':
 			daemonize = 1;
 			break;
+		case 'L':
+			listen_mode = 1;
+			break;
+		case 'k':
+			use_hostkey = 1;
+			break;
 		default:
 			usage();
 		}
@@ -741,5 +997,8 @@ cmd_net_proxy_main(int argc, char **argv)
 	if (!session_name)
 		usage();
 
-	return net_proxy_run(bindaddr, port, daemonize);
+	if (listen_mode)
+		return net_proxy_listen(bindaddr, port);
+
+	return net_proxy_run(bindaddr, port, daemonize, use_hostkey);
 }

@@ -15,6 +15,8 @@ lumi_SRCS = multicall.c \
 	cmd/kill/kill.c \
 	cmd/detach/detach.c \
 	cmd/new-window/new_window.c \
+	cmd/net-keygen/net_keygen.c \
+	cmd/net-passwd/net_passwd.c \
 	cmd/proxy/proxy.c \
 	cmd/reload/reload.c \
 	cmd/send-input/send_input.c \
@@ -29,7 +31,7 @@ lumi_CPPFLAGS = -I$(lumi_DIR)
 EXECUTABLES += lumi
 
 LUMI_CMDS = attach attr mserver new list version kill detach new-window \
-	proxy net-proxy reload send-input send-keys splash
+	proxy net-proxy net-keygen net-passwd reload send-input send-keys splash
 
 .PHONY: symlinks clean-symlinks
 symlinks: lumi

@@ -19,6 +19,9 @@
 #include "proxy_msg.h"
 #include "sessdir.h"
 #include "nc_udp.h"
+#include "keystore.h"
+#include "nc_auth.h"
+#include "monocypher.h"
 
 /* entry point under test (declared in src/multicall.h, not on our -I). */
 int cmd_net_proxy_main(int argc, char **argv);
@@ -78,32 +81,39 @@ fake_mserver(void)
 	if (lfd < 0)
 		_exit(14);
 
-	cfd = ipc_accept(lfd);
-	if (cfd < 0)
-		_exit(15);
-
-	/* handshake: proxy sends ATTACH, we reply with a size. */
-	if (ipc_msg_recv(cfd, &type, buf, sizeof(buf), &len) != 0 ||
-	    type != IPC_MSG_ATTACH)
-		_exit(16);
-	ipc_msg_send_size(cfd, IPC_MSG_ATTACH_REPLY, 24, 80);
-
+	/* Serve proxy connections repeatedly: a real mserver outlives any one
+	 * client, so the persistent listener must find it again on reattach.
+	 * The test kills this process with SIGTERM when done. */
 	for (;;) {
-		int rc = ipc_msg_recv(cfd, &type, buf, sizeof(buf), &len);
-		uint32_t i;
+		cfd = ipc_accept(lfd);
+		if (cfd < 0)
+			_exit(15);
 
-		if (rc != 0)
-			break;			/* proxy detached / EOF */
-		if (type == IPC_MSG_DETACH)
-			break;
-		if (type != IPC_MSG_INPUT)
+		/* handshake: proxy sends ATTACH, we reply with a size. */
+		if (ipc_msg_recv(cfd, &type, buf, sizeof(buf), &len) != 0 ||
+		    type != IPC_MSG_ATTACH) {
+			ipc_close(cfd);
 			continue;
-		for (i = 0; i < len; i++)
-			buf[i] = (char)toupper((unsigned char)buf[i]);
-		ipc_msg_send(cfd, IPC_MSG_OUTPUT, buf, len);
+		}
+		ipc_msg_send_size(cfd, IPC_MSG_ATTACH_REPLY, 24, 80);
+
+		for (;;) {
+			int rc = ipc_msg_recv(cfd, &type, buf, sizeof(buf),
+			    &len);
+			uint32_t i;
+
+			if (rc != 0)
+				break;		/* proxy detached / EOF */
+			if (type == IPC_MSG_DETACH)
+				break;
+			if (type != IPC_MSG_INPUT)
+				continue;
+			for (i = 0; i < len; i++)
+				buf[i] = (char)toupper((unsigned char)buf[i]);
+			ipc_msg_send(cfd, IPC_MSG_OUTPUT, buf, len);
+		}
+		ipc_close(cfd);
 	}
-	ipc_close(cfd);
-	_exit(0);
 }
 
 /* ---- helpers ---- */
@@ -339,12 +349,236 @@ done:
 		PASS();
 }
 
+/* ---- direct-connect listen path (net-proxy -L) ---- */
+
+/* Client-side credential source for one login attempt. */
+struct la_cred {
+	const uint8_t	*sk;		/* 64-byte Ed25519 secret, or NULL */
+	const uint8_t	*pk;		/* 32-byte public */
+};
+
+static int
+la_get_key(void *ctx, uint8_t sk[64], uint8_t pk[32])
+{
+	struct la_cred *c = ctx;
+
+	if (!c->sk)
+		return -1;
+	memcpy(sk, c->sk, 64);
+	memcpy(pk, c->pk, 32);
+	return 0;
+}
+
+static int
+la_get_password(void *ctx, char *buf, size_t sz)
+{
+	(void)ctx;
+	(void)buf;
+	(void)sz;
+	return -1;			/* this test uses public keys only */
+}
+
+/* Accept whatever host key the server presents (trust on first use). */
+static int
+la_accept_host(void *ctx, const uint8_t *peer_static_pk)
+{
+	(void)ctx;
+	(void)peer_static_pk;
+	return 0;
+}
+
+/*
+ * Connect one client to the listening proxy on `port`, authenticate with the
+ * given key, and, when expect_ok, round-trip one message through the window
+ * (id `mpid`).  Returns 1 if the outcome matched expect_ok.
+ */
+static int
+listen_client(int port, const uint8_t *sk, const uint8_t *pk, pid_t mpid,
+    int expect_ok)
+{
+	struct la_cred cred = { sk, pk };
+	struct ipc_netchan_userauth ua = {
+		.user = "testuser",
+		.get_key = la_get_key,
+		.get_password = la_get_password,
+		.cred_ctx = &cred,
+	};
+	struct ipc_netchan_auth auth = {
+		.verify_peer = la_accept_host,
+		.require_peer_static = 1,
+		.userauth = &ua,
+	};
+	struct sockaddr_in sin;
+	struct nc_addr peer;
+	struct ipc_transport *cli;
+	static uint8_t buf[8192];
+	uint32_t type, len, wid;
+	int cfd, ok = 0, established;
+
+	cfd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (cfd < 0)
+		return 0;
+	memset(&sin, 0, sizeof(sin));
+	sin.sin_family = AF_INET;
+	sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	sin.sin_port = htons((uint16_t)port);
+	if (nc_udp_from_sockaddr(&peer, (struct sockaddr *)&sin,
+	    sizeof(sin)) != 0) {
+		close(cfd);
+		return 0;
+	}
+	cli = ipc_transport_netchan_new_crypto_auth(cfd, 0, &peer, &auth);
+	if (!cli) {
+		close(cfd);
+		return 0;
+	}
+
+	established = (ipc_transport_netchan_establish(cli, 5000) == 0);
+	if (!expect_ok) {
+		ok = !established;	/* the login must be refused */
+		ipc_transport_free(cli);
+		return ok;
+	}
+	if (!established) {
+		ipc_transport_free(cli);
+		return 0;
+	}
+
+	if (recv_timed(cli, &type, buf, sizeof(buf), &len, 5000) == 0 &&
+	    proxy_msg_xdecode(&wid, buf, &len) == 0 && wid == 0 &&
+	    type == IPC_MSG_PROXY_READY && len >= 6) {
+		wid = ((uint32_t)buf[2] << 24) | ((uint32_t)buf[3] << 16) |
+		    ((uint32_t)buf[4] << 8) | (uint32_t)buf[5];
+		if (wid == (uint32_t)mpid &&
+		    proxy_msg_xsend(cli, wid, IPC_MSG_INPUT, "hi", 2) == 0 &&
+		    recv_timed(cli, &type, buf, sizeof(buf), &len, 5000) == 0 &&
+		    proxy_msg_xdecode(&wid, buf, &len) == 0 &&
+		    type == IPC_MSG_OUTPUT && len == 2 &&
+		    memcmp(buf, "HI", 2) == 0)
+			ok = 1;
+	}
+	ipc_transport_free(cli);	/* graceful close: proxy sees the
+					 * disconnect and serves the next client */
+	return ok;
+}
+
+/*
+ * The direct-connect listener: authenticate a user over netchan (no ssh),
+ * gate on the authorized_keys store, and keep serving after a client leaves or
+ * is rejected.  A fixed port is required, so the proxy is started with -L -p.
+ */
+static void
+test_listen_userauth(void)
+{
+	char tmpl[] = "/tmp/lumi-listenrun-XXXXXX";
+	char cfgtmpl[] = "/tmp/lumi-listencfg-XXXXXX";
+	char *rundir, *cfgdir;
+	uint8_t seed[32], sk[64], pk[32], badsk[64], badpk[32];
+	char path[512], hex[65];
+	pid_t mpid, ppid;
+	int port, ok = 1;
+	FILE *f;
+
+	TEST("net-proxy -L authenticates, gates, and serves repeatedly");
+
+	/* a per-pid port keeps concurrent test runs from colliding. */
+	port = 40000 + (int)(getpid() % 20000);
+
+	rundir = mkdtemp(tmpl);
+	cfgdir = mkdtemp(cfgtmpl);
+	if (!rundir || !cfgdir) {
+		FAIL("mkdtemp failed");
+		return;
+	}
+	setenv("XDG_RUNTIME_DIR", rundir, 1);
+	setenv("XDG_CONFIG_HOME", cfgdir, 1);
+	unsetenv("LUMI_SESSION");
+
+	/* an authorized client key, and a different one that is not enrolled. */
+	memset(seed, 0x5C, sizeof(seed));
+	crypto_eddsa_key_pair(sk, pk, seed);
+	memset(seed, 0x77, sizeof(seed));
+	crypto_eddsa_key_pair(badsk, badpk, seed);
+
+	snprintf(path, sizeof(path), "%s/lumi", cfgdir);
+	mkdir(path, 0700);
+	snprintf(path, sizeof(path), "%s/lumi/authorized_keys", cfgdir);
+	f = fopen(path, "w");
+	if (!f) {
+		FAIL("cannot write authorized_keys");
+		return;
+	}
+	ks_hex_encode(hex, pk, 32);
+	fprintf(f, "testuser %s\n", hex);
+	fclose(f);
+
+	mpid = fork();
+	if (mpid < 0) {
+		FAIL("fork mserver failed");
+		return;
+	}
+	if (mpid == 0) {
+		fake_mserver();
+		_exit(99);
+	}
+	usleep(100000);
+
+	ppid = fork();
+	if (ppid < 0) {
+		FAIL("fork proxy failed");
+		kill(mpid, SIGKILL);
+		return;
+	}
+	if (ppid == 0) {
+		char portstr[16];
+		char *argv[] = { "lumi-net-proxy", "-s", (char *)SESSION,
+		    "-L", "-p", portstr, "-b", "127.0.0.1", NULL };
+
+		snprintf(portstr, sizeof(portstr), "%d", port);
+		optind = 1;
+		_exit(cmd_net_proxy_main(8, argv));
+	}
+	usleep(300000);		/* let it bind and load its host key */
+
+	/* an authorized key logs in and round-trips... */
+	if (!listen_client(port, sk, pk, mpid, 1)) {
+		FAIL("authorized-key login or round-trip failed");
+		ok = 0;
+	/* ...the listener serves a second client (persistent, one at a time,
+	 * rebinding the port between them)... */
+	} else if (!listen_client(port, sk, pk, mpid, 1)) {
+		FAIL("listener did not serve a second client");
+		ok = 0;
+	/* ...and an unenrolled key is refused. */
+	} else if (!listen_client(port, badsk, badpk, mpid, 0)) {
+		FAIL("unauthorized key was not refused");
+		ok = 0;
+	}
+
+	kill(ppid, SIGTERM);
+	kill(mpid, SIGTERM);
+	waitpid(ppid, NULL, 0);
+	waitpid(mpid, NULL, 0);
+
+	{
+		char cmd[600];
+
+		snprintf(cmd, sizeof(cmd), "rm -rf '%s' '%s'", rundir, cfgdir);
+		if (system(cmd) != 0)
+			; /* ignore */
+	}
+
+	if (ok)
+		PASS();
+}
+
 int
 main(void)
 {
 	printf("lumi-net-proxy tests:\n");
 
 	test_bridge_roundtrip();
+	test_listen_userauth();
 
 	printf("\n%d tests, %d failures\n", test_count, fail_count);
 	return fail_count > 0 ? 1 : 0;

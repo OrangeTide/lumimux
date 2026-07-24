@@ -2,7 +2,9 @@
 /* Made by a machine. PUBLIC DOMAIN (CC0-1.0) */
 
 #include "nc_udp.h"
-#include <netinet/in.h>
+#ifndef _WIN32
+#  include <netinet/in.h>       /* winsock2.h already supplies these */
+#endif
 #include <string.h>
 
 int

@@ -195,7 +195,7 @@ test_crypto_seal_open(void)
 {
 	struct nc_crypto a, b;
 	uint8_t s0[32], s1[32];
-	uint8_t hp[64], scratch[64];
+	uint8_t hp[128], scratch[64];
 	const char *msg = "encrypted payload";
 	uint8_t sealed[128], out[128];
 	long sn, pn;
@@ -205,8 +205,10 @@ test_crypto_seal_open(void)
 
 	memset(s0, 0x11, sizeof(s0));
 	memset(s1, 0x22, sizeof(s1));
-	ASSERT(nc_crypto_init(&a, 0, s0, NULL) == 0, "init a failed");
-	ASSERT(nc_crypto_init(&b, 1, s1, NULL) == 0, "init b failed");
+	struct nc_crypto_cfg cfg_a = { .eph_sk_seed = s0 };
+	struct nc_crypto_cfg cfg_b = { .eph_sk_seed = s1 };
+	ASSERT(nc_crypto_init(&a, 0, &cfg_a) == 0, "init a failed");
+	ASSERT(nc_crypto_init(&b, 1, &cfg_b) == 0, "init b failed");
 
 	for (i = 0; i < 4 && !(nc_crypto_ready(&a) && nc_crypto_ready(&b));
 	    i++) {
@@ -225,6 +227,174 @@ test_crypto_seal_open(void)
 	pn = nc_crypto_open(&b, sealed, (size_t)sn, out, sizeof(out));
 	ASSERT(pn == (long)strlen(msg), "open wrong size");
 	ASSERT(memcmp(out, msg, strlen(msg)) == 0, "decrypted mismatch");
+	PASS();
+}
+
+/* ---- static-identity authentication (server host key + verify_peer) ---- */
+
+/* Drive an nc_crypto handshake between initiator a and responder b until both
+ * are ready, either has failed, or a bounded number of rounds elapse.  The
+ * caller inspects nc_crypto_ready() / nc_crypto_failed() afterward. */
+static void
+crypto_handshake(struct nc_crypto *a, struct nc_crypto *b)
+{
+	uint8_t hp[128], scratch[128];
+	int i;
+
+	for (i = 0; i < 6 && !(nc_crypto_ready(a) && nc_crypto_ready(b)) &&
+	    !nc_crypto_failed(a) && !nc_crypto_failed(b); i++) {
+		size_t n = nc_crypto_handshake_packet(a, hp, sizeof(hp));
+
+		nc_crypto_open(b, hp, n, scratch, sizeof(scratch));
+		n = nc_crypto_handshake_packet(b, hp, sizeof(hp));
+		nc_crypto_open(a, hp, n, scratch, sizeof(scratch));
+	}
+}
+
+/* Records what the verify_peer callback saw, and dictates its verdict. */
+struct vcb_ctx {
+	int	calls;		/* how many times the callback fired */
+	int	saw_key;	/* the peer presented a (non-zero) identity key */
+	int	decision;	/* value the callback returns: 0 accept, else refuse */
+	uint8_t	seen[32];	/* the key the peer presented */
+};
+
+static int
+vcb(void *ctx, const uint8_t *peer_static_pk)
+{
+	struct vcb_ctx *v = ctx;
+
+	v->calls++;
+	if (peer_static_pk) {
+		memcpy(v->seen, peer_static_pk, 32);
+		v->saw_key = 1;
+	} else {
+		v->saw_key = 0;
+	}
+	return v->decision;
+}
+
+/* A server presents its long-term identity key; the client's verify_peer
+ * accepts it, and the session comes up.  The callback must see exactly the
+ * server's public key, once. */
+static void
+test_crypto_identity_accept(void)
+{
+	struct nc_crypto a, b;
+	struct vcb_ctx v = { .decision = 0 };
+	uint8_t s0[32], s1[32], host_sk[32], host_pk[32];
+	const char *msg = "authenticated payload";
+	uint8_t sealed[128], out[128];
+	long sn, pn;
+	struct nc_crypto_cfg cfg_a, cfg_b;
+
+	TEST("nc_crypto static identity: accepted key completes handshake");
+
+	memset(s0, 0x11, sizeof(s0));
+	memset(s1, 0x22, sizeof(s1));
+	memset(host_sk, 0x33, sizeof(host_sk));
+	nc_crypto_identity_public(host_pk, host_sk);
+
+	memset(&cfg_a, 0, sizeof(cfg_a));
+	cfg_a.eph_sk_seed = s0;
+	cfg_a.verify_peer = vcb;
+	cfg_a.verify_ctx = &v;
+	cfg_a.require_peer_static = 1;
+
+	memset(&cfg_b, 0, sizeof(cfg_b));
+	cfg_b.eph_sk_seed = s1;
+	cfg_b.static_sk = host_sk;
+
+	ASSERT(nc_crypto_init(&a, 0, &cfg_a) == 0, "init client failed");
+	ASSERT(nc_crypto_init(&b, 1, &cfg_b) == 0, "init server failed");
+
+	crypto_handshake(&a, &b);
+
+	ASSERT(nc_crypto_ready(&a) && nc_crypto_ready(&b),
+	    "handshake did not complete");
+	ASSERT(!nc_crypto_failed(&a), "client reported failure");
+	ASSERT(v.calls == 1, "verify_peer not called exactly once");
+	ASSERT(v.saw_key, "verify_peer saw no identity key");
+	ASSERT(memcmp(v.seen, host_pk, 32) == 0,
+	    "verify_peer saw the wrong key");
+
+	sn = nc_crypto_seal(&a, (const uint8_t *)msg, strlen(msg), sealed,
+	    sizeof(sealed));
+	ASSERT(sn > 0, "seal failed");
+	pn = nc_crypto_open(&b, sealed, (size_t)sn, out, sizeof(out));
+	ASSERT(pn == (long)strlen(msg) && memcmp(out, msg, strlen(msg)) == 0,
+	    "authenticated channel did not round-trip");
+	PASS();
+}
+
+/* When the client's verify_peer refuses the presented key, the client's
+ * session fails and never becomes ready. */
+static void
+test_crypto_identity_refused(void)
+{
+	struct nc_crypto a, b;
+	struct vcb_ctx v = { .decision = -1 };
+	uint8_t s0[32], s1[32], host_sk[32];
+	struct nc_crypto_cfg cfg_a, cfg_b;
+
+	TEST("nc_crypto static identity: refused key fails the client");
+
+	memset(s0, 0x11, sizeof(s0));
+	memset(s1, 0x22, sizeof(s1));
+	memset(host_sk, 0x44, sizeof(host_sk));
+
+	memset(&cfg_a, 0, sizeof(cfg_a));
+	cfg_a.eph_sk_seed = s0;
+	cfg_a.verify_peer = vcb;
+	cfg_a.verify_ctx = &v;
+
+	memset(&cfg_b, 0, sizeof(cfg_b));
+	cfg_b.eph_sk_seed = s1;
+	cfg_b.static_sk = host_sk;
+
+	ASSERT(nc_crypto_init(&a, 0, &cfg_a) == 0, "init client failed");
+	ASSERT(nc_crypto_init(&b, 1, &cfg_b) == 0, "init server failed");
+
+	crypto_handshake(&a, &b);
+
+	ASSERT(v.calls == 1, "verify_peer not called");
+	ASSERT(nc_crypto_failed(&a), "client did not fail on refusal");
+	ASSERT(!nc_crypto_ready(&a), "client became ready despite refusal");
+	PASS();
+}
+
+/* A client that requires an identity key refuses a server that presents
+ * none, without a verify_peer callback ever running. */
+static void
+test_crypto_identity_required_missing(void)
+{
+	struct nc_crypto a, b;
+	struct vcb_ctx v = { .decision = 0 };
+	uint8_t s0[32], s1[32];
+	struct nc_crypto_cfg cfg_a, cfg_b;
+
+	TEST("nc_crypto static identity: required-but-absent key is refused");
+
+	memset(s0, 0x11, sizeof(s0));
+	memset(s1, 0x22, sizeof(s1));
+
+	memset(&cfg_a, 0, sizeof(cfg_a));
+	cfg_a.eph_sk_seed = s0;
+	cfg_a.verify_peer = vcb;
+	cfg_a.verify_ctx = &v;
+	cfg_a.require_peer_static = 1;
+
+	memset(&cfg_b, 0, sizeof(cfg_b));	/* server has no static_sk */
+	cfg_b.eph_sk_seed = s1;
+
+	ASSERT(nc_crypto_init(&a, 0, &cfg_a) == 0, "init client failed");
+	ASSERT(nc_crypto_init(&b, 1, &cfg_b) == 0, "init server failed");
+
+	crypto_handshake(&a, &b);
+
+	ASSERT(nc_crypto_failed(&a), "client accepted an anonymous server");
+	ASSERT(!nc_crypto_ready(&a), "client became ready without a host key");
+	ASSERT(v.calls == 0, "verify_peer ran for an absent key");
 	PASS();
 }
 
@@ -519,6 +689,9 @@ main(void)
 	test_handshake();
 	test_reliable_roundtrip();
 	test_crypto_seal_open();
+	test_crypto_identity_accept();
+	test_crypto_identity_refused();
+	test_crypto_identity_required_missing();
 	test_udp_addr_roundtrip();
 	test_stress_periodic_loss();
 	test_stress_reorder();

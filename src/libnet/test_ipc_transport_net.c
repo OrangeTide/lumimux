@@ -12,6 +12,8 @@
 #include "ipc_transport_netchan.h"
 #include "ipc_transport.h"
 #include "nc_udp.h"
+#include "nc_auth.h"
+#include "monocypher.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -431,10 +433,239 @@ test_netchan_transport_roaming_self(void)
 		FAIL("session did not survive a self-roam");
 }
 
+/* ---- user-authentication phase over the loopback link ---- */
+
+/* One client identity, generated once and shared with the forked child. */
+static uint8_t g_client_sk[64];
+static uint8_t g_client_pk[32];
+#define AUTH_PASSWORD	"corr3ct"
+
+/* Server policy: offer both methods, accept the one client key and the one
+ * password. */
+static unsigned
+auth_methods(void *ctx, const char *user)
+{
+	(void)ctx;
+	(void)user;
+	return NC_AUTH_M_PUBKEY | NC_AUTH_M_PASSWORD;
+}
+
+static int
+auth_check_key(void *ctx, const char *user, const uint8_t pk[32])
+{
+	(void)ctx;
+	(void)user;
+	return memcmp(pk, g_client_pk, 32) == 0;
+}
+
+static int
+auth_check_password(void *ctx, const char *user, const char *password)
+{
+	(void)ctx;
+	(void)user;
+	return strcmp(password, AUTH_PASSWORD) == 0;
+}
+
+/* Client credential source, selected per scenario. */
+struct cred_cfg {
+	int		give_key;	/* present the authorized key */
+	const char	*password;	/* password to offer, or NULL to skip */
+};
+
+static int
+cred_get_key(void *ctx, uint8_t sk[64], uint8_t pk[32])
+{
+	struct cred_cfg *c = ctx;
+
+	if (!c->give_key)
+		return -1;
+	memcpy(sk, g_client_sk, 64);
+	memcpy(pk, g_client_pk, 32);
+	return 0;
+}
+
+static int
+cred_get_password(void *ctx, char *buf, size_t sz)
+{
+	struct cred_cfg *c = ctx;
+
+	if (!c->password)
+		return -1;
+	snprintf(buf, sz, "%s", c->password);
+	return 0;
+}
+
+static const uint8_t auth_psk[32] = {
+	0xA5, 0x5A, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+	0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+	0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
+	0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E,
+};
+
+/* Server side: establish with a userauth phase, then echo one message. */
+static void
+auth_server_child(int fd)
+{
+	static uint8_t buf[4096];
+	struct ipc_netchan_userauth ua = {
+		.methods = auth_methods,
+		.check_key = auth_check_key,
+		.check_password = auth_check_password,
+	};
+	struct ipc_netchan_auth auth = { .psk = auth_psk, .userauth = &ua };
+	struct ipc_transport *t;
+	uint32_t type, len;
+
+	t = ipc_transport_netchan_new_crypto_auth(fd, 1, NULL, &auth);
+	if (!t)
+		_exit(1);
+	if (ipc_transport_netchan_establish(t, 5000) != 0)
+		_exit(2);		/* auth denied */
+
+	if (ipc_transport_recv(t, &type, buf, sizeof(buf), &len) != 0)
+		_exit(3);
+	if (type == MSG_ECHO)
+		(void)ipc_transport_send(t, type, buf, len);
+	ipc_transport_free(t);
+	_exit(0);
+}
+
+/*
+ * Fork an authenticating server and run a client with the given credentials.
+ * When expect_ok, require establish to succeed and one message to round-trip;
+ * otherwise require both ends to reject the login.  Returns 1 if the run
+ * matched the expectation.
+ */
+static int
+run_auth(struct cred_cfg *cc, int expect_ok)
+{
+	struct ipc_netchan_userauth ua = {
+		.user = "alice",
+		.get_key = cred_get_key,
+		.get_password = cred_get_password,
+		.cred_ctx = cc,
+	};
+	struct ipc_netchan_auth auth = { .psk = auth_psk, .userauth = &ua };
+	struct sockaddr_in sin;
+	struct nc_addr peer;
+	struct ipc_transport *t;
+	uint16_t port = 0, cport = 0;
+	int sfd, cfd, status, established, ok;
+	pid_t pid;
+
+	sfd = bind_loopback(&port);
+	cfd = bind_loopback(&cport);
+	if (sfd < 0 || cfd < 0) {
+		if (sfd >= 0)
+			close(sfd);
+		if (cfd >= 0)
+			close(cfd);
+		return 0;
+	}
+
+	pid = fork();
+	if (pid < 0) {
+		close(sfd);
+		close(cfd);
+		return 0;
+	}
+	if (pid == 0) {
+		close(cfd);
+		auth_server_child(sfd);		/* no return */
+		_exit(99);
+	}
+	close(sfd);
+
+	memset(&sin, 0, sizeof(sin));
+	sin.sin_family = AF_INET;
+	sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	sin.sin_port = htons(port);
+	if (nc_udp_from_sockaddr(&peer, (struct sockaddr *)&sin,
+	    sizeof(sin)) != 0) {
+		close(cfd);
+		waitpid(pid, NULL, 0);
+		return 0;
+	}
+
+	t = ipc_transport_netchan_new_crypto_auth(cfd, 0, &peer, &auth);
+	if (!t) {
+		close(cfd);
+		waitpid(pid, NULL, 0);
+		return 0;
+	}
+
+	established = (ipc_transport_netchan_establish(t, 5000) == 0);
+	ok = 0;
+	if (expect_ok && established) {
+		uint8_t out[64], in[64];
+		uint32_t type, len;
+
+		memset(out, 0x5A, sizeof(out));
+		ok = ipc_transport_send(t, MSG_ECHO, out, sizeof(out)) == 0 &&
+		    ipc_transport_recv(t, &type, in, sizeof(in), &len) == 0 &&
+		    type == MSG_ECHO && len == sizeof(out) &&
+		    memcmp(in, out, sizeof(out)) == 0;
+	} else if (!expect_ok) {
+		ok = !established;	/* the login must be refused */
+	}
+	ipc_transport_free(t);
+
+	waitpid(pid, &status, 0);
+	if (!WIFEXITED(status))
+		return 0;
+	/* server exits 0 on a good auth+echo, 2 when it rejects the login. */
+	if (expect_ok && WEXITSTATUS(status) != 0)
+		return 0;
+	if (!expect_ok && WEXITSTATUS(status) == 0)
+		return 0;
+	return ok;
+}
+
+static void
+test_userauth_pubkey(void)
+{
+	struct cred_cfg cc = { .give_key = 1, .password = NULL };
+
+	TEST("netchan userauth: authorized key logs in and TLV flows");
+	if (run_auth(&cc, 1))
+		PASS();
+	else
+		FAIL("pubkey login or round-trip failed");
+}
+
+static void
+test_userauth_password(void)
+{
+	struct cred_cfg cc = { .give_key = 0, .password = AUTH_PASSWORD };
+
+	TEST("netchan userauth: password fallback logs in");
+	if (run_auth(&cc, 1))
+		PASS();
+	else
+		FAIL("password login failed");
+}
+
+static void
+test_userauth_denied(void)
+{
+	struct cred_cfg cc = { .give_key = 0, .password = "wrong" };
+
+	TEST("netchan userauth: bad credentials are refused");
+	if (run_auth(&cc, 0))
+		PASS();
+	else
+		FAIL("bad login was not refused");
+}
+
 int
 main(void)
 {
+	uint8_t seed[32];
+
 	printf("netchan ipc_transport tests:\n");
+
+	memset(seed, 0x5C, sizeof(seed));
+	crypto_eddsa_key_pair(g_client_sk, g_client_pk, seed);
 
 	test_netchan_transport_roundtrip();
 	test_netchan_transport_nonblocking();
@@ -442,6 +673,9 @@ main(void)
 	test_netchan_transport_encrypted_nonblocking();
 	test_netchan_transport_roaming();
 	test_netchan_transport_roaming_self();
+	test_userauth_pubkey();
+	test_userauth_password();
+	test_userauth_denied();
 
 	printf("\n%d tests, %d failures\n", test_count, fail_count);
 	return fail_count > 0 ? 1 : 0;

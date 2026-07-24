@@ -1,6 +1,21 @@
 # TODO
 
-(nothing open)
+## Bugs
+
+- [ ] in GNOME terminal: the numbered lists display in Claude CLI while inside lumi show up as blank, instead of:
+    ```
+    1. Something
+    2. Something
+    3. Something
+    ```
+    I see:
+    ```
+                  Something
+                  Something
+                  Something
+    ```
+
+- [ ] Detach (ctrl-A d) of lumi while in GNOME terminal consistently segfaults. possibly in other terminals.
 
 # DONE
 

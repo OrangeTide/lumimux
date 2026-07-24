@@ -9,6 +9,30 @@
 #include "nc_addr.h"
 
 /****************************************************************
+ * Version
+ ****************************************************************/
+
+/*
+ * SemVer, and the release tag is this string with a "v" in front. The
+ * release workflow refuses to publish a tag that disagrees with what is
+ * written here, so a vendored copy can be identified from its source alone.
+ *
+ * The wire protocol is versioned separately and does not move with this:
+ * compatibility holds within a minor version and no further. See
+ * CHANGELOG.md.
+ */
+#define NETCHAN_VERSION_MAJOR 0
+#define NETCHAN_VERSION_MINOR 6
+#define NETCHAN_VERSION_PATCH 0
+#define NETCHAN_VERSION_STRING "0.6.0"
+
+/** The version as one comparable integer, e.g. 0.5.0 is 500. Use it to
+ *  compile against more than one release: NETCHAN_VERSION >= 500. */
+#define NETCHAN_VERSION (NETCHAN_VERSION_MAJOR * 10000 + \
+                         NETCHAN_VERSION_MINOR * 100 + \
+                         NETCHAN_VERSION_PATCH)
+
+/****************************************************************
  * Constants
  ****************************************************************/
 
@@ -98,6 +122,10 @@ void netchan_cfg_default(struct netchan_cfg *cfg);
  ****************************************************************/
 
 struct netchan_conn *netchan_open(int server);
+/* Queue a DISCONNECT for the peer and enter CLOSING, without freeing.  Run one
+ * netchan_send_next cycle afterward to transmit it, then netchan_close to free.
+ * A graceful shutdown that saves the peer a keepalive timeout. */
+void netchan_disconnect(struct netchan_conn *c);
 void netchan_close(struct netchan_conn *c);
 void netchan_config(struct netchan_conn *c, const struct netchan_cfg *cfg);
 int netchan_state(struct netchan_conn *c);
@@ -136,6 +164,11 @@ struct netchan_chan *netchan_chan_open(struct netchan_conn *c,
 void netchan_chan_close(struct netchan_chan *ch);
 int netchan_chan_id(struct netchan_chan *ch);
 int netchan_chan_type(struct netchan_chan *ch);
+/** The channel's content-type string, as given to netchan_chan_open() or as
+ * carried in the peer's OPEN. Use it to tell apart channels that share a
+ * netchan type, e.g. two reliable streams named "control" and "events".
+ * Never NULL: a channel opened without one reads back as "". */
+const char *netchan_chan_content_type(struct netchan_chan *ch);
 int netchan_chan_state(struct netchan_chan *ch);
 
 /** Queue a datagram or stream bytes for sending. Returns bytes queued. */

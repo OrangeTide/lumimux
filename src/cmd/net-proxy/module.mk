@@ -8,6 +8,7 @@ LIBRARIES += lu_netproxy
 
 test_net_proxy_DIR := $(lu_netproxy_DIR)
 test_net_proxy_SRCS = test_net_proxy.c
+test_net_proxy_CPPFLAGS = -I$(lu_net_DIR)third_party
 test_net_proxy_LIBS = lu_netproxy lu_net lu_ipc lu_sessdir lu_core
 EXECUTABLES += test_net_proxy
 

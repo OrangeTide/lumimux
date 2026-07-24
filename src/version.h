@@ -1,3 +1,3 @@
 #ifndef LUMI_VERSION
-#define LUMI_VERSION "26.05.5"
+#define LUMI_VERSION "26.07.1"
 #endif

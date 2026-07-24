@@ -6,6 +6,7 @@
 #include "multicall.h"
 #include "log.h"
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,7 +41,23 @@ launch_mserver(const char *name, const char *shell)
 	}
 
 	if (pid == 0) {
+		int nfd;
+
+		/* Detach from the caller's descriptors.  The mserver outlives
+		 * "lumi new", so a caller that captures our output (a pipe,
+		 * $(...), script(1), a CI harness) would otherwise block on EOF
+		 * for the whole life of the session because the daemon still
+		 * holds the write end.  setsid drops the controlling terminal;
+		 * redirecting std fds to /dev/null drops the inherited ones. */
 		setsid();
+		nfd = open("/dev/null", O_RDWR);
+		if (nfd >= 0) {
+			dup2(nfd, STDIN_FILENO);
+			dup2(nfd, STDOUT_FILENO);
+			dup2(nfd, STDERR_FILENO);
+			if (nfd > STDERR_FILENO)
+				close(nfd);
+		}
 		if (shell) {
 			char *child_argv[] = {
 			    "lumi-mserver", "-s", (char *)name,

@@ -80,6 +80,7 @@ Attach to an existing session.
 .RB [ "\-f window" ]
 .RB [ "\-m mode" ]
 .RB [ \-n ]
+.RB [ \-V ]
 .RB [ "\-s name" ]
 .RI [ name ]
 .TP
@@ -120,10 +121,54 @@ Window I/O flows over the encrypted netchan link rather than through ssh.
 The link roams: if the client's network changes, the session follows the
 new address automatically without reattaching.
 .TP
+.B \-V
+Verify the net-proxy's long-term identity key (requires
+.BR \-n ).
+The proxy must be started with
+.BR "lumi net-proxy \-k" .
+The server presents an X25519 identity key during the handshake; it is
+compared against the copy the proxy published out of band (the
+.I net-hostkey
+session file for a local target, or a third field on the
+.BR "lumi net-proxy \-d"
+report line for a remote one) and against the client's
+.I known_hosts
+store under
+.IR ~/.config/lumi .
+On first contact the key's fingerprint is shown and confirmation is
+requested before it is pinned; a later mismatch aborts the connection.
+This authenticates the server across restarts, when the rotating
+pre-shared key alone cannot.
+.TP
 .BI \-s " name"
 Session name (default:
 .BR 0 ).
 A positional argument may also be used.
+.PP
+A session given as a
+.B lumi://
+URL is a direct-connect target: it dials a persistently-listening
+.B "lumi net-proxy \-L"
+and authenticates the user over netchan with no ssh bootstrap.
+.PP
+.RS 4
+.BI lumi:// [ user @] host : port / session
+.RE
+.PP
+.I user
+defaults to
+.BR $USER .
+The connection is encrypted and the server's host key is pinned in
+.I ~/.config/lumi/known_hosts
+on first contact (with a fingerprint prompt), exactly as
+.B \-V
+does.
+The user then logs in with the identity key from
+.I ~/.config/lumi/id_netchan
+(see
+.BR "lumi net-keygen" ),
+or, if that is refused or absent, a password.
+An encrypted key is unlocked with a passphrase prompt before connecting.
 .PP
 Remote sessions may be specified using scp-style syntax:
 .PP
@@ -318,6 +363,7 @@ Connect to it with
 .RB [ \-p
 .IR port ]
 .RB [ \-d ]
+.RB [ \-k ]
 .TP
 .BI \-s " session"
 Session name (required).
@@ -335,8 +381,101 @@ Print one line,
 .RI \(dq "udp " port " " key \(dq,
 on standard output reporting the bound port and the hex-encoded
 pre-shared key, then detach and keep serving in the background.
+With
+.BR \-k ,
+a third field carrying the hex-encoded host public key is appended.
 .B lumi attach \-n
 runs this over ssh to learn where and how to connect.
+.TP
+.B \-k
+Present a long-term X25519 identity key so a client can verify the server
+across restarts (see
+.BR "lumi attach \-V" ).
+The secret is loaded from, or generated on first use in,
+.I ~/.config/lumi/host_key
+(mode 0600, honoring
+.BR XDG_CONFIG_HOME ).
+Its public half is published as
+.I net-hostkey
+in the session directory, and appended to the
+.B \-d
+report line.
+Without this option the proxy authenticates by the pre-shared key alone.
+.TP
+.B \-L
+Direct-connect mode: listen persistently on the fixed
+.B \-p
+port and serve clients one at a time, each authenticating over netchan with
+no ssh bootstrap.
+There is no pre-shared key; the connection is encrypted, the server is pinned
+by its host key (as with
+.BR \-k ),
+and the user proves identity with a public key or password.
+The server reads
+.I ~/.config/lumi/authorized_keys
+(lines of
+.RI \(dq user " " hexkey \(dq)
+and
+.I ~/.config/lumi/passwd
+(Argon2id hashes); at least one must exist.
+Connect with
+.BR "lumi attach lumi://" user @ host : port / session .
+A fixed
+.B \-p
+port is required.
+.SS lumi net-keygen
+Generate a netchan client identity key for user authentication over a
+networked attach.
+It writes an Ed25519 key pair, optionally sealed under a passphrase, and
+prints the public key line to enroll in a server's
+.I authorized_keys
+file.
+This is the client half of netchan's ssh-shaped userauth.
+.PP
+.B lumi net-keygen
+.RB [ \-f
+.IR keyfile ]
+.RB [ \-N
+.IR passphrase ]
+.RB [ \-q ]
+.TP
+.BI \-f " keyfile"
+Key path (default:
+.IR ~/.config/lumi/id_netchan ,
+honoring
+.BR XDG_CONFIG_HOME ).
+The tool refuses to overwrite an existing key.
+.TP
+.BI \-N " passphrase"
+Passphrase to seal the secret key with, stretched by Argon2id.
+An empty value leaves the key unencrypted.
+Without
+.BR \-N ,
+the tool prompts (with echo off) and asks for confirmation.
+.TP
+.B \-q
+Print only the public key as hex, for scripting.
+.SS lumi net-passwd
+Enroll a password for a user on a direct-connect server, the password half
+of netchan's userauth.
+It reads a password from the terminal (with echo off, asked twice) and
+appends an Argon2id hash for the named user to the server's
+.I passwd
+file.
+.PP
+.B lumi net-passwd
+.RB [ \-f
+.IR passwdfile ]
+.I user
+.TP
+.BI \-f " passwdfile"
+Password file path (default:
+.IR ~/.config/lumi/passwd ,
+honoring
+.BR XDG_CONFIG_HOME ).
+The tool refuses a
+.I user
+that already has a line, so remove it first to change a password.
 .SH KEY BINDINGS
 All key bindings use a prefix key (default:
 .BR Ctrl\-A )
@@ -800,7 +939,37 @@ The original umask is restored for child shell processes.
 .PP
 The session directory is cleaned of stale entries (dead server
 processes) on each attach and list operation.
+.PP
+When
+.B "lumi net-proxy \-k"
+and
+.B "lumi attach \-V"
+are used, the server's identity secret
+.RI ( ~/.config/lumi/host_key )
+is created with mode 0600 and the client pins server keys in
+.IR ~/.config/lumi/known_hosts .
+A direct-connect listener
+.RB ( "lumi net-proxy \-L" )
+additionally authenticates the user against
+.I ~/.config/lumi/authorized_keys
+and
+.IR ~/.config/lumi/passwd ,
+and the client presents its
+.I ~/.config/lumi/id_netchan
+key (mode 0600, optionally passphrase-sealed).
+All paths honor
+.BR XDG_CONFIG_HOME .
 .SH ENVIRONMENT
+.TP
+.B XDG_CONFIG_HOME
+Base directory for
+.B lumi
+configuration
+.RI ( lumi.conf )
+and the network identity files
+.RI ( host_key ", " known_hosts ).
+Defaults to
+.IR ~/.config .
 .TP
 .B LUMI_SESSION
 Set inside an attached session to the current session name.

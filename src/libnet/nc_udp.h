@@ -4,7 +4,13 @@
 #ifndef NC_UDP_H
 #define NC_UDP_H
 
-#include <sys/socket.h>
+/* Socket types: BSD sockets on POSIX, winsock2 on Windows. */
+#ifdef _WIN32
+#  include <winsock2.h>
+#  include <ws2tcpip.h>          /* socklen_t, sockaddr_in6 */
+#else
+#  include <sys/socket.h>
+#endif
 #include "nc_addr.h"
 
 /*

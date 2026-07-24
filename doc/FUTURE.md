@@ -329,6 +329,96 @@ channel may later carry loss-tolerant status. Netchan support is optional
      is covered by `test_ipc_transport_net`; the send-error trigger is not
      loopback-observable, so the attach glue is verified by inspection and a
      no-regression run of `attach -n`.
+   - 5d: server identity (ssh host-key TOFU). The PSK already gives mutual
+     authentication, but it rotates every startup, so a client cannot pin a
+     server across restarts. netchan's `nc_crypto` carries an optional
+     long-term X25519 identity key: the server presents its public half in
+     the HELLO, a second Diffie-Hellman folds it into the key derivation, and
+     the first sealed packet that opens is proof of possession (Noise NX).
+     lumi wires this as opt-in server auth, layered on the PSK, not replacing
+     it:
+       - Files live under `~/.config/lumi/` (honoring `XDG_CONFIG_HOME`):
+         the server's `host_key` (its X25519 secret, mode 0600, generated on
+         first use) and the client's `known_hosts` (host -> pinned public
+         key). Both formats come from netchan's vendored `keystore` (only
+         `ks_host_key` and `ks_known_host`/`ks_known_host_add` are used;
+         `nc_auth` userauth is not adopted).
+       - net-proxy gains `-k`: it loads or generates its host key, presents
+         it via `ipc_netchan_auth.static_sk`, appends the public key (hex) as
+         a third field on the `-d` report line ("udp <port> <psk> <hostkey>"),
+         and writes it to a `net-hostkey` session file for the local path.
+       - attach gains `-V` (verify host): for a remote target it adds `-k` to
+         the ssh net-proxy invocation and reads the third report field; for a
+         local target it reads `net-hostkey`. It installs a `verify_peer`
+         callback that consults `known_hosts` via `ks_known_host`. MATCH is
+         accepted; CHANGED is refused loudly inside the handshake; UNKNOWN is
+         accepted tentatively and confirmed by an interactive fingerprint
+         prompt *after* `_establish` returns, so a slow human cannot trip the
+         5s handshake timeout. Declining tears the session down before any
+         data flows. On acceptance the key is recorded with
+         `ks_known_host_add`. The prompt runs pre-TUI while the terminal is
+         still cooked.
+     Without `-k`/`-V` the flow is byte-identical to 5b. Forward secrecy is
+     unchanged: the ephemeral-ephemeral secret stays in the transcript, so a
+     later host-key theft permits impersonation but does not decrypt recorded
+     sessions.
+   - 5e: user authentication (nc_auth), gated mechanism. netchan's
+     `nc_auth` (vendored) is an ssh-shaped userauth conversation
+     (publickey/password) carried as reliable messages over the encrypted
+     channel, authenticating the connecting *user* rather than the
+     connection. In lumi's current flow the user is already authenticated by
+     ssh (cross-host) or filesystem access (local), so this is redundant
+     until a direct-connect deployment (dialing a listening net-proxy with no
+     ssh) is built. Landed so far, gated and off by default: the vendored
+     `nc_auth`; `lumi net-keygen`, which writes an Ed25519 client identity
+     (`~/.config/lumi/id_netchan`, Argon2id-sealable) and prints the
+     `authorized_keys` line; and an opt-in auth phase in the netchan
+     transport. When `ipc_netchan_auth.userauth` is non-NULL,
+     `_establish` runs the conversation over the reliable channel after the
+     crypto handshake and before any TLV, framing each nc_auth message with a
+     2-byte length; a denied login fails the establish. The server supplies
+     policy callbacks (backed by `authorized_keys`/`passwd` when wired), the
+     client supplies `user` plus credential fetchers that should hand over a
+     preloaded key or already-collected password so the establish deadline
+     cannot race a human. With `userauth` NULL the transport is byte-identical
+     to 5d. Verified: `test_nc_auth` covers the state machines (pubkey,
+     password fallback, denial, session-id binding) and
+     `test_ipc_transport_net` drives the phase over a real loopback link
+     (pubkey login + TLV, password fallback, refusal), valgrind-clean.
+   - 5f: direct-connect deployment. `net-proxy -L -p <port>` listens
+     persistently and serves clients one at a time (rebinding the fixed port
+     between them, reusing the single-client bridge; no two simultaneous
+     attaches, the documented one-client limit). It presents a host key and
+     requires userauth backed by `~/.config/lumi/authorized_keys` (via
+     `ks_authorized_key`) and `passwd` (via `ks_check_password`); the same
+     methods are offered for every name so the handshake cannot enumerate
+     accounts. There is no PSK: the endpoint is public and every client
+     authenticates. `attach lumi://[user@]host:port/session` dials it
+     directly with no ssh, pins the host key in `known_hosts` on first contact
+     (the `-V` fingerprint prompt), unlocks `~/.config/lumi/id_netchan` (with
+     a passphrase prompt up front so the handshake deadline cannot race the
+     human), and logs in by public key or password. `lumi net-keygen` writes
+     the client key and prints its `authorized_keys` line. Verified end to end
+     through the screen harness: host-key TOFU, pubkey login, keystroke
+     forwarding, and live render all work over the direct link; the full test
+     suite stays green. This is what makes the userauth of 5e non-redundant
+     with ssh.
+     Automated coverage: `test_net_proxy` drives the real `-L` listener with
+     a fake mserver and a forked proxy: an authorized key logs in and
+     round-trips, the listener serves a second client (proving the
+     rebind-and-loop persistence), and an unenrolled key is refused.
+     Building it surfaced and fixed two real listener bugs. First, a client's
+     graceful close queued a netchan DISCONNECT but never flushed it before
+     dropping the socket, so a persistent server only learned a client left
+     via the keepalive timeout and stalled the next client for seconds; the
+     transport now transmits the DISCONNECT (new upstream `netchan_disconnect`,
+     flushed in `nct_close`). Second, `udp_bind` lacked `SO_REUSEADDR`, so the
+     immediate rebind of the fixed port could fail. Known limitation: a client
+     that connects immediately after a *rejected* one can fail to establish,
+     because the rejected client's stray DISCONNECT reaches the freshly
+     rebound socket; a legitimate client's retry recovers. A clean fix wants a
+     per-connection socket or a drain-before-serve step, left for the
+     concurrent-clients work.
 
 ---
 

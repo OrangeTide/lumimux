@@ -35,6 +35,8 @@ static const struct {
 	{ "new",	cmd_new_main },
 	{ "new-window",	cmd_new_window_main },
 	{ "net-proxy",	cmd_net_proxy_main },
+	{ "net-keygen",	cmd_net_keygen_main },
+	{ "net-passwd",	cmd_net_passwd_main },
 	{ "proxy",	cmd_proxy_main },
 	{ "reload",	cmd_reload_main },
 	{ "send-input",	cmd_send_input_main },

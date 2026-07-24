@@ -1,11 +1,24 @@
 /* netchan.c : multiplexed UDP channels for game networking */
 /* Made by a machine. PUBLIC DOMAIN (CC0-1.0) */
 
+#ifdef _WIN32
+/* rand_s() sits behind this in <stdlib.h>, and it has to be defined before
+ * anything pulls that header in. */
+#  define _CRT_RAND_S
+#endif
+
 #include "netchan.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
+
+/* Monotonic clock: clock_gettime on POSIX, GetTickCount64 on Windows. */
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#else
+#  include <time.h>
+#endif
 
 /****************************************************************
  * Internal constants
@@ -98,23 +111,60 @@ rd32(const uint8_t *p)
 static uint32_t
 nc_now_ms(void)
 {
+#ifdef _WIN32
+    return (uint32_t)GetTickCount64();
+#else
     struct timespec ts;
+
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+#endif
 }
 
+/*
+ * A connection id has to be unpredictable enough that a peer cannot guess
+ * the next one, and it must differ between two processes that start at the
+ * same moment. Nothing is authenticated by it.
+ *
+ * The core has no crypto dependency and adds no link-time one either, which
+ * is why this asks the C runtime rather than reaching for BCryptGenRandom
+ * the way crypto/nc_crypto.c and auth/keystore.c do. Those two derive key
+ * material and are already linking a library for it; the core is meant to
+ * build with nothing but a compiler. rand_s draws from the same OS pool.
+ */
 static uint32_t
 nc_random_id(void)
 {
     uint32_t id = 0;
+
+#ifdef _WIN32
+    unsigned int v;
+
+    if (rand_s(&v) == 0)
+        id = (uint32_t)v;
+#else
     FILE *f = fopen("/dev/urandom", "r");
+
     if (f) {
         if (fread(&id, sizeof(id), 1, f) != 1)
             id = 0;
         fclose(f);
     }
-    if (id == 0)
-        id = (uint32_t)rand() ^ ((uint32_t)rand() << 16);
+#endif
+
+    /*
+     * Last resort: a process with no /dev, or an entropy call that refused.
+     * The old fallback called rand() without ever seeding it, so every
+     * process produced the identical sequence of ids. Mix the clock with a
+     * stack address instead, which differs between processes on any system
+     * that lays memory out differently from one run to the next.
+     */
+    if (id == 0) {
+        uintptr_t here = (uintptr_t)&id;
+
+        id = nc_now_ms() * 2654435761u;
+        id ^= (uint32_t)here ^ (uint32_t)(here >> 16);
+    }
     if (id == 0)
         id = 1;
     return id;
@@ -1001,6 +1051,22 @@ netchan_open(int server)
 }
 
 void
+netchan_disconnect(struct netchan_conn *c)
+{
+    if (!c || c->state != NETCHAN_STATE_CONNECTED)
+        return;
+    /*
+     * Queue a DISCONNECT for the peer and move to CLOSING.  netchan has no
+     * socket of its own, so the caller must run one send cycle
+     * (netchan_send_next) to actually transmit it before freeing the
+     * connection with netchan_close.  This lets a peer learn a session ended
+     * at once instead of waiting for the keepalive timeout to expire.
+     */
+    ctrl_disconnect(c, 0);
+    c->state = NETCHAN_STATE_CLOSING;
+}
+
+void
 netchan_close(struct netchan_conn *c)
 {
     if (!c) return;
@@ -1404,6 +1470,12 @@ int
 netchan_chan_type(struct netchan_chan *ch)
 {
     return ch->type;
+}
+
+const char *
+netchan_chan_content_type(struct netchan_chan *ch)
+{
+    return ch->content_type;
 }
 
 int

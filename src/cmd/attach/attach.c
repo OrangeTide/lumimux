@@ -21,6 +21,9 @@
 #include "ipc_msg.h"
 #include "ipc_transport.h"
 #include "ipc_transport_netchan.h"
+#include "keystore.h"
+#include "nc_crypto.h"
+#include "nc_auth.h"
 #include "nc_udp.h"
 #include "lumi_msg.h"
 #include "proxy_msg.h"
@@ -59,7 +62,9 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
+#include <termios.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -4639,22 +4644,170 @@ hex_decode(const char *hex, uint8_t *out, size_t n)
 	return 0;
 }
 
+/* Build ~/.config/lumi/<name> (honoring XDG_CONFIG_HOME) into buf, creating
+ * the directory if needed.  Returns 0 on success, -1 on no home dir,
+ * truncation, or a directory that cannot be created. */
+static int
+lumi_config_path(char *buf, size_t sz, const char *name)
+{
+	const char *xdg = getenv("XDG_CONFIG_HOME");
+	const char *home = getenv("HOME");
+	char dir[256];
+	int n;
+
+	if (xdg && *xdg)
+		n = snprintf(dir, sizeof(dir), "%s/lumi", xdg);
+	else if (home && *home)
+		n = snprintf(dir, sizeof(dir), "%s/.config/lumi", home);
+	else
+		return -1;
+	if (n <= 0 || (size_t)n >= sizeof(dir))
+		return -1;
+
+	if (mkdir(dir, 0700) != 0 && errno != EEXIST)
+		return -1;
+
+	n = snprintf(buf, sz, "%s/%s", dir, name);
+	return (n > 0 && (size_t)n < sz) ? 0 : -1;
+}
+
+/* Server-identity verification state, carried through the crypto handshake.
+ * The verify callback fires mid-handshake and cannot block on a human, so it
+ * only records a verdict; an UNKNOWN host is confirmed by an interactive
+ * prompt after the handshake completes (see net_connect). */
+struct host_verify {
+	char known_hosts[256];	/* path to ~/.config/lumi/known_hosts */
+	char host[128];		/* lookup key: hostname, or "localhost" */
+	const uint8_t *expected; /* out-of-band pubkey, or NULL for blind TOFU */
+	int result;		/* KS_HOST_*, or -1 if the server presented none */
+	uint8_t presented[32];	/* the key the server actually presented */
+	uint8_t stored[32];	/* the previously pinned key, on KS_HOST_CHANGED */
+};
+
+/* nc_crypto verify_peer callback.  Compares the server's presented identity
+ * key against the out-of-band expectation and the known_hosts store, and
+ * records the verdict.  Returns 0 to let the handshake proceed (MATCH or a
+ * first-contact UNKNOWN, confirmed later), non-zero to refuse it outright (no
+ * key, out-of-band mismatch, or a changed pinned key). */
+static int
+host_verify_cb(void *ctx, const uint8_t *peer_static_pk)
+{
+	struct host_verify *hv = ctx;
+
+	if (!peer_static_pk) {
+		hv->result = -1;
+		return -1;
+	}
+	memcpy(hv->presented, peer_static_pk, 32);
+
+	/* The bootstrap channel (ssh, or the local session dir) already told
+	 * us which key to expect.  A different key on the UDP path is a MITM. */
+	if (hv->expected && memcmp(hv->expected, peer_static_pk, 32) != 0) {
+		hv->result = KS_HOST_CHANGED;
+		return -1;
+	}
+
+	hv->result = ks_known_host(hv->known_hosts, hv->host, peer_static_pk,
+	    hv->stored);
+	if (hv->result == KS_HOST_CHANGED)
+		return -1;
+	return 0;
+}
+
+/* Ask the user, on the still-cooked terminal, whether to trust a server's key
+ * on first contact.  Returns 0 to accept, -1 to decline. */
+static int
+host_verify_prompt(const struct host_verify *hv)
+{
+	char fp[65], line[16];
+
+	ks_hex_encode(fp, hv->presented, 32);
+	fprintf(stderr,
+	    "The identity of host '%s' is not established.\n"
+	    "Its public key fingerprint is:\n  %s\n"
+	    "Trust this key and continue connecting? (yes/no) ",
+	    hv->host, fp);
+	fflush(stderr);
+
+	if (!fgets(line, sizeof(line), stdin))
+		return -1;
+	if (strcmp(line, "yes\n") == 0 || strcmp(line, "y\n") == 0)
+		return 0;
+	fprintf(stderr, "Host key not accepted; aborting.\n");
+	return -1;
+}
+
 /* Wrap fd in an encrypted netchan transport toward peer, authenticated by
  * psk, and run the handshake.  Takes ownership of fd (closed on failure).
- * Sets rnet on success.  Returns 0 on success, -1 on error. */
+ * When hv is non-NULL, verify the server's long-term identity key: the
+ * handshake refuses a changed or missing key, and a first-contact key is
+ * confirmed by an interactive prompt before it is pinned.  Sets rnet on
+ * success.  Returns 0 on success, -1 on error. */
 static int
-net_connect(int fd, const struct nc_addr *peer, const uint8_t *psk)
+net_connect(int fd, const struct nc_addr *peer, const uint8_t *psk,
+    struct host_verify *hv, const struct ipc_netchan_userauth *ua)
 {
-	rnet = ipc_transport_netchan_new_crypto(fd, 0, peer, psk);
+	struct ipc_netchan_auth auth = { .psk = psk };
+
+	if (hv) {
+		auth.verify_peer = host_verify_cb;
+		auth.verify_ctx = hv;
+		auth.require_peer_static = 1;
+	}
+	auth.userauth = ua;
+
+	rnet = ipc_transport_netchan_new_crypto_auth(fd, 0, peer, &auth);
 	if (!rnet) {
 		close(fd);
 		return -1;
 	}
 	if (ipc_transport_netchan_establish(rnet, 5000) != 0) {
+		if (hv && hv->result == KS_HOST_CHANGED) {
+			char now[65], was[65];
+
+			ks_hex_encode(now, hv->presented, 32);
+			ks_hex_encode(was, hv->stored, 32);
+			fprintf(stderr,
+			    "WARNING: identity key for host '%s' has changed!\n"
+			    "  expected: %s\n  presented: %s\n"
+			    "This could be a man-in-the-middle attack. "
+			    "Refusing to connect.\n", hv->host, was, now);
+		} else if (hv && hv->result == -1) {
+			fprintf(stderr,
+			    "Host '%s' presented no identity key; refusing "
+			    "(-V requires one).\n", hv->host);
+		}
 		ipc_transport_free(rnet);
 		rnet = NULL;
 		return -1;
 	}
+
+	/* First contact: confirm the key with the user, then pin it. */
+	if (hv && hv->result == KS_HOST_UNKNOWN) {
+		if (host_verify_prompt(hv) != 0 ||
+		    ks_known_host_add(hv->known_hosts, hv->host,
+		    hv->presented) != 0) {
+			ipc_transport_free(rnet);
+			rnet = NULL;
+			return -1;
+		}
+	}
+	return 0;
+}
+
+/* Fill hv for a connection to `host`, using `expected` as the out-of-band
+ * key if non-NULL.  Returns 0 on success, -1 if the config path cannot be
+ * built. */
+static int
+host_verify_prepare(struct host_verify *hv, const char *host,
+    const uint8_t *expected)
+{
+	memset(hv, 0, sizeof(*hv));
+	if (lumi_config_path(hv->known_hosts, sizeof(hv->known_hosts),
+	    "known_hosts") != 0)
+		return -1;
+	snprintf(hv->host, sizeof(hv->host), "%s", host);
+	hv->expected = expected;
 	return 0;
 }
 
@@ -4666,10 +4819,11 @@ net_connect(int fd, const struct nc_addr *peer, const uint8_t *psk)
  * (learning the remote endpoint and key over ssh) is a later step; today
  * this attaches to a net-proxy bridging a session on this host. */
 static int
-start_net_proxy(const char *session)
+start_net_proxy(const char *session, int verify)
 {
-	char *addr, *key;
-	uint8_t psk[32];
+	char *addr, *key, *hostkey = NULL;
+	uint8_t psk[32], host_pk[32];
+	struct host_verify hv, *hvp = NULL;
 	struct sockaddr_in sin;
 	struct nc_addr peer;
 	int port = 0, fd;
@@ -4682,6 +4836,21 @@ start_net_proxy(const char *session)
 		return -1;
 	}
 	free(key);
+
+	if (verify) {
+		hostkey = sessdir_read_session_file(session, "net-hostkey");
+		if (!hostkey || hex_decode(hostkey, host_pk,
+		    sizeof(host_pk)) != 0) {
+			fprintf(stderr, "lumi-attach: net-proxy for '%s' "
+			    "published no host key (-k needed)\n", session);
+			free(hostkey);
+			return -1;
+		}
+		free(hostkey);
+		if (host_verify_prepare(&hv, "localhost", host_pk) != 0)
+			return -1;
+		hvp = &hv;
+	}
 
 	addr = sessdir_read_session_file(session, "net-addr");
 	if (!addr)
@@ -4705,7 +4874,7 @@ start_net_proxy(const char *session)
 		return -1;
 	}
 
-	return net_connect(fd, &peer, psk);
+	return net_connect(fd, &peer, psk, hvp, NULL);
 }
 
 /* Reach a lumi-net-proxy on another host.  Runs `lumi net-proxy -d` there
@@ -4717,12 +4886,16 @@ start_net_proxy(const char *session)
  * Returns 0 on success, -1 on error. */
 static int
 ssh_capture_endpoint(const char *user, const char *host, const char *rsession,
-    int *port, uint8_t *psk)
+    int *port, uint8_t *psk, uint8_t *host_pk, int *have_host_pk)
 {
 	int pfd[2];
 	pid_t pid;
-	char dest[384], line[256], hex[65];
+	char dest[384], line[256], hex[65], hkhex[65];
 	size_t off = 0;
+	int want_hostkey = (host_pk != NULL);
+
+	if (have_host_pk)
+		*have_host_pk = 0;
 
 	if (user)
 		snprintf(dest, sizeof(dest), "%s@%s", user, host);
@@ -4743,9 +4916,16 @@ ssh_capture_endpoint(const char *user, const char *host, const char *rsession,
 		if (pfd[1] > STDERR_FILENO)
 			close(pfd[1]);
 		lu_umask_restore();
-		execlp("ssh", "ssh", "-T", "-o", "BatchMode=yes", dest,
-		    "lumi", "net-proxy", "-s", rsession, "-b", "0.0.0.0",
-		    "-d", NULL);
+		/* -k makes the remote proxy advertise its identity key as a
+		 * third report field, which we pin below. */
+		if (want_hostkey)
+			execlp("ssh", "ssh", "-T", "-o", "BatchMode=yes", dest,
+			    "lumi", "net-proxy", "-s", rsession, "-b",
+			    "0.0.0.0", "-d", "-k", NULL);
+		else
+			execlp("ssh", "ssh", "-T", "-o", "BatchMode=yes", dest,
+			    "lumi", "net-proxy", "-s", rsession, "-b",
+			    "0.0.0.0", "-d", NULL);
 		_exit(127);
 	}
 
@@ -4768,22 +4948,44 @@ ssh_capture_endpoint(const char *user, const char *host, const char *rsession,
 	waitpid(pid, NULL, 0);
 	line[off] = '\0';
 
-	if (sscanf(line, "udp %d %64s", port, hex) != 2 || *port <= 0)
+	if (want_hostkey) {
+		if (sscanf(line, "udp %d %64s %64s", port, hex, hkhex) != 3 ||
+		    *port <= 0)
+			return -1;
+		if (hex_decode(hkhex, host_pk, 32) != 0)
+			return -1;
+		*have_host_pk = 1;
+	} else if (sscanf(line, "udp %d %64s", port, hex) != 2 || *port <= 0) {
 		return -1;
+	}
 	return hex_decode(hex, psk, 32);
 }
 
 static int
-start_net_proxy_ssh(const char *user, const char *host, const char *rsession)
+start_net_proxy_ssh(const char *user, const char *host, const char *rsession,
+    int verify)
 {
-	uint8_t psk[32];
+	uint8_t psk[32], host_pk[32];
+	struct host_verify hv, *hvp = NULL;
 	struct addrinfo hints, *res = NULL;
 	struct sockaddr_in sin;
 	struct nc_addr peer;
-	int port = 0, fd;
+	int port = 0, fd, have_host_pk = 0;
 
-	if (ssh_capture_endpoint(user, host, rsession, &port, psk) != 0)
+	if (ssh_capture_endpoint(user, host, rsession, &port, psk,
+	    verify ? host_pk : NULL, &have_host_pk) != 0)
 		return -1;
+
+	if (verify) {
+		if (!have_host_pk) {
+			fprintf(stderr, "lumi-attach: remote net-proxy did not "
+			    "advertise a host key\n");
+			return -1;
+		}
+		if (host_verify_prepare(&hv, host, host_pk) != 0)
+			return -1;
+		hvp = &hv;
+	}
 
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_INET;
@@ -4802,7 +5004,232 @@ start_net_proxy_ssh(const char *user, const char *host, const char *rsession)
 		close(fd);
 		return -1;
 	}
-	return net_connect(fd, &peer, psk);
+	return net_connect(fd, &peer, psk, hvp, NULL);
+}
+
+/* ---- direct-connect: dial a listening net-proxy and log in over netchan ---- */
+
+/* Read a line from the terminal with echo suppressed (for passphrases and
+ * passwords).  Returns 0 on success, -1 on error; the newline is stripped. */
+static int
+prompt_hidden(const char *msg, char *out, size_t sz)
+{
+	struct termios old, raw;
+	int have_tty;
+
+	fputs(msg, stderr);
+	fflush(stderr);
+
+	have_tty = isatty(STDIN_FILENO);
+	if (have_tty) {
+		if (tcgetattr(STDIN_FILENO, &old) != 0) {
+			have_tty = 0;
+		} else {
+			raw = old;
+			raw.c_lflag &= ~(tcflag_t)ECHO;
+			tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+		}
+	}
+	if (!fgets(out, (int)sz, stdin)) {
+		if (have_tty) {
+			tcsetattr(STDIN_FILENO, TCSAFLUSH, &old);
+			fputc('\n', stderr);
+		}
+		return -1;
+	}
+	if (have_tty) {
+		tcsetattr(STDIN_FILENO, TCSAFLUSH, &old);
+		fputc('\n', stderr);
+	}
+	out[strcspn(out, "\n")] = '\0';
+	return 0;
+}
+
+/* Client credentials for the userauth phase.  The key is loaded (and its
+ * passphrase collected) up front so get_key returns instantly and cannot race
+ * the handshake deadline; the password is prompted on demand. */
+struct direct_cred {
+	int	have_key;
+	uint8_t	sk[64];
+	uint8_t	pk[32];
+};
+
+static int
+direct_get_key(void *ctx, uint8_t sk[64], uint8_t pk[32])
+{
+	struct direct_cred *d = ctx;
+
+	if (!d->have_key)
+		return -1;
+	memcpy(sk, d->sk, 64);
+	memcpy(pk, d->pk, 32);
+	return 0;
+}
+
+static int
+direct_get_password(void *ctx, char *buf, size_t sz)
+{
+	(void)ctx;
+	return prompt_hidden("Password: ", buf, sz);
+}
+
+/* Load ~/.config/lumi/id_netchan into d, prompting for its passphrase if the
+ * file is sealed.  A missing key is not an error: d->have_key stays 0 and the
+ * login falls back to a password.  Returns 0 on success, -1 on a real error
+ * (bad passphrase, unreadable path). */
+static int
+load_client_key(struct direct_cred *d)
+{
+	char path[256], pass[256];
+	int r;
+
+	d->have_key = 0;
+	if (lumi_config_path(path, sizeof(path), "id_netchan") != 0)
+		return -1;
+	if (access(path, R_OK) != 0)
+		return 0;			/* no key: password only */
+
+	if (ks_keyfile_encrypted(path)) {
+		if (prompt_hidden("Key passphrase: ", pass, sizeof(pass)) != 0)
+			return -1;
+	} else {
+		pass[0] = '\0';
+	}
+	r = ks_keyfile_load(path, pass, d->sk, d->pk);
+	memset(pass, 0, sizeof(pass));
+	if (r == -2) {
+		fprintf(stderr, "lumi-attach: wrong key passphrase\n");
+		return -1;
+	}
+	if (r != 0) {
+		fprintf(stderr, "lumi-attach: cannot read %s\n", path);
+		return -1;
+	}
+	d->have_key = 1;
+	return 0;
+}
+
+/* Parse lumi://[user@]host:port/session.  Empty fields (except session) are
+ * allowed; user defaults are applied by the caller.  Returns 0 on success. */
+static int
+parse_lumi_url(const char *url, char *user, size_t usz, char *host, size_t hsz,
+    int *port, char *session, size_t ssz)
+{
+	const char *p, *at, *slash, *hoststart, *colon, *sess;
+	size_t ul, hl;
+
+	if (strncmp(url, "lumi://", 7) != 0)
+		return -1;
+	p = url + 7;
+	slash = strchr(p, '/');
+	if (!slash)
+		return -1;
+	at = memchr(p, '@', (size_t)(slash - p));
+	hoststart = p;
+	if (at) {
+		ul = (size_t)(at - p);
+		if (ul >= usz)
+			return -1;
+		memcpy(user, p, ul);
+		user[ul] = '\0';
+		hoststart = at + 1;
+	} else {
+		user[0] = '\0';
+	}
+
+	colon = memchr(hoststart, ':', (size_t)(slash - hoststart));
+	if (!colon)
+		return -1;
+	hl = (size_t)(colon - hoststart);
+	if (hl == 0 || hl >= hsz)
+		return -1;
+	memcpy(host, hoststart, hl);
+	host[hl] = '\0';
+
+	*port = atoi(colon + 1);
+	if (*port <= 0 || *port > 65535)
+		return -1;
+
+	sess = slash + 1;
+	if (*sess == '\0' || strlen(sess) >= ssz)
+		return -1;
+	snprintf(session, ssz, "%s", sess);
+	return 0;
+}
+
+/*
+ * Direct-connect: dial a persistently-listening net-proxy at the URL and log
+ * in over netchan with no ssh bootstrap.  The connection is encrypted, the
+ * server is pinned by its host key (known_hosts TOFU), and the user proves
+ * identity with the id_netchan key or a password.  Sets session_name and rnet
+ * on success.  Returns 0 on success, -1 on error.
+ */
+static int
+start_net_proxy_direct(const char *url)
+{
+	char user[NC_AUTH_MAX_USER + 1], host[128], session[128];
+	struct direct_cred cred;
+	struct ipc_netchan_userauth ua;
+	struct host_verify hv;
+	struct addrinfo hints, *res = NULL;
+	struct sockaddr_in sin;
+	struct nc_addr peer;
+	int port = 0, fd;
+
+	if (parse_lumi_url(url, user, sizeof(user), host, sizeof(host), &port,
+	    session, sizeof(session)) != 0) {
+		fprintf(stderr, "lumi-attach: malformed URL '%s' "
+		    "(expected lumi://[user@]host:port/session)\n", url);
+		return -1;
+	}
+	if (user[0] == '\0') {
+		const char *env = getenv("USER");
+
+		if (!env || !*env) {
+			fprintf(stderr, "lumi-attach: no user in URL and $USER "
+			    "unset\n");
+			return -1;
+		}
+		snprintf(user, sizeof(user), "%s", env);
+	}
+
+	free(session_name);
+	session_name = strdup(session);
+	if (!session_name)
+		return -1;
+
+	if (load_client_key(&cred) != 0)
+		return -1;
+
+	if (host_verify_prepare(&hv, host, NULL) != 0)
+		return -1;
+
+	memset(&ua, 0, sizeof(ua));
+	ua.user = user;
+	ua.get_key = direct_get_key;
+	ua.get_password = direct_get_password;
+	ua.cred_ctx = &cred;
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_DGRAM;
+	if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) {
+		fprintf(stderr, "lumi-attach: cannot resolve '%s'\n", host);
+		return -1;
+	}
+	memcpy(&sin, res->ai_addr, sizeof(sin));
+	freeaddrinfo(res);
+	sin.sin_port = htons((uint16_t)port);
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return -1;
+	if (nc_udp_from_sockaddr(&peer, (struct sockaddr *)&sin,
+	    sizeof(sin)) != 0) {
+		close(fd);
+		return -1;
+	}
+	return net_connect(fd, &peer, NULL, &hv, &ua);
 }
 
 /* dispatch one decoded proxy envelope (window_id + type + payload) to the
@@ -5651,11 +6078,12 @@ static void
 usage(void)
 {
 	fprintf(stderr,
-	    "usage: lumi-attach [-f window] [-m mode] [-n] [-s name]\n");
+	    "usage: lumi-attach [-f window] [-m mode] [-n] [-V] [-s name]\n");
 	fprintf(stderr,
 	    "  -f window   focus this window (by PID) after startup\n"
 	    "  -m mode     UI mode: screen (default), turbo, minimal\n"
 	    "  -n          connect via the session's net-proxy (netchan)\n"
+	    "  -V          verify the net-proxy's host identity key (with -n)\n"
 	    "  -s name     session name (default: 0)\n");
 }
 
@@ -5669,6 +6097,7 @@ cmd_attach_main(int argc, char **argv)
 	int rows, cols;
 	int opt;
 	int use_netchan = 0;
+	int use_verify = 0;
 
 	if (getenv("LUMI_SESSION")) {
 		fprintf(stderr,
@@ -5677,7 +6106,7 @@ cmd_attach_main(int argc, char **argv)
 		return 1;
 	}
 
-	while ((opt = getopt(argc, argv, "f:m:ns:")) != -1) {
+	while ((opt = getopt(argc, argv, "f:m:nVs:")) != -1) {
 		switch (opt) {
 		case 'f':
 			focus_window = (uint32_t)strtoul(optarg, NULL, 10);
@@ -5687,6 +6116,9 @@ cmd_attach_main(int argc, char **argv)
 			break;
 		case 'n':
 			use_netchan = 1;
+			break;
+		case 'V':
+			use_verify = 1;
 			break;
 		case 's':
 			name = optarg;
@@ -5698,6 +6130,12 @@ cmd_attach_main(int argc, char **argv)
 	}
 	if (optind < argc)
 		name = argv[optind];
+
+	if (use_verify && !use_netchan) {
+		fprintf(stderr, "lumi-attach: -V requires -n\n");
+		usage();
+		return 1;
+	}
 
 	/* parse mode */
 	if (mode_str) {
@@ -5724,14 +6162,26 @@ cmd_attach_main(int argc, char **argv)
 	{
 		const char *ruser, *rhost, *rsess;
 
-		if (use_netchan && parse_session_name(name, &ruser, &rhost,
-		    &rsess)) {
+		if (name && strncmp(name, "lumi://", 7) == 0) {
+			/* direct-connect: dial a persistently-listening
+			 * net-proxy and authenticate over netchan, no ssh. */
+			is_remote = 1;
+			remote_netchan = 1;
+			if (start_net_proxy_direct(name) < 0) {
+				fprintf(stderr,
+				    "lumi-attach: failed to connect to %s\n",
+				    name);
+				return 1;
+			}
+		} else if (use_netchan && parse_session_name(name, &ruser,
+		    &rhost, &rsess)) {
 			/* remote host: bootstrap the proxy over ssh, then
 			 * dial its endpoint directly over encrypted netchan. */
 			is_remote = 1;
 			remote_netchan = 1;
 			session_name = strdup(rsess);
-			if (start_net_proxy_ssh(ruser, rhost, rsess) < 0) {
+			if (start_net_proxy_ssh(ruser, rhost, rsess,
+			    use_verify) < 0) {
 				fprintf(stderr,
 				    "lumi-attach: failed to reach net-proxy "
 				    "on %s\n", name);
@@ -5744,7 +6194,7 @@ cmd_attach_main(int argc, char **argv)
 			is_remote = 1;
 			remote_netchan = 1;
 			session_name = strdup(name);
-			if (start_net_proxy(name) < 0) {
+			if (start_net_proxy(name, use_verify) < 0) {
 				fprintf(stderr,
 				    "lumi-attach: failed to connect to "
 				    "net-proxy for session '%s'\n", name);

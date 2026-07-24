@@ -6,6 +6,7 @@
 
 #include "ipc_transport.h"
 #include "nc_addr.h"
+#include "nc_crypto.h"
 
 /*
  * A netchan-backed ipc_transport.  It carries the same TLV messages as
@@ -47,6 +48,70 @@ struct ipc_transport *ipc_transport_netchan_new(int udp_fd, int server,
  */
 struct ipc_transport *ipc_transport_netchan_new_crypto(int udp_fd,
     int server, const struct nc_addr *peer, const uint8_t *psk);
+
+/*
+ * Optional authentication for a crypto transport, layered on the PSK.  Any
+ * field may be NULL/zero, which selects the plain PSK behaviour above.
+ *
+ *   psk                 32-byte pre-shared key mixed into the KDF, or NULL.
+ *   static_sk           server: its 32-byte long-term identity secret, so a
+ *                       client can pin it across restarts (ssh host-key TOFU).
+ *                       NULL for an anonymous server.
+ *   verify_peer         client: called once with the server's presented
+ *                       identity key (or NULL if none) before any key material
+ *                       is derived; return 0 to accept, non-zero to refuse the
+ *                       session permanently.  This is where known_hosts
+ *                       comparison lives.
+ *   verify_ctx          opaque pointer passed to verify_peer.
+ *   require_peer_static client: refuse a server that presents no identity key.
+ */
+/*
+ * Optional ssh-shaped user authentication run over the encrypted channel
+ * after the crypto handshake, before any TLV.  This authenticates the
+ * connecting *user* (nc_crypto authenticates the connection).  It is off
+ * unless a non-NULL ipc_netchan_userauth is supplied, so the default flow is
+ * unchanged.  The callbacks run synchronously inside
+ * ipc_transport_netchan_establish(), where blocking (and prompting) is fine.
+ *
+ * Client side supplies `user` and credential fetchers; server side supplies
+ * the policy callbacks.  Each side ignores the other side's fields.
+ */
+struct ipc_netchan_userauth {
+	/* Client: the login name to claim, and where to get credentials.
+	 * A fetcher fills its output and returns 0 to supply that credential,
+	 * non-zero to skip the method.  Either fetcher may be NULL. */
+	const char *user;
+	int (*get_key)(void *ctx, uint8_t sk[64], uint8_t pk[32]);
+	int (*get_password)(void *ctx, char *buf, size_t sz);
+	void *cred_ctx;
+
+	/* Server: which methods to offer a name, and how to check each.
+	 * A NULL check rejects that method.  methods() returning 0 refuses
+	 * the name. */
+	unsigned (*methods)(void *ctx, const char *user);
+	int (*check_key)(void *ctx, const char *user, const uint8_t pk[32]);
+	int (*check_password)(void *ctx, const char *user, const char *password);
+	void *server_ctx;
+};
+
+struct ipc_netchan_auth {
+	const uint8_t *psk;
+	const uint8_t *static_sk;
+	nc_crypto_verify_cb verify_peer;
+	void *verify_ctx;
+	int require_peer_static;
+	/* NULL for no user-authentication phase (the default). */
+	const struct ipc_netchan_userauth *userauth;
+};
+
+/*
+ * Like ipc_transport_netchan_new_crypto, but takes the full auth config so a
+ * server can present a long-term identity key and a client can pin it.  `auth`
+ * may be NULL, which is identical to passing a NULL psk.  Returns NULL on
+ * failure (caller retains udp_fd).
+ */
+struct ipc_transport *ipc_transport_netchan_new_crypto_auth(int udp_fd,
+    int server, const struct nc_addr *peer, const struct ipc_netchan_auth *auth);
 
 /*
  * Drive the handshake and open the local reliable channel, blocking up to

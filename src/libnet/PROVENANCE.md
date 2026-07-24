@@ -1,23 +1,27 @@
 # src/libnet provenance
 
 This directory is the reliable-UDP transport for lumi's networked
-connections (see [FUTURE.md 11C][1]). The `netchan`/`nc_*` files were
-extracted from the netchan-v2 demo and are now verbatim copies of it.
-The lumi-original glue that adapts netchan to the `ipc_transport` seam is
+connections (see [FUTURE.md 11C][1]). The `netchan`/`nc_*` files are
+verbatim copies of the netchan project (currently netchan 0.6.0). The
+lumi-original glue that adapts netchan to the `ipc_transport` seam is
 listed separately below.
 
 ## What was copied
 
 | File | Role | Upstream |
 |------|------|----------|
-| `netchan.c` / `netchan.h` / `nc_addr.h` | transport-agnostic protocol core | netchan-v2 demo, top level |
-| `nc_udp.c` / `nc_udp.h` | UDP backend (the only code that knows `sockaddr`) | netchan-v2 demo, top level |
-| `nc_crypto.c` / `nc_crypto.h` | encrypted-UDP decorator (X25519 + XChaCha20-Poly1305) | netchan-v2 demo, top level |
-| `third_party/monocypher.c` / `monocypher.h` | crypto primitives used by `nc_crypto` | Monocypher 4.0.2, vendored via the demo |
+| `netchan.c` / `netchan.h` / `nc_addr.h` | transport-agnostic protocol core | netchan `src/` |
+| `nc_udp.c` / `nc_udp.h` | UDP backend (the only code that knows `sockaddr`) | netchan `transport/` |
+| `nc_crypto.c` / `nc_crypto.h` | encrypted-UDP decorator (X25519 + XChaCha20-Poly1305) | netchan `crypto/` |
+| `keystore.c` / `keystore.h` | on-disk key/credential file formats (`host_key`, `known_hosts`, `authorized_keys`, `passwd`, `id_netchan`) | netchan `auth/` |
+| `nc_auth.c` / `nc_auth.h` | ssh-shaped client userauth (publickey/password) over the encrypted channel | netchan `auth/` |
+| `third_party/monocypher.c` / `monocypher.h` | crypto primitives used by `nc_crypto` | Monocypher 4.0.2, vendored via netchan |
 
 The core (`netchan` + `nc_udp`) has no third-party dependency.
-`nc_crypto` is the only part that reaches outside, and only into
-Monocypher.
+`nc_crypto`, `keystore`, and `nc_auth` are the only parts that reach
+outside, and only into Monocypher. netchan's own userauth transport glue
+(`auth_link`) and its example programs are not vendored; lumi drives the
+`nc_auth` state machines directly through the netchan transport.
 
 ## lumi-original files (not from the demo)
 
