@@ -1,4 +1,4 @@
-# modular-make -- A modular GNUmakefile for C, C++, D, Fortran, Objective-C, Objective-C++, Pascal, Modula-2, and Assembly projects [v1.8.6]
+# modular-make -- A modular GNUmakefile for C, C++, D, Fortran, Objective-C, Objective-C++, Pascal, Modula-2, and Assembly projects [v1.8.7]
 # updated: 20 Jul 2026
 # Requires GNU Make 3.81 or later.  compile_commands.json needs the $(file)
 # function (GNU Make 4.0); it is skipped on 3.81.
@@ -690,9 +690,20 @@ endif
 
 # Cross-toolchain prefix derived from $(CC) so OBJCOPY/STRIP match the target.
 # e.g. CC=aarch64-linux-gnu-gcc -> aarch64-linux-gnu-objcopy.  Empty for native.
+# A prefixed name is used only when it exists in PATH; otherwise fall back to
+# the unprefixed tool.  This handles compiler wrappers like musl-gcc, which
+# ship no musl-objcopy/musl-strip and rely on the native binutils.
 _TOOLCHAIN_PREFIX := $(shell echo "$(CC)" | sed -E 's|.*/||; s/(gcc|clang|cc)(-[0-9.]+)?$$//')
-OBJCOPY ?= $(_TOOLCHAIN_PREFIX)objcopy
-STRIP   ?= $(_TOOLCHAIN_PREFIX)strip
+_pick_tool = $(shell command -v $(_TOOLCHAIN_PREFIX)$1 >/dev/null 2>&1 && echo $(_TOOLCHAIN_PREFIX)$1 || echo $1)
+# Snapshot with := so the command -v probe runs once, not on every $(OBJCOPY)/
+# $(STRIP) reference in the per-target split-debug recipe.  The origin guard
+# preserves the override behaviour that ?= gave.
+ifeq ($(origin OBJCOPY),undefined)
+OBJCOPY := $(call _pick_tool,objcopy)
+endif
+ifeq ($(origin STRIP),undefined)
+STRIP := $(call _pick_tool,strip)
+endif
 
 # Literal space and comma, for subst-based list manipulation.
 _empty :=
