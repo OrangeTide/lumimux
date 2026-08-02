@@ -2,22 +2,65 @@
 
 ## Bugs
 
-- [ ] in GNOME terminal: the numbered lists display in Claude CLI while inside lumi show up as blank, instead of:
-    ```
-    1. Something
-    2. Something
-    3. Something
-    ```
-    I see:
-    ```
-                  Something
-                  Something
-                  Something
-    ```
-
-- [ ] Detach (ctrl-A d) of lumi while in GNOME terminal consistently segfaults. possibly in other terminals.
-
 # DONE
+
+- [x] in GNOME terminal: the numbered lists display in Claude CLI while inside
+      lumi show up as blank, instead of:
+      ```
+      1. Something
+      2. Something
+      3. Something
+      ```
+      it showed:
+      ```
+                    Something
+                    Something
+                    Something
+      ```
+      Claude CLI queries the terminal's background/foreground color via
+      OSC 10/11 to pick a contrasting color for things like list markers.
+      lumi's renderer is cell-based, not a raw passthrough, so the query
+      had nowhere to go: `osc_passthru()` forwarded only one-way
+      notification OSCs (9/99/777), and a query with no answer left the
+      asking program guessing a background that didn't match, making the
+      marker digits invisible. `osc_passthru()` now also forwards OSC
+      10/11 *queries* (not color-set requests) to the outer terminal, and
+      a new stdin-side OSC observer (`stdin_osc_parser`/
+      `stdin_osc_reply()`) matches the terminal's reply against the
+      pending query and routes it back to the asking window's PTY as
+      input, via `mconn_ipc_send(..., IPC_MSG_INPUT, ...)`. Verified both
+      directions against a live session: a real query printed by a child
+      process is forwarded out lumi's stdout, and a simulated terminal
+      reply written to lumi's stdin is routed back and delivered into
+      that same child's PTY (confirmed by its own tty echoing the
+      delivered bytes back out as window output).
+
+- [x] Detach (ctrl-A d) of lumi while in GNOME terminal consistently segfaults.
+      Also reproduced in iTerm2 and kitty -- not terminal-specific.
+      `cmd_attach_main()`'s exit path freed `tilemgr` before calling
+      `cwin_free_all()`, which still walks every client window and calls
+      `tile_forget_vt()` on the now-freed tile manager: a heap-use-after-free
+      on every clean exit with at least one window open (i.e. always).
+      Already fixed on this branch in a34cc27, found earlier reviewing
+      Phase 12 under ASan; the crash the user hit was from a separate,
+      out-of-date checkout that predates that fix.
+
+- [x] BUG: reattaching came up with a blank screen that no redraw would fix.
+      Ctrl-A l did nothing and only switching windows brought the content
+      back. The saved screen layout stores each pane as an index into the
+      session's window order, and a pane whose window was not in that order
+      was written out as index -1, then restored as a pane with no VT, which
+      composites as blank. The state fed itself: the restored empty pane was
+      saved as -1 again on the next detach. Unresolvable panes are now
+      rejected on import (a split collapses onto its surviving side) and
+      refused on export, and the focus that `tile_focus()` actually applied
+      is read back so the taskbar cannot highlight a window no pane shows.
+
+- [x] BUG: the tab bar came back with bare window numbers after a reattach,
+      showing names again only once something set a title. `sync_vt_title()`
+      copied an empty VT title over the name read from the session
+      directory on the first output after attaching. Each window now keeps
+      the name it was discovered under as a fallback.
 
 - [x] Networked client connections over a reliable channel (netchan-v2
       reliable UDP, not QUIC). See doc/FUTURE.md#11c for the design.

@@ -92,13 +92,29 @@ int sessdir_layout_load_turbo(const char *session,
 int sessdir_layout_load_screen(const char *session,
     struct sessdir_screen_layout *out);
 
+/* ---- generation (13-d) ----
+ *
+ * Each save bumps a monotonic counter, written via temp-plus-rename so a
+ * reader never sees a torn write. A writer compares this against the
+ * generation it last saw before saving its own change, so it can catch up
+ * on a newer generation it has not applied yet instead of blindly
+ * overwriting it -- see attach.c's mirror_publish() (12B share.display).
+ */
+
+/* returns 0 if there is no file, no GEN= line, or either could not be
+ * read -- a save always writes 1 or higher, so 0 never collides with a
+ * real generation. */
+unsigned long sessdir_layout_generation(const char *session);
+
 /* ---- save ---- */
 
-/* save turbo layout. returns 0 on success, -1 on error. */
+/* save turbo layout, bumping the generation. returns 0 on success, -1 on
+ * error. */
 int sessdir_layout_save_turbo(const char *session,
     const struct sessdir_turbo_layout *layout);
 
-/* save screen layout. returns 0 on success, -1 on error. */
+/* save screen layout, bumping the generation. returns 0 on success, -1
+ * on error. */
 int sessdir_layout_save_screen(const char *session,
     const struct sessdir_screen_layout *layout);
 

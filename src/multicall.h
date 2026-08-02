@@ -20,6 +20,7 @@ int cmd_proxy_main(int argc, char **argv);
 int cmd_reload_main(int argc, char **argv);
 int cmd_send_input_main(int argc, char **argv);
 int cmd_send_keys_main(int argc, char **argv);
+int cmd_share_main(int argc, char **argv);
 int cmd_splash_main(int argc, char **argv);
 int cmd_version_main(int argc, char **argv);
 

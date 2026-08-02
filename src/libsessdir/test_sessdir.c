@@ -5,12 +5,15 @@
 #include "sessdir.h"
 #include "sessdir_state.h"
 #include "sessdir_watch.h"
+#include "sessdir_control.h"
+#include "sessdir_layout.h"
 
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static int test_count;
@@ -511,6 +514,383 @@ test_watch(void)
 	printf("ok\n");
 }
 
+/* ---- write token ---- */
+
+/* One keyboard per session. The lock is what makes the answer the same on
+ * every window, so what matters is that a second holder is impossible and
+ * that a dead holder does not keep it. */
+static void
+test_token_exclusive(void)
+{
+	printf("  token is held by one process at a time ... ");
+	sessdir_session_create("tok");
+
+	CHECK(sessdir_token_acquire("tok", 111, "first@host") == 0,
+	    "first acquire failed");
+	CHECK(sessdir_token_held(), "held flag not set");
+
+	/* a second process, since flock is per open file description and a
+	 * second acquire in this process would just be ours again */
+	{
+		pid_t pid = fork();
+		int status = 0;
+
+		if (pid == 0) {
+			/* fork shares the open file description, so drop the
+			 * inherited reference first: this has to be a real
+			 * outside attempt, not the parent's own lock seen
+			 * again */
+			sessdir_token_forget();
+			_exit(sessdir_token_acquire("tok", 222, "second@host")
+			    == 0 ? 1 : 0);
+		}
+		waitpid(pid, &status, 0);
+		CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+		    "a second process took a held token");
+	}
+
+	{
+		char who[64] = "";
+		pid_t holder = 0;
+
+		CHECK(sessdir_token_holder("tok", who, sizeof(who),
+		    &holder) == 0, "holder not reported");
+		CHECK(strcmp(who, "first@host") == 0, "wrong holder name");
+		CHECK(holder == getpid(), "wrong holder pid");
+	}
+
+	sessdir_token_release();
+	CHECK(!sessdir_token_held(), "held flag still set after release");
+	CHECK(sessdir_token_holder("tok", NULL, 0, NULL) < 0,
+	    "released token still reports a holder");
+
+	/* and it can be taken again */
+	CHECK(sessdir_token_acquire("tok", 333, "third@host") == 0,
+	    "reacquire after release failed");
+	sessdir_token_release();
+	printf("ok\n");
+}
+
+/* A holder that dies must not keep the keyboard: the kernel drops the
+ * lock, and the line it left behind names a pid that is gone. */
+static void
+test_token_survives_holder_death(void)
+{
+	pid_t pid;
+	int status = 0;
+
+	printf("  a dead holder does not keep the token ... ");
+	sessdir_session_create("tokdead");
+
+	pid = fork();
+	if (pid == 0) {
+		if (sessdir_token_acquire("tokdead", 444, "gone@host") != 0)
+			_exit(1);
+		_exit(0);		/* exits holding it */
+	}
+	waitpid(pid, &status, 0);
+	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+	    "child could not take the token");
+
+	CHECK(sessdir_token_holder("tokdead", NULL, 0, NULL) < 0,
+	    "a dead holder is still reported as holding it");
+	CHECK(sessdir_token_acquire("tokdead", 555, "next@host") == 0,
+	    "could not take the token from a dead holder");
+	sessdir_token_release();
+	printf("ok\n");
+}
+
+/* ---- client roster ---- */
+
+static void
+test_client_roster(void)
+{
+	struct sessdir_client me, got[SESSDIR_CLIENT_MAX];
+	int n;
+
+	printf("  roster entries round-trip ... ");
+	sessdir_session_create("ros");
+
+	memset(&me, 0, sizeof(me));
+	me.client_id = 4242;
+	me.pid = getpid();
+	snprintf(me.name, sizeof(me.name), "someone@somewhere");
+	snprintf(me.role, sizeof(me.role), "view");
+	snprintf(me.mode, sizeof(me.mode), "turbo");
+	me.rows = 40;
+	me.cols = 132;
+	me.since = 1234567;
+	CHECK(sessdir_client_register("ros", &me) == 0, "register failed");
+
+	n = sessdir_client_list("ros", got, SESSDIR_CLIENT_MAX);
+	CHECK(n == 1, "expected one roster entry");
+	if (n == 1) {
+		CHECK(got[0].client_id == 4242, "wrong client id");
+		CHECK(got[0].pid == getpid(), "wrong pid");
+		CHECK(strcmp(got[0].name, "someone@somewhere") == 0,
+		    "wrong name");
+		CHECK(strcmp(got[0].role, "view") == 0, "wrong role");
+		CHECK(strcmp(got[0].mode, "turbo") == 0, "wrong mode");
+		CHECK(got[0].rows == 40 && got[0].cols == 132, "wrong size");
+		CHECK(got[0].since == 1234567, "wrong attach time");
+	}
+
+	/* re-registering updates rather than duplicating */
+	snprintf(me.role, sizeof(me.role), "write");
+	CHECK(sessdir_client_register("ros", &me) == 0, "re-register failed");
+	n = sessdir_client_list("ros", got, SESSDIR_CLIENT_MAX);
+	CHECK(n == 1, "re-register duplicated the entry");
+	if (n == 1)
+		CHECK(strcmp(got[0].role, "write") == 0, "role not updated");
+
+	sessdir_client_unregister("ros", 4242);
+	CHECK(sessdir_client_list("ros", got, SESSDIR_CLIENT_MAX) == 0,
+	    "entry survived unregister");
+	printf("ok\n");
+}
+
+/* A client that was killed leaves its entry behind, so "who is attached"
+ * has to be filtered by whether the process is still there. */
+static void
+test_client_prune(void)
+{
+	struct sessdir_client c, got[SESSDIR_CLIENT_MAX];
+	pid_t dead;
+	int status = 0;
+
+	printf("  a dead client is pruned from the roster ... ");
+	sessdir_session_create("pru");
+
+	dead = fork();
+	if (dead == 0)
+		_exit(0);
+	waitpid(dead, &status, 0);
+
+	memset(&c, 0, sizeof(c));
+	c.client_id = (unsigned long)dead;
+	c.pid = dead;
+	snprintf(c.name, sizeof(c.name), "gone@host");
+	snprintf(c.role, sizeof(c.role), "write");
+	CHECK(sessdir_client_register("pru", &c) == 0, "register failed");
+
+	/* a live entry alongside it must survive */
+	memset(&c, 0, sizeof(c));
+	c.client_id = (unsigned long)getpid();
+	c.pid = getpid();
+	snprintf(c.name, sizeof(c.name), "here@host");
+	snprintf(c.role, sizeof(c.role), "view");
+	CHECK(sessdir_client_register("pru", &c) == 0, "register failed");
+
+	CHECK(sessdir_client_list("pru", got, SESSDIR_CLIENT_MAX) == 2,
+	    "expected two entries before pruning");
+	CHECK(sessdir_client_prune("pru") == 1, "expected one prune");
+	CHECK(sessdir_client_list("pru", got, SESSDIR_CLIENT_MAX) == 1,
+	    "pruning removed the wrong number of entries");
+	CHECK(sessdir_client_prune("pru") == 0, "pruned twice");
+
+	/* and the general cleanup does it too, which is what every client
+	 * calls on attach */
+	sessdir_cleanup_stale("pru");
+	CHECK(sessdir_client_list("pru", got, SESSDIR_CLIENT_MAX) == 1,
+	    "cleanup_stale removed a live client");
+
+	sessdir_client_unregister("pru", (unsigned long)getpid());
+	printf("ok\n");
+}
+
+/* A name written by another client is drawn on this client's screen. A
+ * peer that calls itself an escape sequence must not be able to paint on
+ * someone else's display, so the roster strips anything a terminal would
+ * act on. */
+static void
+test_client_name_sanitized(void)
+{
+	struct sessdir_client me, got[SESSDIR_CLIENT_MAX];
+	int n;
+
+	printf("  a hostile client name is defanged ... ");
+	sessdir_session_create("evil");
+
+	memset(&me, 0, sizeof(me));
+	me.client_id = 5150;
+	me.pid = getpid();
+	snprintf(me.name, sizeof(me.name), "a\033[31mb");
+	snprintf(me.role, sizeof(me.role), "view");
+	CHECK(sessdir_client_register("evil", &me) == 0, "register failed");
+
+	n = sessdir_client_list("evil", got, SESSDIR_CLIENT_MAX);
+	CHECK(n == 1, "expected one entry");
+	if (n == 1) {
+		CHECK(strchr(got[0].name, '\033') == NULL,
+		    "an escape survived the roster");
+		CHECK(strcmp(got[0].name, "a?[31mb") == 0,
+		    "the name was not defanged as expected");
+	}
+
+	/* a raw newline would end the line early and could forge a field:
+	 * the writer emits it, the reader must not honor it */
+	snprintf(me.name, sizeof(me.name), "x\ny");
+	CHECK(sessdir_client_register("evil", &me) == 0, "register failed");
+	n = sessdir_client_list("evil", got, SESSDIR_CLIENT_MAX);
+	CHECK(n == 1, "newline in a name changed the entry count");
+	if (n == 1)
+		CHECK(strchr(got[0].name, '\n') == NULL,
+		    "a newline survived the roster");
+
+	sessdir_client_unregister("evil", 5150);
+	printf("ok\n");
+}
+
+/* ---- share control messages ---- */
+
+/* The sequence number is what makes a client act once. Everything else
+ * about the message is just fields. */
+static void
+test_ctl_messages(void)
+{
+	struct sessdir_ctl m;
+
+	printf("  control messages carry a rising sequence ... ");
+	sessdir_session_create("ctl");
+
+	CHECK(sessdir_ctl_read("ctl", &m) < 0, "read an absent message");
+
+	CHECK(sessdir_ctl_post("ctl", SESSDIR_CTL_REQUEST, 0, 77,
+	    "asker@host") == 0, "post failed");
+	CHECK(sessdir_ctl_read("ctl", &m) == 0, "read failed");
+	CHECK(m.seq == 1, "first message should be sequence 1");
+	CHECK(m.verb == SESSDIR_CTL_REQUEST, "wrong verb");
+	CHECK(m.actor == 77, "wrong actor");
+	CHECK(strcmp(m.name, "asker@host") == 0, "wrong name");
+
+	CHECK(sessdir_ctl_post("ctl", SESSDIR_CTL_GRANT, 77, 88,
+	    "holder@host") == 0, "second post failed");
+	CHECK(sessdir_ctl_read("ctl", &m) == 0, "second read failed");
+	CHECK(m.seq == 2, "sequence did not rise");
+	CHECK(m.verb == SESSDIR_CTL_GRANT, "wrong verb");
+	CHECK(m.target == 77, "wrong target");
+
+	CHECK(sessdir_ctl_post("ctl", SESSDIR_CTL_KICK, 99, 0, "") == 0,
+	    "kick post failed");
+	CHECK(sessdir_ctl_read("ctl", &m) == 0, "kick read failed");
+	CHECK(m.verb == SESSDIR_CTL_KICK && m.target == 99, "wrong kick");
+	CHECK(m.actor == 0, "a command should post no actor");
+	printf("ok\n");
+}
+
+static void
+test_share_lock(void)
+{
+	printf("  the attach lock is a session flag ... ");
+	sessdir_session_create("lok");
+
+	CHECK(!sessdir_share_locked("lok"), "a new session should be open");
+	CHECK(sessdir_share_set_locked("lok", 1) == 0, "lock failed");
+	CHECK(sessdir_share_locked("lok"), "lock did not take");
+	CHECK(sessdir_share_set_locked("lok", 1) == 0, "relock failed");
+	CHECK(sessdir_share_locked("lok"), "relock cleared it");
+	CHECK(sessdir_share_set_locked("lok", 0) == 0, "unlock failed");
+	CHECK(!sessdir_share_locked("lok"), "unlock did not take");
+	printf("ok\n");
+}
+
+static void
+test_share_mode(void)
+{
+	printf("  share mode defaults to single-writer and round-trips ... ");
+	sessdir_session_create("modetest");
+
+	CHECK(sessdir_share_mode_get("modetest") == SESSDIR_SHARE_SINGLE_WRITER,
+	    "a new session should default to single-writer");
+	CHECK(sessdir_share_mode_get("no-such-session") ==
+	    SESSDIR_SHARE_SINGLE_WRITER,
+	    "a missing session should default to single-writer");
+
+	CHECK(sessdir_share_mode_set("modetest",
+	    SESSDIR_SHARE_MULTI_WRITER) == 0, "set multi-writer failed");
+	CHECK(sessdir_share_mode_get("modetest") == SESSDIR_SHARE_MULTI_WRITER,
+	    "mode did not read back as multi-writer");
+
+	CHECK(sessdir_share_mode_set("modetest",
+	    SESSDIR_SHARE_SINGLE_WRITER) == 0, "set single-writer failed");
+	CHECK(sessdir_share_mode_get("modetest") ==
+	    SESSDIR_SHARE_SINGLE_WRITER,
+	    "mode did not read back as single-writer");
+	printf("ok\n");
+}
+
+static void
+test_share_display(void)
+{
+	printf("  share display defaults to independent, round-trips, and "
+	    "does not clobber mode ... ");
+	sessdir_session_create("displaytest");
+
+	CHECK(sessdir_share_display_get("displaytest") ==
+	    SESSDIR_SHARE_DISPLAY_INDEPENDENT,
+	    "a new session should default to independent");
+
+	CHECK(sessdir_share_mode_set("displaytest",
+	    SESSDIR_SHARE_MULTI_WRITER) == 0, "set multi-writer failed");
+	CHECK(sessdir_share_display_set("displaytest",
+	    SESSDIR_SHARE_DISPLAY_SHARED) == 0, "set shared failed");
+
+	/* setting display must not have clobbered the mode set moments
+	 * earlier, and vice versa -- both live in the same file */
+	CHECK(sessdir_share_mode_get("displaytest") ==
+	    SESSDIR_SHARE_MULTI_WRITER,
+	    "setting display clobbered the mode");
+	CHECK(sessdir_share_display_get("displaytest") ==
+	    SESSDIR_SHARE_DISPLAY_SHARED,
+	    "display did not read back as shared");
+
+	CHECK(sessdir_share_mode_set("displaytest",
+	    SESSDIR_SHARE_SINGLE_WRITER) == 0, "set single-writer failed");
+	CHECK(sessdir_share_display_get("displaytest") ==
+	    SESSDIR_SHARE_DISPLAY_SHARED,
+	    "setting mode clobbered the display");
+	printf("ok\n");
+}
+
+static void
+test_layout_generation(void)
+{
+	struct sessdir_turbo_layout layout, got;
+
+	printf("  layout saves bump a monotonic generation ... ");
+	sessdir_session_create("layoutgen");
+
+	CHECK(sessdir_layout_generation("layoutgen") == 0,
+	    "a session with no layout yet should read generation 0");
+	CHECK(sessdir_layout_generation("no-such-session") == 0,
+	    "a missing session should read generation 0");
+
+	memset(&layout, 0, sizeof(layout));
+	layout.focus = -1;
+	layout.wins[0].x = 1;
+	layout.wins[0].y = 2;
+	layout.wins[0].w = 40;
+	layout.wins[0].h = 12;
+	layout.wins[0].valid = 1;
+	layout.nwins = 1;
+
+	CHECK(sessdir_layout_save_turbo("layoutgen", &layout) == 0,
+	    "first save failed");
+	CHECK(sessdir_layout_generation("layoutgen") == 1,
+	    "first save should be generation 1");
+
+	CHECK(sessdir_layout_save_turbo("layoutgen", &layout) == 0,
+	    "second save failed");
+	CHECK(sessdir_layout_generation("layoutgen") == 2,
+	    "second save should be generation 2, not reset");
+
+	CHECK(sessdir_layout_load_turbo("layoutgen", &got) == 0,
+	    "load failed");
+	CHECK(got.nwins == 1 && got.wins[0].valid && got.wins[0].w == 40,
+	    "the GEN= line must not disturb the rest of the format");
+	printf("ok\n");
+}
+
 /* ---- main ---- */
 
 int
@@ -540,6 +920,18 @@ main(void)
 
 	/* inotify watch */
 	test_watch();
+
+	/* write token and client roster */
+	test_token_exclusive();
+	test_token_survives_holder_death();
+	test_client_roster();
+	test_client_prune();
+	test_client_name_sanitized();
+	test_ctl_messages();
+	test_share_lock();
+	test_share_mode();
+	test_share_display();
+	test_layout_generation();
 
 	teardown();
 

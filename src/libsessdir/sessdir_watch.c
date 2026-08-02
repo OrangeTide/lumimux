@@ -46,6 +46,17 @@ sessdir_watch_start(const char *session)
 		return -1;
 	}
 
+	/* NOTE_WRITE on a directory fires when an entry is added, removed,
+	 * or renamed -- not when an existing file's contents change (12-d-b
+	 * needs to notice <session>/access being rewritten in place, e.g.
+	 * a plain fopen(path, "w") that truncates and rewrites without
+	 * touching the directory entry itself). Unlike the inotify branch
+	 * below, there is no per-directory kqueue flag that covers child
+	 * content writes; catching that would mean watching each file of
+	 * interest individually, which this generic directory watcher does
+	 * not do. Untested on any BSD/macOS machine, same as the routing
+	 * assumption already noted in net_proxy.c's fork-per-client path --
+	 * flagged here rather than silently assumed fixed by NOTE_WRITE. */
 	EV_SET(&ev, dirfd, EVFILT_VNODE, EV_ADD | EV_CLEAR,
 	    NOTE_WRITE | NOTE_DELETE | NOTE_RENAME, 0, NULL);
 	if (kevent(kq, &ev, 1, NULL, 0, NULL) < 0) {
@@ -107,8 +118,14 @@ sessdir_watch_start(const char *session)
 		return -1;
 	}
 
+	/* IN_CLOSE_WRITE catches a file being rewritten in place (12-d-b
+	 * needs to notice <session>/access changing, which a plain
+	 * fopen(path, "w")+fclose() does without ever touching the
+	 * directory entry itself, so IN_CREATE/DELETE/MOVED alone would
+	 * miss it). */
 	wd = inotify_add_watch(fd, path,
-	    IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO);
+	    IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO |
+	    IN_CLOSE_WRITE);
 	free(path);
 	if (wd < 0) {
 		int saved = errno;

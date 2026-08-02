@@ -33,3 +33,23 @@ str_strlcat(char *dst, const char *src, size_t dstsize)
 	}
 	return dstlen + srclen;
 }
+
+size_t
+str_sanitize(char *dst, const char *src, size_t dstsize)
+{
+	size_t n = 0;
+
+	if (dstsize == 0)
+		return 0;
+	for (; src && *src && n + 1 < dstsize; src++, n++) {
+		unsigned char c = (unsigned char)*src;
+
+		/* C0 controls, DEL, and the C1 range a terminal may act on */
+		if (c < 0x20 || c == 0x7f)
+			dst[n] = '?';
+		else
+			dst[n] = (char)c;
+	}
+	dst[n] = '\0';
+	return n;
+}

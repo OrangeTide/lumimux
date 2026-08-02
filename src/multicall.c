@@ -41,6 +41,7 @@ static const struct {
 	{ "reload",	cmd_reload_main },
 	{ "send-input",	cmd_send_input_main },
 	{ "send-keys",	cmd_send_keys_main },
+	{ "share",	cmd_share_main },
 	{ "splash",	cmd_splash_main },
 	{ "version",	cmd_version_main },
 };
@@ -64,6 +65,7 @@ usage(void)
 	    "  reload                Reload server configuration\n"
 	    "  send-keys             Send keystrokes to a session\n"
 	    "  send-input            Send raw input to a pane\n"
+	    "  share                 Show clients; pass the keyboard\n"
 	    "  splash                Display splash screen\n"
 	    "  version               Print version information\n");
 }
@@ -80,24 +82,34 @@ lookup(const char *name))(int, char **)
 	return NULL;
 }
 
-/* Rewrite the original argv buffer so ps(1) reflects the active command. */
+/* Rewrite the original argv buffer so ps(1) reflects the active command.
+ *
+ * argv[] points into the buffer being rewritten, so the new title has to
+ * be assembled somewhere else first. Writing in place would destroy the
+ * argument strings, and multicall_exec_cmd() hands the same argv straight
+ * to the sub-command afterward: the sub-command would parse an argv whose
+ * strings had been blanked. */
 static void
 update_proctitle(int argc, char **argv)
 {
-	size_t off;
+	char *title;
+	size_t off = 0;
 	int i;
 
 	if (!proc_argv_base || proc_argv_size == 0)
 		return;
 
-	memset(proc_argv_base, 0, proc_argv_size);
-	off = 0;
+	title = malloc(proc_argv_size);
+	if (!title)
+		return;			/* cosmetic; not worth failing over */
+	memset(title, 0, proc_argv_size);
+
 	for (i = 0; i < argc && argv[i]; i++) {
 		size_t len = strlen(argv[i]);
 
 		if (off + len >= proc_argv_size)
 			break;
-		memcpy(proc_argv_base + off, argv[i], len);
+		memcpy(title + off, argv[i], len);
 		off += len + 1;
 	}
 
@@ -105,6 +117,9 @@ update_proctitle(int argc, char **argv)
 	if (argc > 0 && argv[0])
 		prctl(PR_SET_NAME, (unsigned long)argv[0], 0, 0, 0);
 #endif
+
+	memcpy(proc_argv_base, title, proc_argv_size);
+	free(title);
 }
 
 static int
@@ -200,10 +215,43 @@ multicall_exec_cmd(const char *cmd, int argc, char **argv)
 
 	if (binname[0])
 		argv[0] = binname;
-	update_proctitle(argc, argv);
 
-	optind = 1;
-	return fn(argc, argv);
+	/* The sub-command runs in this process, and the proctitle rewrite
+	 * overwrites the memory argv[] points into: the new title is a
+	 * different length from the old one, so the argument strings do not
+	 * survive it. Hand the sub-command its own copies.
+	 *
+	 * Skipping this is how "lumi new -d -s NAME" came to start an
+	 * mserver with an empty session name whenever the lumi-mserver
+	 * symlink was missing, which sent the window's directory to the
+	 * root of the runtime directory instead of into the session. */
+	{
+		char **dup = calloc((size_t)argc + 1, sizeof(*dup));
+		int rc, i;
+
+		if (dup) {
+			for (i = 0; i < argc; i++) {
+				dup[i] = argv[i] ? strdup(argv[i]) : NULL;
+				if (argv[i] && !dup[i]) {
+					while (--i >= 0)
+						free(dup[i]);
+					free(dup);
+					dup = NULL;
+					break;
+				}
+			}
+		}
+
+		update_proctitle(argc, argv);
+		optind = 1;
+		if (!dup)
+			return fn(argc, argv);	/* out of memory: no worse */
+		rc = fn(argc, dup);
+		for (i = 0; i < argc; i++)
+			free(dup[i]);
+		free(dup);
+		return rc;
+	}
 }
 
 int

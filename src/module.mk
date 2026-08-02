@@ -7,8 +7,8 @@ lumi_SRCS = multicall.c \
 	cmd/attach/app_calc.c cmd/attach/app_cal.c cmd/attach/app_emoji.c \
 	cmd/attach/app_dict.c cmd/attach/color_picker.c \
 	cmd/attach/session_picker.c cmd/attach/selection.c \
+	cmd/attach/share_menu.c \
 	cmd/attr/attr.c \
-	cmd/mserver/mserver.c \
 	cmd/new/new.c \
 	cmd/list/list.c \
 	cmd/version/version.c \
@@ -17,21 +17,22 @@ lumi_SRCS = multicall.c \
 	cmd/new-window/new_window.c \
 	cmd/net-keygen/net_keygen.c \
 	cmd/net-passwd/net_passwd.c \
-	cmd/proxy/proxy.c \
 	cmd/reload/reload.c \
 	cmd/send-input/send_input.c \
 	cmd/send-keys/send_keys.c \
+	cmd/share/share.c \
 	cmd/splash/splash_cmd.c
-lumi_LIBS = lu_iox lu_ipc lu_net lu_attr lu_sessdir lu_session lu_tio \
-	lu_render lu_txl lu_termlib lu_vt lu_utf8 lu_pty lu_keys lu_cfg \
+lumi_LIBS = lu_mserver lu_iox lu_ipc lu_net lu_attr lu_sessdir lu_session \
+	lu_tio lu_render lu_txl lu_termlib lu_vt lu_utf8 lu_pty lu_keys lu_cfg \
 	lu_taskbar lu_tui lu_tui_term lu_wm lu_tile lu_splash lu_predict \
-	lu_netproxy lu_core
+	lu_netproxy lu_proxy lu_core
 lumi_LDLIBS = $(if $(findstring darwin,$(TARGET_TRIPLET)),,-lutil)
 lumi_CPPFLAGS = -I$(lumi_DIR)
 EXECUTABLES += lumi
 
 LUMI_CMDS = attach attr mserver new list version kill detach new-window \
-	proxy net-proxy net-keygen net-passwd reload send-input send-keys splash
+	proxy net-proxy net-keygen net-passwd reload send-input send-keys share \
+	splash
 
 .PHONY: symlinks clean-symlinks
 symlinks: lumi
@@ -47,4 +48,5 @@ SUBDIRS = libcore libutf8 libiox libpty libvt libtio librender libtxl \
 	libtaskbar libsplash libtui libtui_term libwm libtile \
 	cmd/attr cmd/mserver cmd/attach cmd/new cmd/list \
 	cmd/proxy cmd/net-proxy cmd/version cmd/kill cmd/detach cmd/send-keys \
+	cmd/share \
 	cmd/send-input cmd/new-window cmd/reload cmd/splash

@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -51,6 +52,10 @@ struct nct {
 	size_t			 rxcap;
 	int			 use_userauth;	/* run the nc_auth phase */
 	struct ipc_netchan_userauth uacfg;	/* userauth config (copied) */
+	char			 auth_user[NC_AUTH_MAX_USER + 1];
+						/* server: the name the peer
+						 * authenticated as, set once
+						 * userauth succeeds */
 };
 
 /* CLOCK_MONOTONIC in ms, matching netchan's internal clock. */
@@ -809,7 +814,15 @@ nct_run_userauth(struct nct *n, uint32_t start, uint32_t budget)
 	if (alen && nct_rx_append(n, abuf, alen) != 0)
 		return -1;
 
-	return nc_auth_state(&ua) == NC_AUTH_OK ? 0 : -1;
+	if (nc_auth_state(&ua) != NC_AUTH_OK)
+		return -1;
+	if (n->server) {
+		const char *u = nc_auth_user(&ua);
+
+		if (u)
+			snprintf(n->auth_user, sizeof(n->auth_user), "%s", u);
+	}
+	return 0;
 }
 
 int
@@ -870,4 +883,17 @@ ipc_transport_netchan_establish(struct ipc_transport *t, int timeout_ms)
 		return -1;
 
 	return 0;
+}
+
+const char *
+ipc_transport_netchan_auth_user(const struct ipc_transport *t)
+{
+	const struct nct *n;
+
+	if (!t || !t->ctx)
+		return NULL;
+	n = t->ctx;
+	if (!n->server || !n->use_userauth || n->auth_user[0] == '\0')
+		return NULL;
+	return n->auth_user;
 }

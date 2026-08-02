@@ -52,6 +52,7 @@ action_label(enum keys_action action)
 	case KEYS_ACTION_RESIZE_PANE:	return "Resize pane";
 	case KEYS_ACTION_WINDOW_COLORS:	return "Window colors";
 	case KEYS_ACTION_REDISPLAY:	return "Redisplay";
+	case KEYS_ACTION_SHARE_MENU:	return "Clients / keyboard";
 	default:			return NULL;
 	}
 }

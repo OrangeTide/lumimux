@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* ---- tree node helpers ---- */
 
@@ -426,6 +427,31 @@ sessdir_layout_load_screen(const char *session,
 	return (out->root) ? 0 : -1;
 }
 
+/* ---- generation (13-d) ---- */
+
+/* Peek the current on-disk generation without a mode-specific parse.
+ * Missing file, unreadable file, or no GEN= line all read as 0, so a
+ * client that has never saved or seen a generation compares as behind
+ * any real one -- 0 is never handed out by a save, which starts at 1. */
+unsigned long
+sessdir_layout_generation(const char *session)
+{
+	char *data;
+	struct kv_table kv;
+	const char *val;
+	unsigned long gen = 0;
+
+	data = layout_read(session);
+	if (!data)
+		return 0;
+	kv_parse(data, &kv);
+	val = kv_get(&kv, "GEN");
+	if (val)
+		gen = strtoul(val, NULL, 10);
+	free(data);
+	return gen;
+}
+
 /* ---- public API: save ---- */
 
 int
@@ -433,19 +459,32 @@ sessdir_layout_save_turbo(const char *session,
     const struct sessdir_turbo_layout *layout)
 {
 	char *path;
+	char tmp[PATH_MAX];
 	FILE *f;
+	unsigned long gen;
 	int i;
 
 	path = layout_path(session);
 	if (!path)
 		return -1;
-
-	f = fopen(path, "w");
-	free(path);
-	if (!f)
+	if (snprintf(tmp, sizeof(tmp), "%s.new", path) >= (int)sizeof(tmp)) {
+		free(path);
 		return -1;
+	}
+
+	/* write-and-rename: a reader never sees a half written file, and
+	 * a writer that reads this back (13-d) sees a generation strictly
+	 * ahead of whatever was here before its own save */
+	gen = sessdir_layout_generation(session) + 1;
+
+	f = fopen(tmp, "w");
+	if (!f) {
+		free(path);
+		return -1;
+	}
 
 	fprintf(f, "MODE=turbo\n");
+	fprintf(f, "GEN=%lu\n", gen);
 	if (layout->focus >= 0)
 		fprintf(f, "FOCUS=%d\n", layout->focus);
 
@@ -456,8 +495,14 @@ sessdir_layout_save_turbo(const char *session,
 		    layout->wins[i].x, layout->wins[i].y,
 		    layout->wins[i].w, layout->wins[i].h);
 	}
-
 	fclose(f);
+
+	if (rename(tmp, path) < 0) {
+		unlink(tmp);
+		free(path);
+		return -1;
+	}
+	free(path);
 	return 0;
 }
 
@@ -466,20 +511,30 @@ sessdir_layout_save_screen(const char *session,
     const struct sessdir_screen_layout *layout)
 {
 	char *path;
+	char tmp[PATH_MAX];
 	FILE *f;
 	char tree_buf[4096];
+	unsigned long gen;
 	int len;
 
 	path = layout_path(session);
 	if (!path)
 		return -1;
-
-	f = fopen(path, "w");
-	free(path);
-	if (!f)
+	if (snprintf(tmp, sizeof(tmp), "%s.new", path) >= (int)sizeof(tmp)) {
+		free(path);
 		return -1;
+	}
+
+	gen = sessdir_layout_generation(session) + 1;
+
+	f = fopen(tmp, "w");
+	if (!f) {
+		free(path);
+		return -1;
+	}
 
 	fprintf(f, "MODE=screen\n");
+	fprintf(f, "GEN=%lu\n", gen);
 	if (layout->focus >= 0)
 		fprintf(f, "FOCUS=%d\n", layout->focus);
 
@@ -489,7 +544,13 @@ sessdir_layout_save_screen(const char *session,
 		tree_buf[len] = '\0';
 		fprintf(f, "TREE=\"%s\"\n", tree_buf);
 	}
-
 	fclose(f);
+
+	if (rename(tmp, path) < 0) {
+		unlink(tmp);
+		free(path);
+		return -1;
+	}
+	free(path);
 	return 0;
 }

@@ -45,11 +45,13 @@ Information for developers working on lumimux.
 ## Architecture
 
 lumimux uses a micro-server architecture. Each window runs as an independent
-`lumi-mserver` process owning a single PTY and VT emulation state. The
-client (`lumi-attach`) discovers servers via the session directory
-(`libsessdir`), connects to each one over its own Unix domain socket, and
-routes input/output by file descriptor. There is no centralized server
-process.
+`lumi-mserver` process owning a single PTY and VT emulation state. Any number
+of `lumi-attach` clients discover servers via the session directory
+(`libsessdir`), connect to each one over its own Unix domain socket, and
+route input/output by file descriptor. One client holds the keyboard (role
+`IPC_ROLE_WRITE`) at a time in single-writer mode, or several at once in
+multi-writer mode; every other client watches (`IPC_ROLE_VIEW`). There is no
+centralized server process.
 
 ```
                             sessdir: /run/user/<uid>/lumi/<session>/
@@ -59,43 +61,55 @@ process.
                             | <pid3>/socket  <pid3>/title        |
                             +------------------------------------+
                                   |          |          |
-lumi-attach (client)         mserver 1   mserver 2   mserver 3
- +-----------------------+   +--------+  +--------+  +--------+
- | stdin -> tkbd_parse   |   | PTY+VT |  | PTY+VT |  | PTY+VT |
- |   prefix keys/menu    |   +--------+  +--------+  +--------+
- |   overlay (tui_stack) |     ^    |      ^    |      ^    |
- |                       |     |    v      |    v      |    v
- | mconn table:          |   INPUT OUTPUT INPUT OUTPUT INPUT OUTPUT
- |   mconns[0]: fd,pid   |---/    \-------/    \-------/    \----+
- |   mconns[1]: fd,pid   |                                       |
- |   mconns[2]: fd,pid   |             Unix domain sockets       |
- |                       |---------------------------------------+
- | per-window VT state:  |
- |   cwins[0]: vt+parser |
- |   cwins[1]: vt+parser |
- |   cwins[2]: vt+parser |
- |                       |
- | renderer (shadow diff) |
- | taskbar               |
- +-----------------------+
+                              mserver 1   mserver 2   mserver 3
+                              +--------+  +--------+  +--------+
+                              | PTY+VT |  | PTY+VT |  | PTY+VT |
+                              +--------+  +--------+  +--------+
+                                  ^^         ^^          ^^
+                                  ||         ||          ||
+                    each mserver accepts one socket connection per
+                    attached client -- role_for() decides its role
+                                  ||         ||          ||
+                                  vv         vv          vv
+ +-----------------------+                          +-----------------------+
+ | lumi-attach (WRITE)   |                          | lumi-attach (VIEW)    |
+ |   stdin -> tkbd_parse |                          |   input dropped by    |
+ |   mconns[*]: WRITE    |                          |   role_for() (asked   |
+ |   cwins[*]: vt+parser |                          |   IPC_ATTACH_F_VIEW)  |
+ |   renderer, taskbar   |                          |   mconns[*]: VIEW     |
+ +-----------------------+                          |   follows WRITE's     |
+                                                    |   focus/layout via    |
+                                                    |   mirror_sync()       |
+                                                    +-----------------------+
 ```
+
+One session can also be reached by a client of a different uid, relayed
+through the broker described under Cross-User Broker below; that client
+looks like an ordinary connection to each mserver, just relayed rather than
+direct.
 
 ### Micro-Server (lumi-mserver)
 
 Each `lumi-mserver` owns a single window: one PTY, one VT emulation state,
 one listen socket. It runs an `iox_loop` event loop with fd watchers for:
 
-- **Listen socket** -- accepts a client connection
-- **Client fd** -- receives IPC messages (input, resize, kill)
+- **Listen socket** -- accepts client connections
+- **Client fds** -- receives IPC messages (input, resize, kill) from each
+  connected client
 - **PTY master fd** -- reads child output
 
 On PTY read, the server feeds output through `window_feed()` (VT parser) to
-maintain a server-side screen image, then forwards raw bytes as OUTPUT to the
-connected client. On attach, it sends an ATTACH_REPLY with the current VT
-dimensions, followed by a full screen replay via OUTPUT messages.
+maintain a server-side screen image, then forwards raw bytes as OUTPUT to
+every connected client. On attach, it sends an ATTACH_REPLY with the current
+VT dimensions and the role granted, followed by a full screen replay via
+OUTPUT messages.
 
-Only one client is connected at a time. A new attach disconnects the previous
-client. SIGCHLD reaps the dead child process and shuts down the server.
+Several clients may be connected to the same window at once (`struct
+mclient`, a linked list walked with `mclient_first()`/`mclient_next()`);
+`role_for()` decides each connection's role (see Client Roles and Coupling
+below) rather than one connection displacing another. SIGCHLD reaps the dead
+child process and shuts down the server, which disconnects every client
+still attached to it.
 
 The server registers itself in the session directory (`sessdir`) at startup:
 it creates `<session>/<pid>/socket` (the Unix domain socket path) and
@@ -198,6 +212,38 @@ VT to keep overlays functional.
 `mconn` table, reading titles from sessdir. It is called after discovery,
 window selection, mserver disconnect, and sessdir watch events.
 
+#### Client Roster and Coupling
+
+A session's attached clients are tracked in two places. Each `lumi-mserver`
+keeps its own in-process list of connections to that one window (`struct
+mclient`, walked with `mclient_first()`/`mclient_next()`); this is what
+`role_for()` consults to decide a new connection's role. Separately, the
+session directory keeps a session-wide roster (`sessdir_client_register()`/
+`sessdir_client_list()`/`sessdir_client_unregister()`, `libsessdir`) that
+`lumi share -l` reads to print one row per client rather than one row per
+window connection.
+
+Each roster entry (`struct sessdir_client`, `sessdir_control.h`) holds:
+
+- **client_id** -- the client's own id, its pid for a local attach or a
+  broker child's pid for a relayed one (a broker uses its own pid rather
+  than the peer's uid so two connections from the same foreign uid do not
+  collide in the roster)
+- **name** -- display name, `user@host`
+- **who** -- `uid:<n>` or `key:<name>` for a broker- or netchan-relayed
+  client; empty for a same-uid local client, since that case is always the
+  session owner's own uid
+- **role** -- `"write"` or `"view"` (a pending `ask` admission is shown as
+  `"ask"` until approved)
+- **mode** -- the client's UI mode (`screen`/`turbo`/`minimal`), or `"-"`
+  when a broker registered the entry on the client's behalf and has no way
+  to know it
+- **coupling** -- `"mirror"` or `"free"` for a local view-role client (see
+  `-v`/`-F` under `lumi attach`); `"-"` for a write-role client or a
+  broker/netchan registration, neither of which the concept applies to
+- **pending** -- whether this connection is an `ask` admission still
+  awaiting `lumi share -a`/`-d`
+
 ### Overlay System
 
 Menu popups (prefix-key menu, window picker, apps menu) use a `tui_stack`
@@ -245,6 +291,78 @@ state. The session name is passed via `-s` and set as `LUMI_SESSION` in
 the child shell's environment. `lumi-attach` checks this variable at
 startup to prevent recursive attach (which would deadlock).
 
+## Client Roles and Coupling
+
+### Single-Writer vs. Multi-Writer
+
+The session's write mode is a persistent setting, not a per-connection
+choice: `sessdir_share_mode_get()`/`_set()` (`libsessdir`) read and write
+`MODE=` in `<session>/control`, defaulting to `SESSDIR_SHARE_SINGLE_WRITER`
+when the file does not exist. `lumi share -M` sets it. Each `lumi-mserver`
+re-reads it directly (no watch, no caching) inside `role_for()` every time a
+connection asks for a role, so a mode change takes effect for the next
+attach without restarting any server; a client already attached keeps
+whatever role it has until it reattaches or is handed the keyboard with
+`lumi share -g`.
+
+`role_for()` (`mserver.c`) decides the role for a new (or role-requesting)
+connection in this order:
+
+1. `IPC_ATTACH_F_VIEW` set -- grant `IPC_ROLE_VIEW` outright.
+2. `IPC_ATTACH_F_TOKEN` set -- demote every other `IPC_ROLE_WRITE`
+   connection on this window to `IPC_ROLE_VIEW` (each gets an
+   `IPC_MSG_ROLE_CHANGE`), then grant this one `IPC_ROLE_WRITE`. The token
+   is trusted because only the session owner's own uid can present it; it
+   settles which of several simultaneously-attaching cooperating clients
+   ends up holding the keyboard, on every window, rather than one process
+   winning window 1 and another winning window 2.
+3. Session mode is multi-writer -- grant `IPC_ROLE_WRITE` unconditionally;
+   nobody already typing is displaced.
+4. Otherwise (single-writer, no token) -- grant `IPC_ROLE_WRITE` only if no
+   other connection on this window already holds it, else `IPC_ROLE_VIEW`.
+
+In multi-writer mode the token still works as an attach-time tiebreaker
+(step 3 above never applies once step 2 has already granted the role) but
+no longer demotes anyone as a side effect of *not* being presented -- it
+survives as an optional input lock, not a precondition for typing.
+
+### Independent vs. Shared Display
+
+`share.display` (`sessdir_share_display_get()`/`_set()`, also stored in
+`<session>/control`) only matters for write-role clients in multi-writer
+mode, and only decides whether a writer's own view is coupled to the
+others':
+
+- **independent** (default) -- a writer publishes its own focus and layout
+  (`mirror_publish()`) so others can follow it, but never applies another
+  writer's layout or focus to itself.
+- **shared** -- a writer also follows the others, the same way a
+  view-role mirror-coupled client already does. `mirror_following()`
+  (`attach.c`) returns true for a writer once `mirror_display_shared()`
+  is true, so `mirror_sync()`'s periodic and watch-driven checks apply an
+  incoming layout to it as well, *except* while this writer has its own
+  unpublished edit pending (`layout_dirty`) -- `mirror_apply_layout()`
+  refuses to import the disk tree over a live edit it would otherwise
+  free out from under itself. `mirror_publish()` then exports that
+  pending edit as-is: last-writer-wins on disk, same as single-writer
+  mode, this is not a merge. Catching up on another writer's more recent
+  change happens on `mirror_sync()`'s own timer, in whatever gap this
+  writer is not dirty.
+
+### View-Role Coupling
+
+A view-role (`IPC_ROLE_VIEW`) client chooses independently whether to
+follow the write-role client's focus and layout, via `IPC_ATTACH_F_MIRROR`
+on attach (`-v` without `-F`, the default for a client that attaches
+read-only). `mirror_sync()` (`attach.c`) is what a mirror-coupled client
+runs on a session-directory watch event and a slow poll fallback: it reads
+the published focus and, if it names a window this client already has a
+connection to and is not already watching, calls `micro_select_window()`;
+it then checks the layout file's mtime and generation and reimports it via
+`screen_apply_layout()`/`turbo_apply_layout()` if either changed. `-F`
+(`IPC_ATTACH_F_MIRROR` not set) leaves a client to pick its own focus and
+layout while still receiving every window's output.
+
 ## IPC Protocol
 
 Communication uses TLV (type-length-value) messages over Unix domain sockets.
@@ -269,27 +387,75 @@ Types are organized by category (high byte):
 
 **0x00xx -- Session / Connection Control**
 
-| Type         | Code     | Direction | Payload                          |
-|--------------|----------|-----------|----------------------------------|
-| ATTACH       | `0x0001` | C -> S    | (empty or microser `IpcSize`)    |
-| ATTACH_REPLY | `0x0006` | S -> C    | microser `IpcSize` (rows, cols)  |
-| DETACH       | `0x0002` | either    | (empty)                          |
-| KILL         | `0x0003` | C -> S    | (empty)                          |
-| OK           | `0x0004` | S -> C    | (empty)                          |
-| ERROR        | `0x0005` | S -> C    | error message bytes              |
+| Type          | Code     | Direction | Payload                                     |
+|---------------|----------|-----------|----------------------------------------------|
+| ATTACH        | `0x0001` | C -> S    | (empty), microser `IpcSize` (old client), or `ipc_attach` (size + `IPC_ATTACH_F_*` flags + identity) |
+| ATTACH_REPLY  | `0x0006` | S -> C    | microser `IpcSize` (old server, decodes as role WRITE) or `ipc_attach_reply` (size + granted role) |
+| ROLE_CHANGE   | `0x0007` | S -> C    | 1 byte: the role now held (sent when it changes while attached) |
+| CLIENT_EVENT  | `0x0008` | S -> C    | 1 byte kind (`IPC_CLIENT_JOIN`/`LEAVE`/`ROLE`) + client id (u32 BE) + name bytes |
+| ROLE_REQUEST  | `0x0009` | C -> S    | 1 byte of `IPC_ATTACH_F_*` flags: ask for a new role without reattaching |
+| DETACH        | `0x0002` | either    | (empty)                                      |
+| KILL          | `0x0003` | C -> S    | (empty)                                      |
+| OK            | `0x0004` | S -> C    | (empty)                                      |
+| ERROR         | `0x0005` | S -> C    | error message bytes                          |
+
+See `src/libipc/ipc_msg.h` for `IPC_ATTACH_F_VIEW`, `_SIZE_OBSERVE`, `_MIRROR`,
+and `_TOKEN`, and the Client Roles and Attach Handshake sections below.
 
 **0x01xx -- Data Transfer**
 
-| Type   | Code     | Direction | Payload            |
-|--------|----------|-----------|--------------------|
-| INPUT  | `0x0100` | C -> S    | raw keyboard bytes |
-| OUTPUT | `0x0101` | S -> C    | raw PTY output     |
+| Type        | Code     | Direction | Payload                                  |
+|-------------|----------|-----------|--------------------------------------------|
+| INPUT       | `0x0100` | C -> S    | raw keyboard bytes                       |
+| OUTPUT      | `0x0101` | S -> C    | raw PTY output                           |
+| FLOW_CTRL   | `0x0102` | C -> S    | 1 byte: 1 = pause, 0 = resume             |
+| REFRESH     | `0x0103` | C -> S    | (empty): resend a full screen replay at the current size |
+| INPUT_BEGIN | `0x0104` | C -> S    | (empty): open a bracketed multi-message input run (13-b) |
+| INPUT_END   | `0x0105` | C -> S    | (empty): close the run and flush it to the PTY as one write |
+
+INPUT_BEGIN/INPUT_END exist so a bracketed paste (or any other multi-message
+input run) cannot be torn apart by another writer's own `INPUT` landing
+between two messages of the run in multi-writer mode: the server buffers a
+connection's `INPUT` payloads per-connection between BEGIN and END (or until
+disconnect) instead of writing each one immediately.
 
 **0x02xx -- Window / PTY Management**
 
-| Type       | Code     | Direction | Payload                  |
-|------------|----------|-----------|--------------------------|
-| WIN_RESIZE | `0x0207` | C -> S    | microser `IpcWinResize`  |
+| Type       | Code     | Direction | Payload                          |
+|------------|----------|-----------|-------------------------------------|
+| PTY_FLAGS  | `0x0201` | S -> C    | 1 byte bitmask (`IPC_PTY_ECHO`)   |
+| WIN_RESIZE | `0x0207` | C -> S    | microser `IpcWinResize`          |
+
+**0x03xx -- Attribute Store**
+
+Used by `lumi attr` (`libattr`) to get/set/delete per-session key-value
+attributes transactionally.
+
+| Type              | Code     | Direction | Payload                  |
+|-------------------|----------|-----------|--------------------------|
+| ATTR_TXN_BEGIN    | `0x0300` | C -> S    | (empty): begin a transaction |
+| ATTR_TXN_COMMIT   | `0x0301` | C -> S    | txn id                   |
+| ATTR_TXN_ROLLBACK | `0x0302` | C -> S    | txn id                   |
+| ATTR_TXN_OK       | `0x0303` | S -> C    | txn id                   |
+| ATTR_SET          | `0x0310` | C -> S    | txn id + key + value     |
+| ATTR_DELETE       | `0x0311` | C -> S    | txn id + key             |
+| ATTR_GET          | `0x0320` | C -> S    | txn id + key             |
+| ATTR_VALUE        | `0x0321` | S -> C    | key + value              |
+| ATTR_LIST         | `0x0322` | C -> S    | txn id                   |
+| ATTR_ENTRIES      | `0x0323` | S -> C    | key=value entries        |
+| ATTR_OK           | `0x0324` | S -> C    | (empty): success         |
+
+**0x04xx -- Proxy Control**
+
+Sent over the multiplexed `lumi-proxy` connection (SSH-tunneled or netchan),
+not directly to an mserver; `window_id` is 0 in the proxy envelope.
+
+| Type              | Code     | Direction    | Payload                       |
+|-------------------|----------|--------------|-------------------------------|
+| PROXY_READY       | `0x0400` | proxy -> C   | initial window list           |
+| PROXY_WIN_ADDED   | `0x0401` | proxy -> C   | a new window appeared         |
+| PROXY_WIN_REMOVED | `0x0402` | proxy -> C   | a window's server exited      |
+| NOP               | `0x0403` | C -> proxy   | ignored; used as a migration nudge after roaming |
 
 ### Microser Encoding
 
@@ -313,6 +479,26 @@ wire type, providing forward compatibility.
 | 1     | u32 | id     | Window ID (mserver PID) |
 | 2     | u16 | rows   | New row count        |
 | 3     | u16 | cols   | New column count     |
+
+**`IpcAttach`** (ATTACH). Tags 1 and 2 deliberately match `IpcSize` so an old
+peer on either side decodes the shared prefix and ignores the rest:
+
+| Field | Tag | Type   | Description          |
+|-------|-----|--------|----------------------|
+| 1     | u16 | rows   | Terminal row count   |
+| 2     | u16 | cols   | Terminal column count|
+| 3     | u8  | flags  | `IPC_ATTACH_F_*` bitmask (see Client Roles below) |
+| 4     | u32 | client_id | This client's id, for `CLIENT_EVENT` correlation |
+| 5     | string | name | Identity string (`user@host`, or the keystore key name for a netchan client) |
+
+**`IpcAttachReply`** (ATTACH_REPLY):
+
+| Field | Tag | Type   | Description          |
+|-------|-----|--------|----------------------|
+| 1     | u16 | rows   | Terminal row count   |
+| 2     | u16 | cols   | Terminal column count|
+| 3     | u8  | role   | Granted role: `IPC_ROLE_WRITE` (0) or `IPC_ROLE_VIEW` (1) |
+| 4     | u8  | nclients | Number of clients already attached to this window |
 
 ### IDL and Code Generation
 
@@ -345,17 +531,24 @@ When adding a new structured message:
 
 ### Connection Lifecycle
 
-Each `lumi-attach` <-> `lumi-mserver` connection is independent:
+Each `lumi-attach` <-> `lumi-mserver` connection is independent, and any
+number of them may exist for the same window at once (see Client Roles and
+Coupling above):
 
 ```
 Client                          Micro-Server
   |                               |
-  |--- ATTACH ------------------->|  client connects to mserver socket
-  |<----- ATTACH_REPLY (r,c) ----|  server reports its VT dimensions
+  |--- ATTACH (r,c,flags,id,name)>|  client connects to mserver socket
+  |<----- ATTACH_REPLY (r,c,role)-|  server grants a role (role_for())
   |<----- OUTPUT (replay) -------|  server dumps current VT state
+  |<----- CLIENT_EVENT (to others)|  every other connected client is told
+  |                               |  this one joined
   |<----- OUTPUT (ongoing) ------|  server forwards PTY reads
   |                               |
-  |--- INPUT -------------------->|  keyboard bytes to PTY
+  |--- INPUT -------------------->|  keyboard bytes to PTY (write role only)
+  |--- ROLE_REQUEST (flags) ----->|  ask for a different role without
+  |<----- ROLE_CHANGE (role) -----|  reattaching; may demote another
+  |                               |  connection if IPC_ATTACH_F_TOKEN
   |--- WIN_RESIZE (id,r,c) ------>|  resize PTY
   |                               |
   |--- DETACH ------------------->|  client disconnects
@@ -364,13 +557,88 @@ Client                          Micro-Server
   |<----- OK --------------------|  confirmed (mserver exits)
 ```
 
+An old client that sends no `flags`/`client_id`/`name` fields is decoded as
+a bare `IpcSize` (tags 1-2 only) and granted `IPC_ROLE_WRITE`, matching its
+old behavior; an old server that sends no `role` field back is decoded the
+same way by a new client. This is why `IpcAttach`/`IpcAttachReply` keep
+tags 1 and 2 identical to `IpcSize` (see `lumi.idl`) rather than being
+defined from scratch.
+
 The client maintains N such connections simultaneously (one per mserver
-in the session). Window switching in screen mode changes which connection
-receives INPUT; in turbo mode, all connections receive OUTPUT and the
-focused connection receives INPUT.
+in the session, times however many role/mirror connections it opens --
+today exactly one per window per client process). Window switching in
+screen mode changes which connection receives INPUT; in turbo mode, all
+connections receive OUTPUT and the focused connection receives INPUT.
 
 One-shot commands (KILL, DETACH) can be sent on a fresh connection
 without ATTACH.
+
+## Cross-User Broker
+
+`lumi share -u user` or `-G group` starts `lumi proxy -L` (`proxy.c`) as a
+background broker for the session: a listener on a Unix socket outside the
+session directory (`proxy_broker_dir()`/`proxy_broker_sock_path()`, under
+`/tmp/lumi-broker-<uid>/`, since a single uid cannot be expressed in socket
+permissions alone) that relays connections from other local users to every
+mserver in the session.
+
+The broker's accept loop (`proxy_listen_run()`) `fork()`s a child per
+accepted connection; the child (`broker_serve_client()`) does all the work
+and never
+returns -- it always `_exit()`s once its one client is done:
+
+1. Reads the peer's kernel-reported uid/gid via `ipc_peer_cred()`. No peer
+   credential support on the platform is a hard refusal, not an open door.
+2. Checks `sessdir_access_check()` against `<session>/access` (see
+   `doc/lumi.1`'s Cross-user access section for the file format) to get a
+   role ceiling.
+3. If the matching rule was `ask`, admits the connection as pending
+   (`sessdir_client_register()` with `pending=1`) rather than granting or
+   refusing outright, but only if `approver_available()` says someone could
+   plausibly answer (a write-token holder or a locally attached owner
+   client); otherwise it is denied, the same fail-closed default as an
+   explicit `deny` rule. `broker_wait_for_approval()` then blocks the child
+   on the session's control-message watch until `lumi share -a`/`-d`
+   answers it or a timeout elapses.
+4. Every decision is audited via `sessdir_access_audit()` (`<session>/access.log`).
+5. Once admitted, the child registers itself in the session-wide roster
+   (`sessdir_client_register()`) on the client's behalf -- the connecting
+   process has no local session directory to write into itself -- using
+   its own pid as `client_id` (not the peer's uid: two connections from the
+   same uid would otherwise collide in the roster) and `who="uid:<n>"`.
+6. `dup2()`s the accepted socket onto stdin/stdout and runs the same proxy
+   engine used for an SSH-tunneled remote session, with `proxy_attach_flags`
+   set to `IPC_ATTACH_F_VIEW` when the granted role is view-only. From here
+   the child is indistinguishable from an SSH-tunneled `lumi proxy`.
+
+A same-uid client never goes through any of this: each mserver's listen
+socket only accepts connections from its own uid (checked by the kernel via
+the session directory's `0700` mode plus each socket's own permissions), so
+`lumi-attach` connects directly. The broker exists purely to bridge a uid
+that could not otherwise reach those sockets.
+
+## Connection Types and Trust Tiers
+
+| Tier | Path | Peer authenticated by | Encrypted | Authorized by |
+|------|------|------------------------|-----------|----------------|
+| Local | Unix socket, same uid | Kernel (socket/directory permissions) | No (local IPC) | Implicit (same user) |
+| Broker | `lumi proxy -L`, same host | Kernel peer uid/gid (`ipc_peer_cred()`) | No (local IPC) | `<session>/access` ACL |
+| SSH-tunneled | `lumi proxy` over `ssh(1)` | SSH's own login (key, password, etc.) | Yes (SSH channel) | Implicit (whoever can log in) |
+| Netchan, key | `lumi net-proxy -L`/`-k`, direct-connect | Client's `~/.config/lumi/id_netchan` identity key against `~/.config/lumi/authorized_keys` | Yes (X25519 netchan) | `authorized_keys` |
+| Netchan, password | `lumi net-proxy -L`, direct-connect | Username + password against `~/.config/lumi/passwd` | Yes (X25519 netchan) | `passwd` |
+
+All netchan tiers additionally support server identity pinning
+(`lumi attach -V`): the server's long-term host key is compared against
+what the server published out of band and against the client's
+`~/.config/lumi/known_hosts`, so the rotating per-connection key alone
+does not have to carry authentication of the server across restarts.
+
+Local and broker tiers assume trust in the local kernel's uid/gid
+reporting and the session directory's own file permissions; the SSH and
+netchan tiers assume trust in, respectively, the system's SSH
+configuration or the netchan key/password stores under
+`~/.config/lumi`. See `doc/lumi.1`'s Security and Cross-user access
+sections for the exact file paths, modes, and ACL rule syntax.
 
 ## Configuration
 

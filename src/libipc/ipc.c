@@ -2,8 +2,15 @@
 /* Copyright (c) 2026 Jon Mayo
  * Licensed under MIT-0 OR PUBLIC DOMAIN */
 
+/* struct ucred is behind __USE_GNU on glibc and musl alike, and this must
+ * be defined before any system header is pulled in. */
+#if defined(__linux__)
+#define _GNU_SOURCE
+#endif
+
 #include "ipc.h"
 #include "ipc_msg.h"
+#include "runtime_dir.h"
 #include "xmalloc.h"
 
 #include <errno.h>
@@ -16,6 +23,10 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <limits.h>
+
+#if defined(__sun) && defined(__SVR4)
+#include <ucred.h>
+#endif
 
 static void
 set_cloexec(int fd)
@@ -44,8 +55,8 @@ ipc_socket_dir(void)
 		return NULL;
 	}
 
-	/* create directory if it doesn't exist */
-	if (mkdir(dir, 0700) < 0 && errno != EEXIST) {
+	/* create the directory if needed, and refuse it if it is not ours */
+	if (lu_runtime_dir_ensure(dir) < 0) {
 		free(dir);
 		return NULL;
 	}
@@ -97,9 +108,19 @@ ipc_listen(const char *path)
 	/* remove stale socket */
 	unlink(path);
 
-	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-		close(fd);
-		return -1;
+	/* create the socket 0600 whatever umask the caller happened to
+	 * have.  binding under a temporary umask is atomic, where a chmod
+	 * after the fact leaves a window in which the socket is connectable
+	 * by anyone the directory lets in. */
+	{
+		mode_t old = umask(0177);
+		int rc = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+
+		umask(old);
+		if (rc < 0) {
+			close(fd);
+			return -1;
+		}
 	}
 
 	if (listen(fd, 4) < 0) {
@@ -151,6 +172,60 @@ ipc_connect(const char *path)
 	}
 
 	return fd;
+}
+
+int
+ipc_peer_cred(int fd, uid_t *uid, gid_t *gid, pid_t *pid)
+{
+#if defined(__linux__)
+	struct ucred cr;
+	socklen_t len = sizeof(cr);
+
+	if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cr, &len) < 0)
+		return -1;
+	if (uid)
+		*uid = cr.uid;
+	if (gid)
+		*gid = cr.gid;
+	if (pid)
+		*pid = cr.pid;
+	return 0;
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || \
+    defined(__OpenBSD__) || defined(__DragonFly__)
+	uid_t u;
+	gid_t g;
+
+	/* getpeereid() reports no pid; the caller only displays it anyway */
+	if (getpeereid(fd, &u, &g) < 0)
+		return -1;
+	if (uid)
+		*uid = u;
+	if (gid)
+		*gid = g;
+	if (pid)
+		*pid = -1;
+	return 0;
+#elif defined(__sun) && defined(__SVR4)
+	ucred_t *uc = NULL;
+
+	if (getpeerucred(fd, &uc) < 0)
+		return -1;
+	if (uid)
+		*uid = ucred_geteuid(uc);
+	if (gid)
+		*gid = ucred_getegid(uc);
+	if (pid)
+		*pid = ucred_getpid(uc);
+	ucred_free(uc);
+	return 0;
+#else
+	(void)fd;
+	(void)uid;
+	(void)gid;
+	(void)pid;
+	errno = ENOTSUP;
+	return -1;
+#endif
 }
 
 void

@@ -38,6 +38,22 @@ extern int taskbar_visible;
 extern int content_rows, content_cols;
 extern int sessdir_watch_degraded;	/* nonzero: live window watch is off */
 
+/* Presence marker for the taskbar row, e.g. "share:1w+2v ".
+ *
+ * Empty when this client is the only one attached. Drawn by render_taskbar()
+ * regardless of the user's taskbar format, like the degraded-watch marker:
+ * configuration decides how it reads, not whether a session can be watched
+ * without anyone noticing. */
+extern char share_marker[48];
+
+/* Nonzero when at least one attached client is not the session owner's
+ * uid (a broker-relayed tier 1/2 client, per 12-d-a's roster "who" field)
+ * or, for a remote client's own view of its session, always -- a remote
+ * attach is itself a foreign uid by definition. render_taskbar() draws
+ * share_marker in a distinct color while this is set, so a shared,
+ * cross-user session cannot look identical to a private one. */
+extern int share_marker_foreign;
+
 /* overlay system */
 extern struct tui_stack overlay;
 extern struct tui_backend *tb;

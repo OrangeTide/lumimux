@@ -6,6 +6,17 @@
 #define IPC_H
 
 #include <stdint.h>
+#include <sys/types.h>
+
+/* defined on platforms where ipc_peer_cred() can report the credentials of
+ * the far end of a connected Unix domain socket.  code that authorizes a
+ * peer by uid or gid must be compiled out where this is undefined: there is
+ * no safe fallback, so the caller refuses the peer instead. */
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__) || \
+    defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__) || \
+    (defined(__sun) && defined(__SVR4))
+#define IPC_HAVE_PEER_CRED 1
+#endif
 
 /* return the socket directory path (caller must free).
  * uses $XDG_RUNTIME_DIR/lumi/ or /tmp/lumi-<uid>/ as fallback.
@@ -26,6 +37,15 @@ int ipc_accept(int listen_fd);
 /* connect to a Unix domain socket at path.
  * returns fd on success, -1 on error. */
 int ipc_connect(const char *path);
+
+/* report the credentials the kernel recorded for the peer of a connected
+ * Unix domain socket.  they are captured at connect() time and cannot be
+ * forged by the peer, not even by a later exec of a setuid binary.
+ * uid, gid, and pid may each be NULL.  *pid is set to -1 where the platform
+ * does not report one, and is safe to display but never to decide with:
+ * pids are reused, so authorization must use the uid or the gid.
+ * returns 0 on success, -1 on error (errno ENOTSUP where unsupported). */
+int ipc_peer_cred(int fd, uid_t *uid, gid_t *gid, pid_t *pid);
 
 /* close a socket fd and optionally unlink the path */
 void ipc_close(int fd);

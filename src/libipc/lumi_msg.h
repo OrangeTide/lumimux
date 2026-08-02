@@ -15,6 +15,28 @@ struct ipc_size {
 int ipc_size_encode(const struct ipc_size *msg, uint8_t *buf, int len);
 int ipc_size_decode(struct ipc_size *msg, const uint8_t *buf, int len);
 
+struct ipc_attach {
+	uint16_t	rows;
+	uint16_t	cols;
+	uint8_t	flags;
+	uint32_t	client_id;
+	const char	*name;
+	uint16_t	 name_len;
+};
+
+int ipc_attach_encode(const struct ipc_attach *msg, uint8_t *buf, int len);
+int ipc_attach_decode(struct ipc_attach *msg, const uint8_t *buf, int len);
+
+struct ipc_attach_reply {
+	uint16_t	rows;
+	uint16_t	cols;
+	uint8_t	role;
+	uint8_t	nclients;
+};
+
+int ipc_attach_reply_encode(const struct ipc_attach_reply *msg, uint8_t *buf, int len);
+int ipc_attach_reply_decode(struct ipc_attach_reply *msg, const uint8_t *buf, int len);
+
 struct ipc_win_id {
 	uint32_t	id;
 };

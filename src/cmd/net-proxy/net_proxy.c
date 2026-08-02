@@ -27,6 +27,8 @@
 #include "lumi_msg.h"
 #include "proxy_msg.h"
 #include "sessdir.h"
+#include "sessdir_access.h"
+#include "sessdir_control.h"
 #include "sessdir_watch.h"
 #include "nc_udp.h"
 #include "log.h"
@@ -44,6 +46,8 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define NET_PSK_LEN	32
@@ -68,6 +72,35 @@ static const char *session_name;
 static struct ipc_transport *client;	/* the netchan link to the client */
 static int watch_fd = -1;
 static volatile sig_atomic_t stop_flag;
+
+/* what attach_mserver() asks each window for: unrestricted by default (the
+ * ssh-bootstrap and PSK-only daemon modes, both reachable only by the
+ * session owner's own uid over a channel they already had to have
+ * pre-arranged access for), overridden by serve_one_client() to the ACL's
+ * granted ceiling once a -L listener's userauth names who connected. */
+static uint8_t proxy_attach_flags;
+static uint32_t proxy_client_id;
+static char proxy_client_name[64] = "net-proxy";
+
+/* 12-d-b: the identity to re-check on every sessdir watch wakeup, so an
+ * ACL edit reaches an already-connected client rather than only the next
+ * one. Set once in serve_one_client() alongside the initial admission
+ * decision; left inactive (acl_active == 0) for the ssh-bootstrap and PSK
+ * daemon paths, which have no identity to check in the first place. */
+static struct sessdir_access_who acl_who;
+static int acl_active;
+static int acl_last_granted;
+
+/* 12-d-c: an "ask" match is admitted rather than denied outright, but
+ * sees nothing until approved. No one able to approve, or no answer
+ * within this long, is still a denial -- fail-closed rule 3 stays the
+ * default, "ask" just gets a real chance to be answered first. */
+#define PENDING_TIMEOUT_S	60
+static int pending_state;	/* nonzero: waiting, not yet attached */
+static time_t pending_deadline;
+static unsigned long pending_last_seq;
+
+static void detach_pconns(void);
 
 /* ---- pconn management ---- */
 
@@ -130,7 +163,7 @@ attach_mserver(pid_t pid)
 	int fd;
 	uint32_t rtype, rlen;
 	char rbuf[64];
-	struct ipc_size sz;
+	struct ipc_attach_reply rep;
 	uint16_t rows = 24, cols = 80;
 
 	if (pconn_find_by_id((uint32_t)pid))
@@ -150,16 +183,34 @@ attach_mserver(pid_t pid)
 	if (fd < 0)
 		return -1;
 
-	if (ipc_msg_send_empty(fd, IPC_MSG_ATTACH) < 0) {
-		ipc_close(fd);
-		return -1;
+	/* a real IpcAttach rather than the legacy empty form, so
+	 * proxy_attach_flags (IPC_ATTACH_F_VIEW when serve_one_client()
+	 * clamped a -L listener's client to the ACL's view ceiling) reaches
+	 * the mserver the same way a direct -v attach would. */
+	{
+		struct ipc_attach at;
+		uint8_t abuf[128];
+		int an;
+
+		at.rows = rows;
+		at.cols = cols;
+		at.flags = proxy_attach_flags;
+		at.client_id = proxy_client_id;
+		at.name = proxy_client_name;
+		at.name_len = (uint16_t)strlen(proxy_client_name);
+		an = ipc_attach_encode(&at, abuf, sizeof(abuf));
+		if (an < 0 ||
+		    ipc_msg_send(fd, IPC_MSG_ATTACH, abuf, (uint32_t)an) < 0) {
+			ipc_close(fd);
+			return -1;
+		}
 	}
 	if (ipc_msg_recv(fd, &rtype, rbuf, sizeof(rbuf), &rlen) == 0 &&
 	    rtype == IPC_MSG_ATTACH_REPLY) {
-		if (ipc_size_decode(&sz, (const uint8_t *)rbuf,
-		    (int)rlen) >= 0 && sz.rows > 0 && sz.cols > 0) {
-			rows = sz.rows;
-			cols = sz.cols;
+		if (ipc_attach_reply_decode(&rep, (const uint8_t *)rbuf,
+		    (int)rlen) >= 0 && rep.rows > 0 && rep.cols > 0) {
+			rows = rep.rows;
+			cols = rep.cols;
 		}
 	}
 
@@ -263,14 +314,25 @@ udp_bind(const char *bindaddr, int port, uint16_t *bound_port)
 	fd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (fd < 0)
 		return -1;
-	/* A direct-connect listener (-L) rebinds the same fixed port between
-	 * clients; allow the immediate rebind rather than failing on a port
-	 * the kernel has not fully released. */
+	/* SO_REUSEADDR lets a restarted proxy rebind without waiting out a
+	 * TIME_WAIT-like state; SO_REUSEPORT lets the direct-connect listener
+	 * (-L) keep its socket bound to <bindaddr, port> for the life of the
+	 * process while each forked child binds its own socket to that same
+	 * <bindaddr, port> and connect()s it to one client, so the kernel
+	 * routes that client's later datagrams to the child instead of the
+	 * listener. This "more specific socket wins" routing is exercised and
+	 * confirmed under test on Linux; other SO_REUSEPORT-supporting POSIX
+	 * systems (this project also targets macOS/BSD -- see ipc_peer_cred())
+	 * are expected to behave the same way but have not been tested here. */
 	{
 		int one = 1;
 
 		(void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one,
 		    sizeof(one));
+#ifdef SO_REUSEPORT
+		(void)setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one,
+		    sizeof(one));
+#endif
 	}
 	memset(&sin, 0, sizeof(sin));
 	sin.sin_family = AF_INET;
@@ -584,11 +646,193 @@ drain_mserver(struct pconn *pc)
 
 /* ---- sessdir watch: add/remove mservers ---- */
 
+/* Ask every currently-attached mserver window to re-clamp this connection's
+ * role. mserver's own IPC_MSG_ROLE_REQUEST handler answers with
+ * IPC_MSG_ROLE_CHANGE and enforces it from then on, so nothing further
+ * needs to happen here for a client already relying on that enforcement
+ * for INPUT et al. */
+static void
+broadcast_role_request(uint8_t flags)
+{
+	int i;
+
+	for (i = 0; i < pconn_count; i++)
+		ipc_transport_send(pconns[i].t, IPC_MSG_ROLE_REQUEST, &flags,
+		    1);
+}
+
+/* 12-d-b: an ACL change re-evaluates a live connection, not just new ones.
+ * Called on every sessdir watch wakeup (so on any session directory
+ * change, not just an edit to "access" -- there is no finer-grained watch
+ * today), but only acts when the granted role actually differs from the
+ * last decision, so an unrelated write elsewhere in the directory (a
+ * window switching focus, another client's own roster update) does not
+ * spam the audit log or re-request a role that never changed. */
+static void
+recheck_acl(void)
+{
+	struct sessdir_access_decision dec;
+	int granted;
+
+	if (!acl_active)
+		return;
+
+	sessdir_access_check(session_name, getuid(), &acl_who, &dec);
+	/* dec.ask only matters at initial admission (serve_one_client()):
+	 * it decides whether a brand new connection is admitted pending or
+	 * denied outright. This connection already got past that, whether
+	 * by an outright grant or by 12-d-c's approval flow, and the ACL
+	 * rule that produced it is not expected to change out from under
+	 * it just because it still carries "ask" -- that would revoke every
+	 * pending admission the instant it was approved, since approval is
+	 * a one-time control message, not an edit to the rule itself. Use
+	 * the role ceiling directly; an owner who wants to revoke a live
+	 * connection changes the rule to an outright deny, which this still
+	 * catches below exactly as before. */
+	granted = dec.role;
+	if (granted == acl_last_granted)
+		return;
+
+	sessdir_access_audit(session_name, &acl_who, &dec, dec.role, granted);
+	acl_last_granted = granted;
+
+	if (granted == SESSDIR_ACCESS_DENY) {
+		log_err("net-proxy: ACL change revoked key '%s' (%s)",
+		    acl_who.key, dec.subject);
+		stop_flag = 1;
+		return;
+	}
+
+	proxy_attach_flags = (granted == SESSDIR_ACCESS_VIEW) ?
+	    IPC_ATTACH_F_VIEW : 0;
+	broadcast_role_request(proxy_attach_flags);
+}
+
+/* Discover every mserver in the session, attach to each (replaying its
+ * screen into this connection's own pconn), and tell the far client the
+ * resulting window list. Called once immediately for an ordinary
+ * admission, or once on approval for a client that was pending -- never
+ * before either point, since attaching is exactly the step that starts
+ * sending session content. Returns 0 on success, -1 on failure (the
+ * caller tears the connection down either way). */
+static int
+attach_all_and_announce(void)
+{
+	uint8_t ready_buf[4096];
+	pid_t pids[PCONN_MAX];
+	int ready_len, n, i;
+
+	sessdir_cleanup_stale(session_name);
+	n = sessdir_list_servers(session_name, pids, PCONN_MAX);
+	if (n < 0) {
+		log_err("failed to list servers for session '%s'",
+		    session_name);
+		return -1;
+	}
+	for (i = 0; i < n; i++)
+		attach_mserver(pids[i]);
+
+	ready_len = encode_ready_payload(ready_buf, sizeof(ready_buf));
+	if (ready_len < 0 ||
+	    proxy_msg_xsend(client, 0, IPC_MSG_PROXY_READY, ready_buf,
+	    (uint32_t)ready_len) != 0) {
+		log_err("failed to send ready message");
+		detach_pconns();
+		return -1;
+	}
+	return 0;
+}
+
+/* Is anyone attached who could actually answer an "ask" admission --
+ * the write-token holder, or (per FUTURE.md 12C) any owner-uid client if
+ * there is no writer? A local, tier-0 attach.c client always registers
+ * with an empty `who` (12-d-a); that is the only signal this broker has
+ * for "an owner client is here," short of re-deriving uids the roster
+ * does not otherwise need to carry. */
+static int
+approver_available(void)
+{
+	struct sessdir_client list[SESSDIR_CLIENT_MAX];
+	char holder[64];
+	int n, i;
+
+	if (sessdir_token_holder(session_name, holder, sizeof(holder), NULL) == 0)
+		return 1;
+
+	n = sessdir_client_list(session_name, list, SESSDIR_CLIENT_MAX);
+	for (i = 0; i < n; i++) {
+		if (list[i].who[0] == '\0')
+			return 1;
+	}
+	return 0;
+}
+
+/* Resolve a pending admission: timeout, an approve/reject verb addressed
+ * to this connection's client_id, or nothing yet. Called every bridge
+ * loop tick regardless of watch activity, since a timeout must fire even
+ * when the session directory never changes again. */
+static void
+pending_tick(void)
+{
+	struct sessdir_ctl ctl;
+
+	if (!pending_state)
+		return;
+
+	if (time(NULL) >= pending_deadline) {
+		log_err("net-proxy: pending admission for '%s' timed out",
+		    acl_who.key);
+		pending_state = 0;
+		stop_flag = 1;
+		return;
+	}
+
+	if (sessdir_ctl_read(session_name, &ctl) != 0 ||
+	    ctl.seq <= pending_last_seq)
+		return;
+	pending_last_seq = ctl.seq;
+	if (ctl.target != proxy_client_id)
+		return;
+
+	if (ctl.verb == SESSDIR_CTL_APPROVE) {
+		struct sessdir_client sc;
+
+		pending_state = 0;
+		memset(&sc, 0, sizeof(sc));
+		sc.client_id = proxy_client_id;
+		sc.pid = getpid();
+		snprintf(sc.name, sizeof(sc.name), "%s", proxy_client_name);
+		snprintf(sc.who, sizeof(sc.who), "%.*s",
+		    (int)sizeof(sc.who) - 1, acl_who.key);
+		snprintf(sc.role, sizeof(sc.role), "%s",
+		    proxy_attach_flags & IPC_ATTACH_F_VIEW ? "view" : "write");
+		snprintf(sc.mode, sizeof(sc.mode), "-");
+		snprintf(sc.coupling, sizeof(sc.coupling), "-");
+		sc.since = (long)time(NULL);
+		sessdir_client_register(session_name, &sc);
+
+		if (attach_all_and_announce() != 0)
+			stop_flag = 1;
+	} else if (ctl.verb == SESSDIR_CTL_REJECT) {
+		log_err("net-proxy: pending admission for '%s' rejected",
+		    acl_who.key);
+		pending_state = 0;
+		stop_flag = 1;
+	}
+}
+
 static void
 reconcile_mservers(void)
 {
 	pid_t pids[PCONN_MAX];
 	int n, i;
+
+	if (pending_state)
+		return;	/* nothing attached yet; nothing to reconcile */
+
+	recheck_acl();
+	if (stop_flag)
+		return;
 
 	sessdir_cleanup_stale(session_name);
 	n = sessdir_list_servers(session_name, pids, PCONN_MAX);
@@ -671,6 +915,13 @@ bridge_loop(void)
 				break;
 			continue;
 		}
+
+		/* checked every tick, not only on watch wakeup, so a pending
+		 * admission's timeout fires even if the session directory
+		 * never changes again. */
+		pending_tick();
+		if (stop_flag)
+			break;
 
 		/* always service netchan (a timer may be due). */
 		if (ipc_transport_netchan_pump(client) != 0)
@@ -758,10 +1009,7 @@ cleanup(void)
 static int
 serve_one_client(int udp_fd, const struct ipc_netchan_auth *auth)
 {
-	uint8_t ready_buf[4096];
 	struct pollfd wait_fd;
-	pid_t pids[PCONN_MAX];
-	int ready_len, n, i;
 
 	wait_fd.fd = udp_fd;
 	wait_fd.events = POLLIN;
@@ -790,26 +1038,113 @@ serve_one_client(int udp_fd, const struct ipc_netchan_auth *auth)
 		return -1;
 	}
 
-	/* discover and attach to all mservers. */
-	sessdir_cleanup_stale(session_name);
-	n = sessdir_list_servers(session_name, pids, PCONN_MAX);
-	if (n < 0) {
-		log_err("failed to list servers for session '%s'",
-		    session_name);
-		ipc_transport_free(client);
-		client = NULL;
-		return -1;
-	}
-	for (i = 0; i < n; i++)
-		attach_mserver(pids[i]);
+	/* A -L listener names who connected via its userauth phase; check
+	 * that identity against the session's ACL and clamp what
+	 * attach_mserver() will ask each window for accordingly. NULL here
+	 * means no userauth ran at all (the ssh-bootstrap and PSK daemon
+	 * modes), reachable only by the session owner's own uid over a
+	 * channel that already needed pre-arranged access, so it keeps the
+	 * unrestricted default rather than being denied for lacking an
+	 * identity to check. */
+	proxy_client_id = (uint32_t)getpid();
+	pending_state = 0;
+	{
+		const char *authuser = ipc_transport_netchan_auth_user(client);
+		const char *role_str = "write";
+		int pending = 0;
 
-	/* send the initial window list. */
-	ready_len = encode_ready_payload(ready_buf, sizeof(ready_buf));
-	if (ready_len < 0 ||
-	    proxy_msg_xsend(client, 0, IPC_MSG_PROXY_READY, ready_buf,
-	    (uint32_t)ready_len) != 0) {
-		log_err("failed to send ready message");
-		detach_pconns();
+		if (authuser) {
+			struct sessdir_access_who who;
+			struct sessdir_access_decision dec;
+			int granted;
+
+			memset(&who, 0, sizeof(who));
+			who.is_key = 1;
+			snprintf(who.key, sizeof(who.key), "%s", authuser);
+
+			sessdir_access_check(session_name, getuid(), &who,
+			    &dec);
+			granted = dec.role;
+			if (dec.ask) {
+				/* Admit as pending rather than deny outright,
+				 * but only if someone could plausibly answer;
+				 * fail-closed rule 3 otherwise ("no one
+				 * available to answer ... means deny"), with
+				 * no wasted timeout. */
+				if (approver_available()) {
+					pending = 1;
+					granted = dec.role;
+				} else {
+					granted = SESSDIR_ACCESS_DENY;
+				}
+			}
+			sessdir_access_audit(session_name, &who, &dec,
+			    dec.role, granted);
+
+			if (!pending && granted == SESSDIR_ACCESS_DENY) {
+				log_err("net-proxy: denied key '%s' (%s)",
+				    authuser, dec.subject);
+				ipc_transport_free(client);
+				client = NULL;
+				return -1;
+			}
+
+			proxy_attach_flags = (granted == SESSDIR_ACCESS_VIEW) ?
+			    IPC_ATTACH_F_VIEW : 0;
+			snprintf(proxy_client_name, sizeof(proxy_client_name),
+			    "%s", authuser);
+			role_str = granted == SESSDIR_ACCESS_VIEW ?
+			    "view" : "write";
+
+			acl_who = who;
+			acl_active = 1;
+			acl_last_granted = granted;
+		}
+
+		/* attach.c never sees this connection to register it itself
+		 * (it has no local session directory to write into), so the
+		 * broker does it on the client's behalf, the same way it
+		 * already stands in for this client's IpcAttach to each
+		 * mserver. */
+		{
+			struct sessdir_client sc;
+
+			memset(&sc, 0, sizeof(sc));
+			sc.client_id = proxy_client_id;
+			sc.pid = getpid();
+			snprintf(sc.name, sizeof(sc.name), "%s",
+			    proxy_client_name);
+			snprintf(sc.who, sizeof(sc.who), "%s",
+			    authuser ? authuser : "");
+			snprintf(sc.role, sizeof(sc.role), "%s",
+			    pending ? "ask" : role_str);
+			snprintf(sc.mode, sizeof(sc.mode), "-");
+			snprintf(sc.coupling, sizeof(sc.coupling), "-");
+			sc.since = (long)time(NULL);
+			sc.pending = pending;
+			sessdir_client_register(session_name, &sc);
+		}
+
+		if (pending) {
+			pending_state = 1;
+			pending_deadline = time(NULL) + PENDING_TIMEOUT_S;
+			pending_last_seq = 0;
+			{
+				struct sessdir_ctl ctl;
+
+				/* baseline against any backlog: only a verb
+				 * posted after this point resolves us. */
+				if (sessdir_ctl_read(session_name, &ctl) == 0)
+					pending_last_seq = ctl.seq;
+			}
+		}
+	}
+
+	/* discover and attach to all mservers -- unless still pending, in
+	 * which case nothing happens until pending_tick() resolves it from
+	 * inside bridge_loop(). */
+	if (!pending_state && attach_all_and_announce() != 0) {
+		sessdir_client_unregister(session_name, proxy_client_id);
 		ipc_transport_free(client);
 		client = NULL;
 		return -1;
@@ -818,24 +1153,88 @@ serve_one_client(int udp_fd, const struct ipc_netchan_auth *auth)
 	watch_fd = sessdir_watch_start(session_name);
 	bridge_loop();
 
+	sessdir_client_unregister(session_name, proxy_client_id);
 	detach_pconns();
 	ipc_transport_free(client);	/* closes udp_fd */
 	client = NULL;
 	return 0;
 }
 
+/* How many clients net_proxy_listen() will bridge at once. Each is a
+ * separate forked process, so this bounds worst-case fork/memory load
+ * rather than any protocol limit. */
+#define NET_PROXY_MAX_CHILDREN 16
+
+static pid_t listen_children[NET_PROXY_MAX_CHILDREN];
+static int listen_child_count;
+
+static void
+listen_child_add(pid_t pid)
+{
+	if (listen_child_count < NET_PROXY_MAX_CHILDREN)
+		listen_children[listen_child_count++] = pid;
+}
+
+static void
+listen_child_remove(pid_t pid)
+{
+	int i;
+
+	for (i = 0; i < listen_child_count; i++) {
+		if (listen_children[i] == pid) {
+			listen_children[i] =
+			    listen_children[--listen_child_count];
+			return;
+		}
+	}
+}
+
+/* Reap every child that has already exited, without blocking. */
+static void
+listen_reap_children(void)
+{
+	pid_t pid;
+
+	while ((pid = waitpid(-1, NULL, WNOHANG)) > 0)
+		listen_child_remove(pid);
+}
+
 /*
- * Direct-connect deployment: listen persistently on a fixed port and serve
- * clients one at a time, each authenticating itself over netchan with no ssh
- * bootstrap.  The connection is encrypted and the server is pinned by its host
- * key; the user proves identity with a key or password from ~/.config/lumi.
- * There is no PSK: the endpoint is public and every client authenticates.
+ * Direct-connect deployment: listen persistently on a fixed port and bridge
+ * up to NET_PROXY_MAX_CHILDREN clients at once, each authenticating itself
+ * over netchan with no ssh bootstrap. The connection is encrypted and the
+ * server is pinned by its host key; the user proves identity with a key or
+ * password from ~/.config/lumi. There is no PSK: the endpoint is public and
+ * every client authenticates.
+ *
+ * The listening socket stays bound for the process lifetime (SO_REUSEPORT).
+ * A new client's first datagram is only ever peeked (MSG_PEEK) on it, never
+ * consumed there: the parent forks a child, the child binds its own socket
+ * to the same <bindaddr, port> and connect()s it to that one peer, and only
+ * then does the parent drain the peeked datagram from the listening socket.
+ * From that point on the kernel routes that peer's packets to the child's
+ * more specific connected socket instead of the listener, so the child never
+ * actually reads the datagram the parent peeked -- it relies on the netchan
+ * handshake's own retry (nct_send_hello() repeats until answered) to see the
+ * client's next attempt, now on its own socket. This keeps the fork/accept
+ * logic here self-contained, with no changes to the netchan transport.
+ *
+ * Known race: if that same peer retransmits its HELLO again before the new
+ * child's connect() completes, the retransmission queues on the listener
+ * like a brand new client and this loop forks a second child for the same
+ * peer. Both race to complete the handshake; the loser just times out
+ * against a peer who has already moved on to the winner, bounded by
+ * ipc_transport_netchan_establish()'s own timeout. Harmless but wasteful,
+ * and not expected in practice given fork()+connect() is far faster than a
+ * handshake retry interval.
  */
 static int
 net_proxy_listen(const char *bindaddr, int port)
 {
 	uint8_t host_sk[NET_KEY_LEN], host_pk[NET_KEY_LEN];
 	char hex[NET_KEY_LEN * 2 + 1];
+	uint16_t bound = 0;
+	int listen_fd;
 
 	if (port == 0) {
 		log_err("listen mode (-L) requires a fixed port (-p)");
@@ -851,6 +1250,12 @@ net_proxy_listen(const char *bindaddr, int port)
 		return 1;
 	}
 
+	listen_fd = udp_bind(bindaddr, port, &bound);
+	if (listen_fd < 0) {
+		log_err("failed to bind udp/%d", port);
+		return 1;
+	}
+
 	signal(SIGTERM, on_signal);
 	signal(SIGINT, on_signal);
 	signal(SIGPIPE, SIG_IGN);
@@ -861,25 +1266,94 @@ net_proxy_listen(const char *bindaddr, int port)
 	log_info("host key: %s", hex);
 
 	while (!stop_flag) {
-		struct ipc_netchan_userauth ua = {
-			.methods = ua_methods,
-			.check_key = ua_check_key,
-			.check_password = ua_check_password,
-		};
-		struct ipc_netchan_auth auth = {
-			.static_sk = host_sk,
-			.userauth = &ua,
-		};
-		uint16_t bound = 0;
-		int udp_fd = udp_bind(bindaddr, port, &bound);
+		struct pollfd pfd;
+		struct sockaddr_storage ss;
+		socklen_t slen;
+		uint8_t peek[64];
+		pid_t pid;
+		int pr;
 
-		if (udp_fd < 0) {
-			log_err("failed to bind udp/%d", port);
-			return 1;
+		listen_reap_children();
+
+		pfd.fd = listen_fd;
+		pfd.events = POLLIN;
+		pfd.revents = 0;
+		pr = poll(&pfd, 1, PROXY_TICK_MS);
+		if (pr < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
 		}
-		/* serve_one_client owns and closes udp_fd, freeing the port for
-		 * the next accept. */
-		(void)serve_one_client(udp_fd, &auth);
+		if (pr == 0)
+			continue;
+
+		slen = sizeof(ss);
+		if (recvfrom(listen_fd, peek, sizeof(peek), MSG_PEEK,
+		    (struct sockaddr *)&ss, &slen) < 0)
+			continue;
+
+		if (listen_child_count >= NET_PROXY_MAX_CHILDREN) {
+			/* no slot free: drain and drop. the client's own
+			 * handshake retry gets it served once one frees up. */
+			(void)recvfrom(listen_fd, peek, sizeof(peek), 0,
+			    NULL, NULL);
+			log_err("dropping a connection attempt: %d clients "
+			    "already active", listen_child_count);
+			continue;
+		}
+
+		pid = fork();
+		if (pid < 0) {
+			/* drain and drop, same as the cap-exceeded case above:
+			 * without this a failing fork() re-peeks the same
+			 * datagram every iteration with no backoff. */
+			(void)recvfrom(listen_fd, peek, sizeof(peek), 0,
+			    NULL, NULL);
+			log_err("fork failed accepting a connection: %s",
+			    strerror(errno));
+			continue;
+		}
+		if (pid == 0) {
+			struct ipc_netchan_userauth ua = {
+				.methods = ua_methods,
+				.check_key = ua_check_key,
+				.check_password = ua_check_password,
+			};
+			struct ipc_netchan_auth auth = {
+				.static_sk = host_sk,
+				.userauth = &ua,
+			};
+			uint16_t child_bound = 0;
+			int child_fd;
+
+			close(listen_fd);
+
+			child_fd = udp_bind(bindaddr, port, &child_bound);
+			if (child_fd < 0 || connect(child_fd,
+			    (struct sockaddr *)&ss, slen) != 0)
+				_exit(1);
+
+			/* serve_one_client owns and closes child_fd. */
+			_exit(serve_one_client(child_fd, &auth) == 0 ? 0 : 1);
+		}
+
+		/* parent: this datagram's retransmission is now the child's
+		 * to receive; drop our peeked copy so it is not repeatedly
+		 * re-peeked into a fork storm for the same client. */
+		(void)recvfrom(listen_fd, peek, sizeof(peek), 0, NULL, NULL);
+		listen_child_add(pid);
+	}
+
+	close(listen_fd);
+
+	/* stop accepting; ask every still-running child to finish up. */
+	{
+		int i;
+
+		for (i = 0; i < listen_child_count; i++)
+			kill(listen_children[i], SIGTERM);
+		for (i = 0; i < listen_child_count; i++)
+			waitpid(listen_children[i], NULL, 0);
 	}
 	return 0;
 }

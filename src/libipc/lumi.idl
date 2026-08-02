@@ -9,6 +9,25 @@ message IpcSize
     uint16 cols = 2
 end
 
+# shared attach handshake.  tags 1 and 2 match IpcSize on purpose: an old
+# peer decodes either of these as an IpcSize and skips the rest, so a new
+# client works against an old server and the reverse.  do not renumber.
+
+message IpcAttach
+    uint16 rows = 1
+    uint16 cols = 2
+    uint8 flags = 3
+    uint32 client_id = 4
+    string name = 5
+end
+
+message IpcAttachReply
+    uint16 rows = 1
+    uint16 cols = 2
+    uint8 role = 3
+    uint8 nclients = 4
+end
+
 message IpcWinId
     uint32 id = 1
 end

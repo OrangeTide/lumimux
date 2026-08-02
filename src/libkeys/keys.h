@@ -58,6 +58,7 @@ enum keys_action {
 	KEYS_ACTION_SWAP_NUM_HIGHER,	/* swap number with next higher window */
 	KEYS_ACTION_COMMAND,		/* open the command input line */
 	KEYS_ACTION_REDISPLAY,		/* resync + fully repaint the screen */
+	KEYS_ACTION_SHARE_MENU,		/* who is attached; pass the keyboard */
 };
 
 /* state of the prefix key state machine */

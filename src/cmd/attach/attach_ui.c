@@ -7,6 +7,7 @@
 #include "tui_term.h"
 #include "tio_write.h"
 
+#include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -202,17 +203,43 @@ render_taskbar(int fd, int rows, int cols)
 		/* prepend a fixed marker when the live window watch is off, so
 		 * the degraded state is visible regardless of the user's
 		 * taskbar format (independent of taskbar_expand). */
-		const char *warn = sessdir_watch_degraded ? "[!watch] " : "";
-		int wlen = (int)strlen(warn);
+		const char *watch_pre = sessdir_watch_degraded ? "[!watch] " : "";
+		char pre_out[160];
+		int wlen, outlen;
 
+		/* Both markers are prepended rather than expanded from the
+		 * format, so neither can be configured away: one says the
+		 * window list may be stale, the other says someone else is
+		 * attached. wlen is the plain display width (both markers
+		 * are ASCII, so byte count and column count agree), used to
+		 * size the format-driven remainder; pre_out is what is
+		 * actually emitted, which may carry color escapes around
+		 * the share marker without changing that width, so its byte
+		 * length (outlen) is used as the write offset instead. */
+		wlen = (int)(strlen(watch_pre) + strlen(share_marker));
 		if (wlen > max) {
 			wlen = 0;
-			warn = "";
+			outlen = 0;
+		} else if (share_marker[0] && share_marker_foreign) {
+			char fg[16];
+			int fglen;
+			const char *sgr0 = txl_str(txl, TXL_SGR0);
+
+			fglen = txl_setaf(txl, fg, sizeof(fg), 3);
+			outlen = snprintf(pre_out, sizeof(pre_out),
+			    "%s%.*s%s%s", watch_pre, fglen, fg, share_marker,
+			    sgr0 ? sgr0 : "");
+		} else {
+			outlen = snprintf(pre_out, sizeof(pre_out), "%s%s",
+			    watch_pre, share_marker);
 		}
-		taskbar_expand(taskbar, content + wlen,
-		    sizeof(content) - (size_t)wlen, max - wlen);
-		if (wlen > 0)
-			memcpy(content, warn, (size_t)wlen);
+		if (outlen < 0 || outlen > (int)sizeof(content) - 64)
+			outlen = 0;
+
+		taskbar_expand(taskbar, content + outlen,
+		    sizeof(content) - (size_t)outlen, max - wlen);
+		if (outlen > 0)
+			memcpy(content, pre_out, (size_t)outlen);
 	}
 
 	/* skip if nothing changed since last draw */

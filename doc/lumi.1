@@ -80,9 +80,16 @@ Attach to an existing session.
 .RB [ "\-f window" ]
 .RB [ "\-m mode" ]
 .RB [ \-n ]
+.RB [ \-v ]
+.RB [ \-F ]
 .RB [ \-V ]
 .RB [ "\-s name" ]
 .RI [ name ]
+.PP
+Several clients may be attached to one session at the same time.
+One of them holds the keyboard; the others watch.
+The client that attaches first holds it, and it passes to another attached
+client if that one leaves.
 .TP
 .BI \-f " window"
 Focus the given window (by server PID) after startup.
@@ -92,6 +99,37 @@ UI mode:
 .BR screen " (default),"
 .BR turbo ,
 .BR minimal .
+.TP
+.B \-v
+Attach read-only.
+The session is displayed and followed live, but nothing typed here reaches
+it, and the window is neither resized nor killed by this client.
+Scrollback, copy mode, the window list, and the menus all work as usual,
+since they are local to this client.
+Without this flag a client asks for the keyboard and is given it only if no
+other client holds it, so an attach that finds one already there becomes
+read-only and says so.
+.IP
+A read-only client does not take part in deciding the window size.
+A window has one size and its clients may have several, so the smallest
+would otherwise win and a viewer with a small terminal would shrink the
+window of the person working in it.
+Such a viewer shows the part that fits and marks the taskbar with
+.BR clip .
+.B share.resize
+changes this.
+.IP
+A read-only client also follows the client holding the keyboard: the window
+it focuses and the layout it arranges.
+That is usually the point of watching.
+.B \-F
+turns the following off.
+A client that is read-only only because someone else got there first keeps
+its own view either way, since it did not ask to watch.
+.TP
+.B \-F
+Do not follow the client holding the keyboard.
+This client chooses its own focused window and layout while it watches.
 .TP
 .B \-n
 Connect through the session's
@@ -201,6 +239,203 @@ Detach a client from its session.
 .BI \-s " name"
 Session name (default:
 .BR 0 ).
+.SS lumi share
+Show the clients attached to a session, and move the keyboard between them.
+.PP
+.B lumi share
+.RB [ "\-s name" ]
+.RB [ \-l ]
+.RB [ "\-g id" ]
+.RB [ "\-r id" ]
+.RB [ "\-k id" ]
+.RB [ "\-a id" ]
+.RB [ "\-d id" ]
+.RB [ \-L ]
+.RB [ \-U ]
+.RB [ "\-M mode" ]
+.RB [ "\-D display" ]
+.PP
+.B lumi share
+.RB [ "\-s name" ]
+.RB "{" "\-u user" \||\| "\-G group" \||\| \-B "}"
+.PP
+By default one client at a time holds the keyboard; the rest watch.
+.B \-M multi\-writer
+lifts that, letting every attached client type (see below).
+The client ids printed by
+.B \-l
+are what the other options take.
+.TP
+.B \-l
+List the attached clients: id, name, who (the uid or netchan key identity
+behind a cross-user connection, blank for the session owner's own local
+clients), role, UI mode, coupling, size, pending state, and how long each
+has been attached, preceded by who holds the keyboard.
+Coupling is
+.B mirror
+or
+.B free
+for a local view-role client (see
+.B \-v
+and
+.B \-F
+under
+.BR "lumi attach" ),
+and
+.B \-
+for a write-role client or a cross-user connection, neither of which the
+concept applies to.
+Pending is
+.B yes
+for a connection admitted under an
+.B ask
+rule that has not yet been approved or refused (see
+.B "Cross-user access"
+below), and
+.B \-
+otherwise.
+This is the default when no other option is given.
+.TP
+.BI \-g " id"
+Give the keyboard to this client.
+The client holding it steps down without being asked.
+.TP
+.BI \-r " id"
+Ask the client holding the keyboard to pass it to this client.
+The holder is told, and answers from its share menu; the request is not
+granted on its own.
+.TP
+.BI \-k " id"
+Ask this client to detach.
+.TP
+.BI \-a " id"
+Admit this pending client.
+A connection matching an
+.B ask
+rule in
+.I session\fR/\fBaccess
+is held open, sent nothing, until admitted this way or refused with
+.BR \-d .
+See
+.B "Cross-user access"
+below.
+.TP
+.BI \-d " id"
+Refuse this pending client.
+Its connection is closed without ever having received any session
+content.
+.TP
+.B \-L
+Close the session to further clients.
+An attach is refused while this is set.
+Clients already attached are unaffected.
+This keeps someone from joining by accident.
+It is not a defense against a client that ignores it, which is what the
+.B lumi net-proxy
+path and its key-based access control are for.
+.TP
+.B \-U
+Open the session to further clients again.
+.TP
+.BI \-M " mode"
+Set the session's write mode:
+.B single\-writer
+(the default) or
+.BR multi\-writer .
+In
+.B multi\-writer
+mode a client asking to type is granted it even while another client
+already holds it; nobody already typing is demoted.
+Takes effect for the next client that attaches, including a client that
+reattaches; it does not retroactively change the role of a client already
+attached, which stays as it was until it reattaches or is given the
+keyboard with
+.BR \-g .
+Stored in
+.IR session\fR/\fBcontrol ,
+mode 0600, owner-only, distinct from
+.I session\fR/\fBcontrol.lock
+(the keyboard token) and
+.I session\fR/\fBcontrol.msg
+(the request/approval mailbox).
+.TP
+.BI \-D " display"
+Set the session's write-role layout coupling:
+.B independent
+(the default) or
+.BR shared .
+Only meaningful in
+.B multi\-writer
+mode.
+.B independent
+means a write-role client never applies another writer's layout or focus
+changes to itself, though it still publishes its own; with
+.B shared
+every write-role client follows the others' layout and focus the same way
+a mirror-coupled view-role client already does (see
+.B \-v
+under
+.BR "lumi attach" ).
+Takes effect for the next client that attaches, same timing as
+.BR \-M .
+Stored alongside the mode in
+.IR session\fR/\fBcontrol .
+.TP
+.BI \-u " user"
+Start the cross-user broker
+.RB ( "lumi proxy \-L" )
+for this session, granting the named local user
+.B view
+access.
+If
+.I session\fR/\fBaccess
+does not already exist it is created (mode 0600, owner-only) seeded with
+.RI "\(dq owner write\(dq, \(dq user:" user " view\(dq" ,
+and \(dq* deny\(dq; an existing file is left untouched.
+The broker listens on a Unix socket outside the session directory
+(mode 0666, in a sticky world-traversable directory), since a single uid
+cannot be expressed in socket permissions alone: every connection is
+authenticated by the kernel-reported peer uid against
+.IR session\fR/\fBaccess ,
+not by the socket's own mode.
+See
+.B "Cross-user access"
+below.
+.TP
+.BI \-G " group"
+Start the cross-user broker granting the named group
+.B view
+access, seeded the same way as
+.BR \-u ,
+with a
+.RI subject " group:" group
+line.
+The broker's socket is group-owned and mode 0660, so the kernel itself
+refuses a non-member before the connection ever reaches lumi's own checks.
+.TP
+.B \-B
+Stop the cross-user broker for this session.
+Clients already bridged through it are unaffected until they detach; no
+further client can connect.
+.TP
+.BI \-s " name"
+Session name (default:
+.BR 0 ).
+.PP
+Inside an attached client the same things are done from the share menu,
+bound to
+.B C\-a *
+by default: it lists the clients, marks which one has the keyboard and
+which one is this client, and shows who is asking for it.
+.B Enter
+gives the keyboard to the selected client, or asks for it when this client
+does not have it,
+.B k
+asks the selected client to detach,
+.B d
+declines a pending request, and
+.B l
+closes or opens the session to further clients.
 .SS lumi kill
 Terminate a session.
 .PP
@@ -405,8 +640,10 @@ Without this option the proxy authenticates by the pre-shared key alone.
 .B \-L
 Direct-connect mode: listen persistently on the fixed
 .B \-p
-port and serve clients one at a time, each authenticating over netchan with
-no ssh bootstrap.
+port and bridge up to 16 clients at once (each in its own forked process,
+one client per process as with
+.BR "lumi proxy" ),
+each authenticating over netchan with no ssh bootstrap.
 There is no pre-shared key; the connection is encrypted, the server is pinned
 by its host key (as with
 .BR \-k ),
@@ -643,6 +880,55 @@ the next rescan.
 The marker is shown independently of
 .B taskbar.format
 so the degraded state is always visible.
+.IP
+While more than one client is attached, the taskbar is likewise prefixed
+with a presence marker, by default
+.BR share:1w+1v :
+the number of clients holding the keyboard and the number watching.
+It is drawn independently of
+.B taskbar.format
+as well, so a session cannot be watched without the people in it seeing
+that it is.
+.B share.indicator
+changes how it reads; nothing turns it off.
+The marker is drawn in a distinct color whenever at least one attached
+client is not the session owner's own uid (a client relayed through
+.B "lumi proxy \-L"
+or
+.BR "lumi net\-proxy \-L" ),
+so a cross-user session cannot look the same as a private one at a
+glance; this coloring cannot be turned off either.
+In
+.B minimal
+mode, which has no taskbar, the terminal title carries
+.B [shared]
+instead.
+.TP
+.B share.resize
+Whether a read-only client takes part in deciding the window size:
+.BR observe " (default) or " negotiate .
+With
+.BR observe ,
+the window is sized for the clients that can type and a read-only client
+crops what does not fit.
+With
+.BR negotiate ,
+every attached client is counted and the window is sized to fit the
+smallest of them, which is what
+.BR screen (1)
+does with
+.BR \-x .
+.TP
+.B share.indicator
+Format of the presence marker described above.
+.B %w
+expands to the number of clients holding the keyboard,
+.B %v
+to the number watching, and
+.B %n
+to the total.
+Default:
+.BR share:%ww+%vv .
 .TP
 .B taskbar.position
 Taskbar position:
@@ -766,6 +1052,7 @@ clipboard\-sync	Sync internal clipboard to system
 command	Open the command input line
 arrange\-grid	Arrange windows in grid (turbo mode)
 redisplay	Resync and repaint the screen
+share\-menu	Attached clients; pass the keyboard
 none	Unbind key
 .TE
 .SH SCROLLBACK MODE
@@ -959,6 +1246,64 @@ and the client presents its
 key (mode 0600, optionally passphrase-sealed).
 All paths honor
 .BR XDG_CONFIG_HOME .
+.SS Cross-user access
+An mserver accepts a connection only from its own uid; a session directory
+is mode 0700.
+A different local user reaches a session only through the broker started by
+.B "lumi share \-u"
+or
+.BR "\-G" ,
+which runs as the session owner, checks the connecting peer's
+kernel-reported uid and gid, and relays.
+.PP
+The broker's policy is
+.IR session\fR/\fBaccess ,
+mode 0600 and owned by the session's own uid; a file that fails either
+check is treated as absent (an unreadable or wrongly moded ACL means
+owner-only, not open access).
+Lines are
+.RI \(dq subject \ role\ [ask]\(dq ,
+matched top to bottom with an implicit final deny; the first match wins.
+Subjects are
+.BR owner ,
+.BI user: name-or-uid ,
+.BI group: name-or-gid ,
+.BI key: name
+(a netchan client identified by keystore key, for
+.BR "lumi net-proxy" ),
+and
+.BR * .
+The role is a ceiling, not a grant: a
+.B write
+subject that attaches asking for
+.B view
+gets
+.BR view .
+A line whose subject cannot be parsed matches every peer, so a typo can
+only take access away, never grant it; a line whose subject matches but
+whose role cannot be parsed denies that match rather than falling through
+to a more permissive line below it.
+Every decision is appended to
+.IR session\fR/\fBaccess.log
+(mode 0600): timestamp, identity, the subject that decided it, the
+requested role, and the granted role.
+The
+.B ask
+option admits a match pending approval rather than granting or refusing it
+outright: the connection is held open and sent nothing, not even the
+initial window list, until the write-token holder or an owner client
+approves it with
+.B "lumi share \-a"
+or refuses it with
+.BR "lumi share \-d" .
+If no client could plausibly answer (no write-token holder and no locally
+attached owner client), or none does within a short timeout, the match is
+denied -- the same fail-closed default as a plain
+.B deny
+rule.
+An approved connection is granted exactly the role the matching
+.B ask
+rule's role column named; nothing renegotiates a higher role afterward.
 .SH ENVIRONMENT
 .TP
 .B XDG_CONFIG_HOME

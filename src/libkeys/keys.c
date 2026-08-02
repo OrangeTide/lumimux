@@ -219,6 +219,9 @@ keys_default(struct keys *k)
 	/* session management */
 	lay->bindings['U'] = KEYS_ACTION_SESSION_LIST;
 
+	/* who else is attached, and passing the keyboard */
+	lay->bindings['*'] = KEYS_ACTION_SHARE_MENU;
+
 	/* layout mode toggle */
 	lay->bindings['t'] = KEYS_ACTION_TOGGLE_MODE;
 
@@ -474,6 +477,7 @@ static const struct {
 	{ "arrange-grid",	KEYS_ACTION_ARRANGE_GRID },
 	{ "command",		KEYS_ACTION_COMMAND },
 	{ "redisplay",		KEYS_ACTION_REDISPLAY },
+	{ "share-menu",		KEYS_ACTION_SHARE_MENU },
 	{ "none",		KEYS_ACTION_NONE },
 };
 

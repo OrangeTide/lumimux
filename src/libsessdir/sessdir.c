@@ -4,6 +4,8 @@
 
 #include "sessdir.h"
 #include "sessdir_state.h"
+#include "sessdir_control.h"
+#include "runtime_dir.h"
 #include "xmalloc.h"
 
 #include <dirent.h>
@@ -35,7 +37,9 @@ sessdir_base(void)
 		return NULL;
 	}
 
-	if (mkdir(dir, 0700) < 0 && errno != EEXIST) {
+	/* mkdir reporting EEXIST is not evidence the directory is ours,
+	 * which matters for the /tmp fallback.  see runtime_dir.h. */
+	if (lu_runtime_dir_ensure(dir) < 0) {
 		free(dir);
 		return NULL;
 	}
@@ -361,5 +365,11 @@ sessdir_cleanup_stale(const char *session)
 	}
 
 	sessdir_state_close(st);
+
+	/* clients are pruned on the same pass: every attach and rescan
+	 * calls this, so a client that was killed does not stay listed as
+	 * attached. */
+	removed += sessdir_client_prune(session);
+
 	return removed;
 }

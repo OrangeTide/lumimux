@@ -121,6 +121,15 @@ struct ipc_transport *ipc_transport_netchan_new_crypto_auth(int udp_fd,
 int ipc_transport_netchan_establish(struct ipc_transport *t, int timeout_ms);
 
 /*
+ * Server side only: the name the peer authenticated as, once
+ * ipc_transport_netchan_establish() has returned 0 for a transport built
+ * with a userauth config.  Returns NULL if there was no userauth phase (a
+ * bare psk/static-key transport has no notion of "who"), t is not a
+ * netchan transport, or establish() has not succeeded yet.
+ */
+const char *ipc_transport_netchan_auth_user(const struct ipc_transport *t);
+
+/*
  * Non-blocking event-loop interface.  The blocking send()/recv() vtable
  * ops are convenient for handshakes and simple clients, but a server that
  * multiplexes many fds must not block in recv().  These three calls let a

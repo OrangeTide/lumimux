@@ -8,6 +8,7 @@
 #include "prefix_menu.h"
 #include "picker.h"
 #include "session_picker.h"
+#include "share_menu.h"
 #include "apps_menu.h"
 #include "color_picker.h"
 #include "selection.h"
@@ -31,6 +32,7 @@
 #include "sessdir.h"
 #include "sessdir_layout.h"
 #include "sessdir_state.h"
+#include "sessdir_control.h"
 #include "sessdir_watch.h"
 #include "tio.h"
 #include "tio_write.h"
@@ -47,6 +49,7 @@
 #include "tkbd.h"
 #include "wm.h"
 #include "tile.h"
+#include "str.h"
 #include "xmalloc.h"
 
 #include <arpa/inet.h>
@@ -57,6 +60,7 @@
 #include <time.h>
 #include <netinet/in.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,6 +73,7 @@
 #include <unistd.h>
 
 static struct render *renderer;
+static struct vt_parse *stdin_osc_parser;	/* catches OSC replies on stdin */
 #define CLIENT_WIN_MAX 32
 
 static uint32_t watched_id;	/* window we're subscribed to */
@@ -82,6 +87,8 @@ struct mconn {
 	pid_t		pid;		/* = window ID */
 	int		num;		/* stable window number, -1 if unknown */
 	char		title[128];
+	char		deftitle[128];	/* name to show when the program has
+					 * set no title of its own */
 };
 
 static struct mconn mconns[CLIENT_WIN_MAX];
@@ -188,6 +195,45 @@ static int cmdline_row(void);
 static void cmdline_render(void);
 static void paste_cancel(void);
 
+/* ---- transient notice line ----
+ *
+ * A short message shown on the taskbar row for a few seconds: why a
+ * keystroke was refused, and from step 9 who joined or left. It takes no
+ * keyboard, unlike the command line it shares a row with.
+ */
+static char notice_msg[128];
+static void notice_show(const char *msg);
+static void notice_render(void);
+static void client_roster_update(void);
+static void share_marker_update(void);
+static int view_clipped(void);
+static void role_announce(void);
+static int share_resize_negotiate;	/* viewers vote on the window size */
+static void mirror_publish(void);
+static void mirror_sync(void);
+static int mirror_following(void);
+static int layout_dirty;	/* our layout changed since it was published */
+
+/* the event loop, for the notice's expiry timer.  set once the loop
+ * exists; a notice raised before that simply has no timer to clear it. */
+static struct iox_loop *ui_loop;
+
+/* ---- shared attach role ----
+ *
+ * What the servers granted us, not what we asked for. A view-only client
+ * receives output and drives its own local UI, and sends nothing that
+ * would change the session.
+ */
+static uint8_t client_role = IPC_ROLE_WRITE;
+static uint8_t client_attach_flags;	/* what we ask each server for */
+
+/* Writers currently in the roster, kept in step with share_marker_update()
+ * rather than rescanned per keystroke. Defaults to 1 ("just me") whenever
+ * the roster is not something this process can see, so prediction stays on
+ * unless it is positively known there is more than one writer -- see
+ * predict_key's call site (13-e). */
+static int share_writer_count = 1;
+
 static int need_render;			/* screen needs repaint before poll */
 static int need_taskbar;			/* taskbar needs redraw */
 
@@ -260,6 +306,10 @@ mconn_add(struct iox_loop *lp, pid_t pid, int fd, const char *title)
 	} else {
 		mc->title[0] = '\0';
 	}
+	/* the session directory's name for this window (the command it
+	 * runs, until the program sets a title) is the fallback whenever
+	 * the window's VT carries no title of its own */
+	memcpy(mc->deftitle, mc->title, strlen(mc->title) + 1);
 	if (lp)
 		iox_fd_add(lp, fd, IOX_READ, on_mserver_read, mc);
 	return mc;
@@ -336,12 +386,51 @@ mconn_focused_transport(void)
 	return mc ? mc->t : NULL;
 }
 
+/* messages that change a window rather than observe it */
+static int
+msg_mutates(uint32_t type)
+{
+	switch (type) {
+	case IPC_MSG_INPUT:
+	case IPC_MSG_INPUT_BEGIN:
+	case IPC_MSG_INPUT_END:
+	case IPC_MSG_KILL:
+	case IPC_MSG_FLOW_CTRL:
+	case IPC_MSG_ATTR_SET:
+	case IPC_MSG_ATTR_DELETE:
+	case IPC_MSG_ATTR_TXN_COMMIT:
+		return 1;
+	}
+	return 0;
+}
+
 /* send IPC message to a specific mserver, routing through proxy
- * envelope when connected to a remote session */
+ * envelope when connected to a remote session.
+ *
+ * Read-only is enforced here rather than at each call site.  Every
+ * client-to-server message in this file goes through this function, so a
+ * call site added later cannot forget the check, and the servers refuse
+ * these messages anyway: this only spares the user a round trip and an
+ * error for something we already know is not allowed. */
 static int
 mconn_ipc_send(struct mconn *mc, uint32_t type,
     const void *payload, uint32_t len)
 {
+	/* A client that opted out of sizing does not tell servers how big
+	 * it is: its terminal is nobody else's business, and it crops what
+	 * does not fit. */
+	if (type == IPC_MSG_WIN_RESIZE &&
+	    (client_attach_flags & IPC_ATTACH_F_SIZE_OBSERVE))
+		return -1;
+
+	if (client_role != IPC_ROLE_WRITE && msg_mutates(type)) {
+		/* typing is the user's own act, so it is worth a word.  a
+		 * resize or a flow-control nudge is ours, and saying
+		 * anything about those would be noise. */
+		if (type == IPC_MSG_INPUT || type == IPC_MSG_KILL)
+			notice_show("read-only: another client has the keyboard");
+		return -1;
+	}
 	if (is_remote) {
 		if (remote_netchan)
 			return proxy_msg_xsend(rnet, (uint32_t)mc->pid,
@@ -442,6 +531,12 @@ micro_spawn_window(struct iox_loop *lp, const char *name)
 		char *child_argv[] = {
 		    "lumi-mserver", "-s", (char *)name, NULL,
 		};
+
+		/* the token's descriptor is close-on-exec, but this child
+		 * runs the server in-process when no lumi-mserver binary is
+		 * found, and an mserver holding the session's keyboard lock
+		 * would keep it long after we detached */
+		sessdir_token_forget();
 		_exit(multicall_exec_cmd("mserver", 3, child_argv));
 	}
 
@@ -645,19 +740,33 @@ dcs_passthru(void *ctx, int introducer, const char *data, size_t len)
 	tio_write(STDOUT_FILENO, "\033\\", 2);
 }
 
+/* A window's OSC 10/11 (foreground/background color) query that has been
+ * forwarded to the outer terminal, awaiting that terminal's reply so it can
+ * be routed back to the window that asked. 0 means none outstanding.
+ *
+ * Without this, a query like this has nowhere to go: the client's own
+ * renderer regenerates escape sequences from its cell buffer rather than
+ * passing PTY bytes through verbatim, so an unhandled query is silently
+ * absorbed and the asking program never hears back -- it then guesses a
+ * background it thinks is likely, and any color chosen assuming the wrong
+ * one (a muted foreground meant to sit on a light background, say) can end
+ * up unreadable against the real, differently-colored terminal. Only one
+ * query is tracked at a time; a second one before the first answers simply
+ * replaces it, which just means the first asker never hears back -- the
+ * same outcome as today, not a new failure mode. */
+static uint32_t osc_color_query_pending_id;
+static int osc_color_query_pending_num;
+
 /* OSC passthrough: forward desktop-notification OSCs (kitty OSC 99, the
- * simple OSC 9 form, and OSC 777 "notify") from any window to the outer
- * terminal so pop-ups from programs like Claude reach the user. */
+ * simple OSC 9 form, OSC 777 "notify") and OSC 10/11 (foreground/background
+ * color queries) from any window to the outer terminal. Notifications need
+ * no answer; a color query does, and stdin_osc_reply() below routes the
+ * terminal's reply back to whichever window asked. */
 static void
 osc_passthru(void *ctx, const char *data, size_t len)
 {
 	int num = 0;
 	size_t i;
-
-	(void)ctx;
-
-	if (!watching)
-		return;
 
 	/* parse the leading "N;" selector */
 	for (i = 0; i < len && data[i] >= '0' && data[i] <= '9'; i++)
@@ -665,13 +774,64 @@ osc_passthru(void *ctx, const char *data, size_t len)
 	if (i == 0 || i >= len || data[i] != ';')
 		return;
 
-	if (num != 9 && num != 99 && num != 777)
+	if (num == 10 || num == 11) {
+		/* only a query ("?") expects an answer; a set request (an
+		 * actual color spec) has nothing to route back */
+		if (len - i - 1 != 1 || data[i + 1] != '?')
+			return;
+	} else if (num != 9 && num != 99 && num != 777) {
 		return;
+	}
+
+	if (!watching)
+		return;
+
+	/* only arm the pending-reply state once the query is actually
+	 * forwarded below -- doing this earlier would leave a stale
+	 * pending window id for a query that never reached the outer
+	 * terminal (e.g. during startup, before a window is watched) */
+	if (num == 10 || num == 11) {
+		osc_color_query_pending_id = (uint32_t)(uintptr_t)ctx;
+		osc_color_query_pending_num = num;
+	}
 
 	/* re-wrap as ESC ] <data> ST for the host terminal */
 	tio_write(STDOUT_FILENO, "\033]", 2);
 	tio_write(STDOUT_FILENO, data, len);
 	tio_write(STDOUT_FILENO, "\033\\", 2);
+}
+
+/* the outer terminal's reply to a color query forwarded by osc_passthru()
+ * above: route it back to the window that asked, as raw input, in the same
+ * OSC form a real terminal would have sent it directly. */
+static void
+stdin_osc_reply(void *ctx, const char *data, size_t len)
+{
+	int num = 0;
+	size_t i;
+	struct mconn *mc;
+	char out[320];
+	int n;
+
+	(void)ctx;
+
+	if (!osc_color_query_pending_id)
+		return;
+
+	for (i = 0; i < len && data[i] >= '0' && data[i] <= '9'; i++)
+		num = num * 10 + (data[i] - '0');
+	if (i == 0 || i >= len || data[i] != ';' || num != osc_color_query_pending_num)
+		return;
+
+	mc = mconn_find_by_pid((pid_t)osc_color_query_pending_id);
+	osc_color_query_pending_id = 0;
+	if (!mc)
+		return;
+
+	n = snprintf(out, sizeof(out), "\033]%.*s\033\\",
+	    (int)len, data);
+	if (n > 0 && n < (int)sizeof(out))
+		mconn_ipc_send(mc, IPC_MSG_INPUT, out, (uint32_t)n);
 }
 
 static struct client_window *
@@ -693,7 +853,7 @@ cwin_add_sized(uint32_t id, int rows, int cols)
 		return NULL;
 	}
 	vt_parse_set_dcs_cb(cw->parser, dcs_passthru, NULL);
-	vt_parse_set_osc_cb(cw->parser, osc_passthru, NULL);
+	vt_parse_set_osc_cb(cw->parser, osc_passthru, (void *)(uintptr_t)id);
 	cw->pred = predict_new();
 	cw->keep_open = -1;	/* inherit global default */
 	cw->dead = 0;
@@ -1516,6 +1676,10 @@ flush_render(void)
 	 * focus paths are captured without each calling in explicitly. */
 	mru_note_focus();
 
+	/* same reason: publish what we are looking at from one place
+	 * rather than from every path that can change it */
+	mirror_publish();
+
 	if (!need_render && !need_taskbar)
 		return;
 
@@ -1555,9 +1719,11 @@ flush_render(void)
 	}
 
 	if (need_taskbar) {
-		/* the command line occupies the taskbar row while open */
+		/* the command line, then a notice, occupy the taskbar row */
 		if (cmdline_visible) {
 			cmdline_render();
+		} else if (notice_msg[0]) {
+			notice_render();
 		} else if (taskbar_visible) {
 			if (scrollback_mode)
 				scrollback_taskbar_render();
@@ -1586,6 +1752,14 @@ flush_render(void)
 			crow = cmdline_row();
 			ccol = 1 + (int)cmd_len;
 			cvis = 1;
+		} else if (notice_msg[0]) {
+			/* a repaint erased the notice row; redraw it and
+			 * leave the caret where the application wants it */
+			notice_render();
+			if (client_mode == CLIENT_MODE_TURBO)
+				turbo_cursor(&crow, &ccol, &cvis);
+			else if (tilemgr)
+				tile_cursor(tilemgr, &crow, &ccol, &cvis);
 		} else if (scrollback_mode) {
 			/* show the copy cursor instead of the app cursor */
 			crow = copy_cur_row;
@@ -1596,6 +1770,11 @@ flush_render(void)
 		} else if (tilemgr) {
 			tile_cursor(tilemgr, &crow, &ccol, &cvis);
 		}
+		/* what is cropped away includes, sometimes, the cursor.
+		 * drawing it at a clamped position would point at the wrong
+		 * character, and this client cannot type anyway. */
+		if (view_clipped())
+			cvis = 0;
 		render_move_cursor(renderer, STDOUT_FILENO, crow, ccol);
 		set_cursor_vis(cvis);
 		tio_flush(STDOUT_FILENO);
@@ -1610,6 +1789,14 @@ tiled_resize_pane_cb(uint32_t window_id, int w, int h, void *arg)
 	struct mconn *mc;
 
 	(void)arg;
+
+	/* A client that opted out of deciding the window size must leave
+	 * its replica at the size the window actually is. Shrinking the
+	 * replica to the pane would put the server's output in the wrong
+	 * columns; the compositor crops instead, which shows less but
+	 * shows it correctly. */
+	if (client_attach_flags & IPC_ATTACH_F_SIZE_OBSERVE)
+		return;
 
 	cw = cwin_find(window_id);
 	if (cw)
@@ -1691,6 +1878,65 @@ tile_sync_focus(void)
 	}
 }
 
+struct pane_id_list {
+	uint32_t ids[CLIENT_WIN_MAX];
+	int n;
+};
+
+/* tile_each_pane callback: collect pane window ids so the caller can
+ * mutate the tree without iterating over it */
+static void
+screen_collect_pane_cb(uint32_t window_id, int w, int h, void *arg)
+{
+	struct pane_id_list *p = arg;
+
+	(void)w;
+	(void)h;
+	if (p->n < CLIENT_WIN_MAX)
+		p->ids[p->n++] = window_id;
+}
+
+/* re-bind every pane to its window's live VT, and repair panes whose
+ * window is gone.  a pane with no VT composites as a blank area that no
+ * amount of repainting can fill, so redisplay has to be able to recover
+ * from one. */
+static void
+screen_repair_panes(void)
+{
+	struct pane_id_list panes;
+	int i;
+
+	if (!tilemgr)
+		return;
+
+	panes.n = 0;
+	tile_each_pane(tilemgr, screen_collect_pane_cb, &panes);
+
+	for (i = 0; i < panes.n; i++) {
+		struct client_window *cw = cwin_find(panes.ids[i]);
+
+		if (cw) {
+			tile_set_window(tilemgr, panes.ids[i],
+			    panes.ids[i], cw->vt);
+			continue;
+		}
+
+		/* the window is gone: drop the pane, or -- if it is the
+		 * only one -- show a live window in it instead */
+		if (tile_close(tilemgr, panes.ids[i]) == 0)
+			continue;
+		cw = cwin_find(watched_id);
+		if (!cw && cwin_count > 0)
+			cw = &cwins[0];
+		if (cw)
+			tile_set_window(tilemgr, panes.ids[i],
+			    cw->id, cw->vt);
+	}
+
+	tile_each_pane(tilemgr, tiled_resize_pane_cb, NULL);
+	tile_sync_focus();
+}
+
 /* sync watched_id / watching / vt globals from wmgr's focused window.
  * analogous to tile_sync_focus() -- wmgr is the source of truth for
  * turbo mode focus, and these globals must track it for the taskbar
@@ -1741,14 +1987,20 @@ sync_host_title(const char *title)
 	char buf[256];
 	int len;
 
+	/* Minimal mode has no taskbar to carry the presence marker, so the
+	 * terminal title carries it instead: there has to be somewhere
+	 * that says the session is being watched. */
+	const char *shared = (share_marker[0] && !taskbar_visible)
+	    ? " [shared]" : "";
+
 	if (title && title[0])
 		len = snprintf(buf, sizeof(buf),
-		    "\033]2;lumi - %s:%s\033\\",
-		    session_name ? session_name : "", title);
+		    "\033]2;lumi - %s:%s%s\033\\",
+		    session_name ? session_name : "", title, shared);
 	else
 		len = snprintf(buf, sizeof(buf),
-		    "\033]2;lumi - %s\033\\",
-		    session_name ? session_name : "");
+		    "\033]2;lumi - %s%s\033\\",
+		    session_name ? session_name : "", shared);
 	if (len > 0 && len < (int)sizeof(buf)) {
 		tio_write(STDOUT_FILENO, buf, (size_t)len);
 		tio_flush(STDOUT_FILENO);
@@ -1791,14 +2043,23 @@ sync_vt_title(uint32_t win_id, struct vt_state *st)
 
 	if (!st)
 		return;
+	mc = mconn_find_by_pid((pid_t)win_id);
+	if (!mc)
+		return;
+
 	vt_title = vt_state_title(st);
 	if (!vt_title)
 		vt_title = "";
 	/* a :title override, when set, replaces the program's title */
 	vt_title = cwin_effective_title(cwin_find(win_id), vt_title);
+	/* a window whose program sets no title keeps the name it was
+	 * discovered under.  without this, the first output after an
+	 * attach replaces the tab label with an empty string, and the
+	 * window list shows bare numbers until something sets a title. */
+	if (!vt_title[0])
+		vt_title = mc->deftitle;
 
-	mc = mconn_find_by_pid((pid_t)win_id);
-	if (!mc || strcmp(mc->title, vt_title) == 0)
+	if (strcmp(mc->title, vt_title) == 0)
 		return;
 
 	len = utf8_trunc(vt_title, sizeof(mc->title));
@@ -1973,7 +2234,29 @@ turbo_apply_layout(const char *session)
 	}
 }
 
-/* recursively convert sessdir_tree_node to tile_node */
+/* recursively free a tile_node tree that has not been handed to a
+ * tile manager yet (tile_import_tree takes ownership on success). */
+static void
+screen_tile_tree_free(struct tile_node *tn)
+{
+	if (!tn)
+		return;
+	screen_tile_tree_free(tn->a);
+	screen_tile_tree_free(tn->b);
+	free(tn);
+}
+
+/* recursively convert sessdir_tree_node to tile_node.
+ *
+ * a leaf that cannot be resolved to a live window is rejected rather
+ * than imported as an empty pane: an empty pane has no VT, so it
+ * composites as a blank area that no refresh or repaint can fill, and
+ * saving that layout again writes the same unresolvable leaf back out.
+ * a split that loses one side collapses to the other, the way closing
+ * that pane would have, so a window exiting between detach and attach
+ * costs only its own pane.  a layout with nothing left to show returns
+ * NULL, and the caller falls back to a single pane holding the
+ * session's foreground window. */
 static struct tile_node *
 screen_build_tile_tree(const struct sessdir_tree_node *sn,
     const pid_t *order, int norder,
@@ -1984,20 +2267,25 @@ screen_build_tile_tree(const struct sessdir_tree_node *sn,
 	if (!sn)
 		return NULL;
 
-	tn = xcalloc(1, sizeof(*tn));
-
 	if (sn->type == SESSDIR_TREE_LEAF) {
-		tn->type = TILE_LEAF;
-		if (sn->win_index >= 0 && sn->win_index < norder) {
-			uint32_t id = (uint32_t)order[sn->win_index];
-			struct client_window *cw = find_cw(id);
+		uint32_t id;
+		struct client_window *cw;
 
-			tn->window_id = id;
-			tn->vt = cw ? cw->vt : NULL;
-		}
+		if (sn->win_index < 0 || sn->win_index >= norder)
+			return NULL;
+		id = (uint32_t)order[sn->win_index];
+		cw = find_cw(id);
+		if (!cw)
+			return NULL;
+
+		tn = xcalloc(1, sizeof(*tn));
+		tn->type = TILE_LEAF;
+		tn->window_id = id;
+		tn->vt = cw->vt;
 		return tn;
 	}
 
+	tn = xcalloc(1, sizeof(*tn));
 	tn->type = (sn->type == SESSDIR_TREE_SPLIT_H)
 	    ? TILE_SPLIT_H : TILE_SPLIT_V;
 	tn->split_pos = sn->split_pos;
@@ -2005,13 +2293,25 @@ screen_build_tile_tree(const struct sessdir_tree_node *sn,
 	tn->b = screen_build_tile_tree(sn->b, order, norder, find_cw);
 
 	if (!tn->a || !tn->b) {
-		/* partial tree -- fall back to default */
-		if (tn->a) free(tn->a);
-		if (tn->b) free(tn->b);
+		/* collapse the split onto whichever side survived */
+		struct tile_node *keep = tn->a ? tn->a : tn->b;
+
 		free(tn);
-		return NULL;
+		return keep;
 	}
 	return tn;
+}
+
+/* tile_each_pane callback: record the first pane's window id */
+static void
+screen_first_pane_cb(uint32_t window_id, int w, int h, void *arg)
+{
+	uint32_t *out = arg;
+
+	(void)w;
+	(void)h;
+	if (*out == 0)
+		*out = window_id;
 }
 
 /* apply screen layout: build tile tree from saved splits.
@@ -2023,6 +2323,7 @@ screen_apply_layout(const char *session)
 	pid_t order[SESSDIR_LAYOUT_MAX_WINS];
 	int norder;
 	struct tile_node *root;
+	int made_new;
 
 	if (sessdir_layout_load_screen(session, &layout) < 0)
 		return -1;
@@ -2039,29 +2340,53 @@ screen_apply_layout(const char *session)
 	if (!root)
 		return -1;
 
-	tilemgr = tile_new(content_rows, content_cols);
+	/* Reuse an existing manager rather than replacing it: tile_new()
+	 * unconditionally here would abandon whatever tilemgr already
+	 * pointed to -- its screen/prev_screen/row_dirty buffers and its
+	 * whole tree, none of which tile_free(tilemgr) at exit ever sees
+	 * again once the pointer is overwritten. This was reachable only
+	 * from a call site that never had an existing tilemgr to lose
+	 * before mirror_apply_layout() (13-d) started calling this for a
+	 * shared-display writer that already has one. tile_import_tree()
+	 * already frees the previous tree via node_free(t->root) before
+	 * replacing it, so reusing the struct is enough. */
+	made_new = !tilemgr;
+	if (made_new)
+		tilemgr = tile_new(content_rows, content_cols);
 	if (tile_import_tree(tilemgr, root) < 0) {
 		/* root was not consumed on error -- free it */
-		free(root);
+		screen_tile_tree_free(root);
+		/* only tear down a manager this call created; one that
+		 * already existed and simply rejected this import keeps
+		 * showing whatever it had before */
+		if (made_new) {
+			tile_free(tilemgr);
+			tilemgr = NULL;
+		}
 		return -1;
 	}
 
-	/* apply saved focus */
-	if (layout.focus >= 0 && layout.focus < norder) {
-		uint32_t fid = (uint32_t)order[layout.focus];
+	/* apply the saved focus, then read back what took effect.
+	 * tile_focus() ignores an id that is not a pane in this tree, so
+	 * a stale saved index would otherwise leave the client watching
+	 * (and the taskbar highlighting) a window that no pane shows. */
+	if (layout.focus >= 0 && layout.focus < norder)
+		tile_focus(tilemgr, (uint32_t)order[layout.focus]);
+	if (tile_focused_id(tilemgr) == 0) {
+		uint32_t first = 0;
 
-		tile_focus(tilemgr, fid);
-		watched_id = fid;
-		watching = 1;
-		{
-			struct client_window *cw;
+		tile_each_pane(tilemgr, screen_first_pane_cb, &first);
+		tile_focus(tilemgr, first);
+	}
+	{
+		uint32_t fid = tile_focused_id(tilemgr);
+		struct client_window *cw = cwin_find(fid);
 
-			cw = cwin_find(fid);
-			if (cw)
-				vt = cw->vt;
+		if (cw) {
+			watched_id = fid;
+			watching = 1;
+			vt = cw->vt;
 		}
-	} else {
-		tile_focus(tilemgr, (uint32_t)order[0]);
 	}
 
 	return 0;
@@ -2102,7 +2427,13 @@ turbo_save_layout(const char *session)
 	sessdir_layout_save_turbo(session, &layout);
 }
 
-/* recursively convert tile_node to sessdir_tree_node */
+/* recursively convert tile_node to sessdir_tree_node.
+ *
+ * a pane holding a window that is not in the session's window order
+ * (an empty pane, or one whose window has exited) cannot be described
+ * by an index, and a leaf saved with index -1 restores as a blank pane
+ * on the next attach.  return NULL for such a pane so the layout is
+ * saved without a tree instead. */
 static struct sessdir_tree_node *
 screen_export_tree(const struct tile_node *tn,
     const pid_t *order, int norder)
@@ -2113,25 +2444,36 @@ screen_export_tree(const struct tile_node *tn,
 	if (!tn)
 		return NULL;
 
-	sn = xcalloc(1, sizeof(*sn));
-
 	if (tn->type == TILE_LEAF) {
-		sn->type = SESSDIR_TREE_LEAF;
-		sn->win_index = -1;
+		int idx = -1;
+
 		for (i = 0; i < norder; i++) {
 			if ((uint32_t)order[i] == tn->window_id) {
-				sn->win_index = i;
+				idx = i;
 				break;
 			}
 		}
+		if (idx < 0)
+			return NULL;
+
+		sn = xcalloc(1, sizeof(*sn));
+		sn->type = SESSDIR_TREE_LEAF;
+		sn->win_index = idx;
 		return sn;
 	}
 
+	sn = xcalloc(1, sizeof(*sn));
 	sn->type = (tn->type == TILE_SPLIT_H)
 	    ? SESSDIR_TREE_SPLIT_H : SESSDIR_TREE_SPLIT_V;
 	sn->split_pos = tn->split_pos;
 	sn->a = screen_export_tree(tn->a, order, norder);
 	sn->b = screen_export_tree(tn->b, order, norder);
+
+	if (!sn->a || !sn->b) {
+		/* one side is unrepresentable -- drop the whole split */
+		sessdir_tree_free(sn);
+		return NULL;
+	}
 	return sn;
 }
 
@@ -2586,6 +2928,36 @@ mconn_initial_focus(void)
 	return (uint32_t)mconns[0].pid;
 }
 
+/* show a window in the currently focused tile pane, for the
+ * "select window" family of actions (cycle, numeric select, and a
+ * shared-display writer following another writer's published focus).
+ *
+ * a window already occupying its own pane must not be assigned into a
+ * second one: with more than one pane visible, "select window X" only
+ * ever means "move input focus to X's existing pane" when X is already
+ * shown somewhere. tile_set_window()'s pane_id=0 case aside, calling it
+ * here unconditionally would leave X's original pane untouched and
+ * bind X into the previously-focused pane too -- two leaves sharing one
+ * window_id, which tile_free() then double-frees on exit. confirmed via
+ * ASAN as the exact mechanism behind a shared-display multi-writer
+ * crash: this path fires from mirror_sync() following a published
+ * focus for a window this process already has on screen. */
+static void
+tile_show_window(uint32_t id, struct vt_state *vt)
+{
+	if (tile_pane_geometry(tilemgr, id, NULL, NULL, NULL, NULL) == 0) {
+		tile_focus(tilemgr, id);
+		return;
+	}
+
+	{
+		uint32_t old_id = tile_focused_id(tilemgr);
+
+		tile_set_window(tilemgr, old_id, id, vt);
+		tile_focus(tilemgr, id);
+	}
+}
+
 /* cycle focus to next/prev mserver window.
  * dir > 0 = next, dir < 0 = prev. */
 static void
@@ -2636,11 +3008,7 @@ micro_cycle_focus(int dir)
 		wm_unminimize(wmgr, watched_id);
 		wm_focus(wmgr, watched_id);
 	} else {
-		/* swap the focused pane to show the selected window */
-		uint32_t old_id = tile_focused_id(tilemgr);
-
-		tile_set_window(tilemgr, old_id, watched_id, vt);
-		tile_focus(tilemgr, watched_id);
+		tile_show_window(watched_id, vt);
 		screen_fit_window(watched_id);
 		tile_need_full = 1;
 	}
@@ -2675,11 +3043,7 @@ micro_select_window(uint32_t id)
 		wm_unminimize(wmgr, id);
 		wm_focus(wmgr, id);
 	} else {
-		/* swap the focused pane to show the selected window */
-		uint32_t old_id = tile_focused_id(tilemgr);
-
-		tile_set_window(tilemgr, old_id, id, vt);
-		tile_focus(tilemgr, id);
+		tile_show_window(id, vt);
 		screen_fit_window(id);
 		tile_need_full = 1;
 	}
@@ -2721,6 +3085,57 @@ cmdline_render(void)
 		tio_write(STDOUT_FILENO, body, strlen(body));
 	tio_write(STDOUT_FILENO, "\033[K", 3);
 	tio_flush(STDOUT_FILENO);
+}
+
+/* ---- transient notice line ---- */
+
+#define NOTICE_MS	3000
+
+static int notice_timer_id = -1;
+
+/* draw the notice in reverse video on the row the command line uses */
+static void
+notice_render(void)
+{
+	render_invalidate_cursor(renderer);
+	render_move_cursor(renderer, STDOUT_FILENO, cmdline_row(), 0);
+	tio_write(STDOUT_FILENO, "\033[7m ", 5);
+	tio_write(STDOUT_FILENO, notice_msg, strlen(notice_msg));
+	tio_write(STDOUT_FILENO, " \033[0m\033[K", 8);
+	tio_flush(STDOUT_FILENO);
+}
+
+static void
+notice_expire(struct iox_loop *lp, void *arg)
+{
+	(void)lp;
+	(void)arg;
+
+	notice_timer_id = -1;
+	notice_msg[0] = '\0';
+	/* the notice wrote over the taskbar row behind its back, so the
+	 * taskbar's "nothing changed since last draw" check would skip the
+	 * redraw and leave the notice on screen */
+	taskbar_invalidate();
+	need_render = 1;
+	need_taskbar = 1;
+}
+
+/* Show a message for a few seconds.  The text may have come from another
+ * client, so it is stripped of anything a terminal would act on before it
+ * reaches the screen. */
+static void
+notice_show(const char *msg)
+{
+	str_sanitize(notice_msg, msg, sizeof(notice_msg));
+	taskbar_invalidate();
+	need_taskbar = 1;
+	if (!ui_loop)
+		return;			/* before the loop exists: no timer */
+	if (notice_timer_id >= 0)
+		iox_timer_remove(ui_loop, notice_timer_id);
+	notice_timer_id = iox_timer_add(ui_loop, NOTICE_MS, notice_expire,
+	    NULL);
 }
 
 /* parse and run a submitted directive.  on success cmd_msg is left
@@ -3054,6 +3469,7 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 	case KEYS_ACTION_SPLIT_V:
 		if (client_mode != CLIENT_MODE_SCREEN)
 			break;
+		layout_dirty = 1;	/* mirrors follow the layout file */
 		{
 			enum tile_split dir = (action == KEYS_ACTION_SPLIT_H)
 			    ? TILE_SPLIT_H : TILE_SPLIT_V;
@@ -3090,6 +3506,7 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 		}
 		break;
 	case KEYS_ACTION_CLOSE_PANE:
+		layout_dirty = 1;
 		if (tile_pane_count(tilemgr) <= 1)
 			break;	/* can't close the only pane */
 		{
@@ -3105,6 +3522,7 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 		}
 		break;
 	case KEYS_ACTION_RESIZE_PANE:
+		layout_dirty = 1;
 		if (tile_pane_count(tilemgr) > 1) {
 			/* pane geometry is about to change under the
 			 * selection; drop it */
@@ -3131,6 +3549,7 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 		}
 		break;
 	case KEYS_ACTION_MINIMIZE:
+		layout_dirty = 1;
 		if (client_mode == CLIENT_MODE_TURBO) {
 			uint32_t fid;
 
@@ -3144,6 +3563,7 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 		}
 		break;
 	case KEYS_ACTION_MAXIMIZE:
+		layout_dirty = 1;
 		if (client_mode == CLIENT_MODE_TURBO) {
 			uint32_t fid;
 
@@ -3220,6 +3640,13 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 		if (client_mode != CLIENT_MODE_MINIMAL)
 			session_picker_show();
 		break;
+	case KEYS_ACTION_SHARE_MENU:
+		if (is_remote)
+			notice_show("sharing is managed on the host of a "
+			    "remote session");
+		else if (client_mode != CLIENT_MODE_MINIMAL)
+			share_menu_show();
+		break;
 	case KEYS_ACTION_PASTE:
 		sel_paste();
 		break;
@@ -3235,7 +3662,11 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 	case KEYS_ACTION_REDISPLAY:
 		/* re-request every window's screen and force a full local
 		 * repaint, so a pane left stale (e.g. an alt-screen app that
-		 * did not repaint) is resynced on demand */
+		 * did not repaint) is resynced on demand.  repair the panes
+		 * first: a pane holding no VT stays blank however often the
+		 * screen is redrawn. */
+		if (client_mode != CLIENT_MODE_TURBO)
+			screen_repair_panes();
 		mconn_request_refresh_all();
 		turbo_need_full = 1;
 		tile_need_full = 1;
@@ -3244,6 +3675,7 @@ dispatch_action(struct iox_loop *loop, enum keys_action action)
 		need_taskbar = 1;
 		break;
 	case KEYS_ACTION_ARRANGE_GRID:
+		layout_dirty = 1;
 		if (client_mode == CLIENT_MODE_TURBO && wmgr) {
 			int gi;
 
@@ -3332,11 +3764,19 @@ sel_paste(void)
 	if (!mc)
 		return;
 
+	/* 13-b: bracket the whole run (both markers plus the content) as one
+	 * atomic unit at the IPC level, distinct from the terminal's own
+	 * \033[200~/201~ bracketed-paste markers below. In multi-writer mode
+	 * another connection's own input could otherwise land on the
+	 * mserver's event loop between any two of these messages and get
+	 * written to the PTY in the middle of this paste. */
+	mconn_ipc_send_empty(mc, IPC_MSG_INPUT_BEGIN);
 	if (focused_wants_bracketed_paste())
 		mconn_ipc_send(mc, IPC_MSG_INPUT, "\033[200~", 6);
 	mconn_ipc_send(mc, IPC_MSG_INPUT, buf, (uint32_t)len);
 	if (focused_wants_bracketed_paste())
 		mconn_ipc_send(mc, IPC_MSG_INPUT, "\033[201~", 6);
+	mconn_ipc_send_empty(mc, IPC_MSG_INPUT_END);
 
 	/* the highlighted selection has served its purpose */
 	if (sel_active())
@@ -4096,6 +4536,11 @@ dispatch_input(struct iox_loop *loop, const struct tkbd_seq *seq)
 		return;
 	}
 
+	if (share_menu_visible) {
+		share_menu_input(seq);
+		return;
+	}
+
 	if (session_picker_visible) {
 		session_picker_input(loop, seq);
 		return;
@@ -4380,8 +4825,12 @@ sb_done:
 			    seq->data, (uint32_t)seq->len);
 
 		/* speculative local echo for printable characters.
-		 * skip for dead windows (no PTY to echo back). */
-		if (mc &&
+		 * skip for dead windows (no PTY to echo back), and skip
+		 * in a multi-writer session with more than one writer
+		 * attached: another writer's input keeps interleaving with
+		 * this client's own, so a prediction would usually be wrong
+		 * and rolled back rather than usually right. */
+		if (mc && share_writer_count <= 1 &&
 		    seq->ch >= 0x20 && seq->ch != 0x7F) {
 			struct client_window *cw = cwin_focused();
 
@@ -4413,6 +4862,15 @@ on_stdin_read(struct iox_loop *loop, int fd, unsigned events, void *arg)
 		return;
 	}
 	stdin_buflen += (int)n;
+
+	/* independent of tkbd_parse() below: catches a color-query reply the
+	 * outer terminal sends back unprompted by the user. tkbd_parse()
+	 * does not recognize OSC sequences, so these bytes would otherwise
+	 * just be skipped one at a time as unrecognized input; this is a
+	 * parallel look at the same bytes, not a replacement for that scan. */
+	if (stdin_osc_parser)
+		vt_parse_feed(stdin_osc_parser, stdin_buf + stdin_buflen - n,
+		    (size_t)n);
 
 	while (off < stdin_buflen) {
 		struct tkbd_seq seq;
@@ -4450,6 +4908,859 @@ on_stdin_read(struct iox_loop *loop, int fd, unsigned events, void *arg)
  * otherwise hang attach indefinitely (its socket lingers in the session
  * directory even after the server stops servicing it). */
 #define MCONN_HANDSHAKE_TIMEOUT 5
+
+/* ---- shared attach identity ----
+ *
+ * One attach process is one client, however many windows it connects to.
+ * The id is the same on every connection so a server, and later a roster,
+ * can tell "one client on eight windows" from "eight clients".
+ *
+ * client_role is what the servers granted us, not what we asked for. It is
+ * recorded here and acted on from step 6 of the shared attach plan.
+ */
+
+static uint32_t client_id;		/* this process, on every window */
+static char client_name[64];		/* "user@host", display only */
+static long client_attached_since;	/* for the roster */
+static int share_remote_clients;	/* connection count, remote sessions */
+char share_marker[48];			/* see attach_ui.h */
+int share_marker_foreign;		/* see attach_ui.h */
+
+/* Whether this client votes on the window size.
+ *
+ * The client with the keyboard always does: it is the one working in the
+ * window. A viewer does only if it was told to. */
+static void
+size_stance_update(void)
+{
+	uint8_t before = client_attach_flags;
+
+	if (client_role == IPC_ROLE_WRITE || share_resize_negotiate)
+		client_attach_flags &= (uint8_t)~IPC_ATTACH_F_SIZE_OBSERVE;
+	else
+		client_attach_flags |= IPC_ATTACH_F_SIZE_OBSERVE;
+
+	if (client_attach_flags != before && mconn_count > 0) {
+		role_announce();	/* carries the flags to every server */
+		if (!(client_attach_flags & IPC_ATTACH_F_SIZE_OBSERVE))
+			screen_fit_all_windows();
+	}
+}
+
+/* a server told us our role changed.  every window of one client is
+ * granted the same role, so the last message simply wins. */
+static void
+client_role_set(uint8_t role)
+{
+	if (role == client_role)
+		return;
+	client_role = role;
+	size_stance_update();
+	/* log_info() writes to stderr, which here is the screen: use the
+	 * debug channel and let the notice tell the user */
+	dbg_trace("role is now %s\n",
+	    role == IPC_ROLE_VIEW ? "view-only" : "read-write");
+	/* a server offered us the keyboard because the holder left, so
+	 * become the recorded holder before anyone else does */
+	if (role == IPC_ROLE_WRITE && !is_remote && session_name)
+		sessdir_token_acquire(session_name, client_id, client_name);
+	else if (role == IPC_ROLE_VIEW)
+		sessdir_token_release();
+	notice_show(role == IPC_ROLE_VIEW
+	    ? "view-only: the keyboard went to another client"
+	    : "you have the keyboard");
+	client_roster_update();
+}
+
+static void
+client_identity_init(void)
+{
+	const char *user;
+	char host[64];
+	char raw[128];
+
+	client_id = (uint32_t)getpid();
+	client_attached_since = (long)time(NULL);
+
+	user = getenv("USER");
+	if (!user || !*user)
+		user = getenv("LOGNAME");
+	if (!user || !*user)
+		user = "?";
+	if (gethostname(host, sizeof(host)) < 0)
+		host[0] = '\0';
+	host[sizeof(host) - 1] = '\0';
+
+	snprintf(raw, sizeof(raw), "%s@%s", user, host[0] ? host : "?");
+	/* $USER is ours but not trustworthy: it is whatever the environment
+	 * says, and this string is drawn on other people's screens. */
+	str_sanitize(client_name, raw, sizeof(client_name));
+}
+
+/* the name this client's UI mode goes by in the roster */
+static const char *
+client_mode_name(void)
+{
+	switch (client_mode) {
+	case CLIENT_MODE_TURBO:
+		return "turbo";
+	case CLIENT_MODE_MINIMAL:
+		return "minimal";
+	default:
+		return "screen";
+	}
+}
+
+/* Publish (or refresh) our roster entry.
+ *
+ * Nothing owns the session as a whole, so "who is attached" lives in the
+ * session directory. Remote clients have no local session directory to
+ * write into, so they are simply absent from it.
+ */
+static void
+client_roster_update(void)
+{
+	struct sessdir_client me;
+
+	if (is_remote || !session_name)
+		return;
+	memset(&me, 0, sizeof(me));
+	me.client_id = client_id;
+	me.pid = getpid();
+	snprintf(me.name, sizeof(me.name), "%s", client_name);
+	snprintf(me.role, sizeof(me.role), "%s",
+	    client_role == IPC_ROLE_VIEW ? "view" : "write");
+	snprintf(me.mode, sizeof(me.mode), "%s", client_mode_name());
+	/* Coupling only means anything for a viewer: a writer is what is
+	 * being followed, not something that follows. */
+	snprintf(me.coupling, sizeof(me.coupling), "%s",
+	    client_role == IPC_ROLE_WRITE ? "-" :
+	    ((client_attach_flags & IPC_ATTACH_F_MIRROR) ? "mirror" : "free"));
+	me.rows = content_rows;
+	me.cols = content_cols;
+	me.since = client_attached_since;
+	sessdir_client_register(session_name, &me);
+	share_marker_update();
+}
+
+/* Decide our role before attaching to anything.
+ *
+ * The keyboard is one thing per session, so the decision cannot be left to
+ * each window: a client attaches to all of them, and two clients could
+ * each win a different one. Whoever holds the session token asks for the
+ * keyboard; everyone else asks to watch. The servers still enforce it,
+ * which is what stops a client that lies about the token. */
+static void
+client_claim_role(void)
+{
+	char holder[64];
+
+	if (is_remote || !session_name)
+		return;			/* no local session directory */
+	if (client_attach_flags & IPC_ATTACH_F_VIEW)
+		return;			/* asked to watch: no claim to make */
+
+
+	if (sessdir_token_acquire(session_name, client_id, client_name) == 0) {
+		/* say so in the handshake: a server that already gave the
+		 * keyboard to a client attaching alongside us has to hand
+		 * it over, or the session ends up split window by window */
+		client_attach_flags |= IPC_ATTACH_F_TOKEN;
+		return;
+	}
+
+	/* Someone else holds it, so we expect view-only.  We still ask for
+	 * the keyboard rather than declaring ourselves a viewer: that is
+	 * what lets a server offer it to us when the holder detaches. */
+	client_role = IPC_ROLE_VIEW;
+	if (sessdir_token_holder(session_name, holder, sizeof(holder),
+	    NULL) == 0 && holder[0]) {
+		char msg[128];
+
+		snprintf(msg, sizeof(msg),
+		    "attached read-only: %s has the keyboard", holder);
+		notice_show(msg);
+	} else {
+		notice_show("attached read-only: another client has "
+		    "the keyboard");
+	}
+}
+
+/* ---- passing the keyboard between clients ----
+ *
+ * Nothing owns the session, so one client tells another through a line in
+ * the session directory (see sessdir_control.h). Each client reads it when
+ * the directory changes and acts on what is addressed to it.
+ *
+ * The role itself is still granted by the servers. A client that has taken
+ * the token announces it, and every server hands it the keyboard and
+ * demotes whoever had it, so the client stepping down does not have to say
+ * anything: it releases the lock and is told by the servers.
+ */
+
+static unsigned long ctl_seq_seen;	/* last control message acted on */
+static unsigned long ctl_request_id;	/* client waiting for our answer */
+static char ctl_request_name[64];
+
+/* tell every server what we are claiming now */
+static void
+role_announce(void)
+{
+	uint8_t flags = client_attach_flags;
+	int i;
+
+	for (i = 0; i < mconn_count; i++)
+		mconn_ipc_send(&mconns[i], IPC_MSG_ROLE_REQUEST, &flags, 1);
+}
+
+/* Hand the keyboard to another client.
+ *
+ * The lock is released before the message is posted, so the other client
+ * finds it free the moment it hears. Our own demotion arrives from the
+ * servers once that client announces the token, which is what keeps the
+ * two of us from both believing we can type. */
+static void
+share_grant_to(unsigned long target, const char *who)
+{
+	char msg[128];
+
+	if (!session_name || is_remote)
+		return;
+	sessdir_token_release();
+	client_attach_flags &= (uint8_t)~IPC_ATTACH_F_TOKEN;
+	sessdir_ctl_post(session_name, SESSDIR_CTL_GRANT, target, client_id,
+	    client_name);
+	if (ctl_request_id == target) {
+		ctl_request_id = 0;
+		ctl_request_name[0] = '\0';
+	}
+	snprintf(msg, sizeof(msg), "keyboard given to %s",
+	    who && who[0] ? who : "another client");
+	notice_show(msg);
+}
+
+/* Refuse a request for the keyboard. */
+static void
+share_deny(unsigned long target)
+{
+	if (!session_name || is_remote)
+		return;
+	sessdir_ctl_post(session_name, SESSDIR_CTL_DENY, target, client_id,
+	    client_name);
+	ctl_request_id = 0;
+	ctl_request_name[0] = '\0';
+	notice_show("request declined");
+}
+
+/* Ask whoever holds the keyboard to pass it here. */
+static void
+share_request(void)
+{
+	if (!session_name || is_remote)
+		return;
+	if (client_role == IPC_ROLE_WRITE) {
+		notice_show("you already have the keyboard");
+		return;
+	}
+	sessdir_ctl_post(session_name, SESSDIR_CTL_REQUEST, 0, client_id,
+	    client_name);
+	notice_show("asked for the keyboard");
+}
+
+static void
+share_kick(unsigned long target, const char *who)
+{
+	char msg[128];
+
+	if (!session_name || is_remote)
+		return;
+	sessdir_ctl_post(session_name, SESSDIR_CTL_KICK, target, client_id,
+	    client_name);
+	snprintf(msg, sizeof(msg), "asked %s to detach",
+	    who && who[0] ? who : "the client");
+	notice_show(msg);
+}
+
+/* Take the keyboard we were given.
+ *
+ * The client giving it up releases the lock before posting the message,
+ * but a poll can still land in between, and on the forced path a command
+ * posts the message without either client having acted yet. Retrying for a
+ * moment is the difference between the keyboard moving and the session
+ * being left with nobody able to type.
+ */
+
+#define CTL_CLAIM_TRIES		10
+#define CTL_CLAIM_DELAY_MS	200
+
+static int ctl_claim_tries;
+
+static void share_claim_retry(struct iox_loop *lp, void *arg);
+
+static void
+share_claim_token(struct iox_loop *lp)
+{
+	if (!session_name || is_remote || ctl_claim_tries <= 0)
+		return;
+	if (sessdir_token_acquire(session_name, client_id, client_name) == 0) {
+		ctl_claim_tries = 0;
+		client_attach_flags |= IPC_ATTACH_F_TOKEN;
+		role_announce();
+		return;
+	}
+	if (--ctl_claim_tries > 0 && lp)
+		iox_timer_add(lp, CTL_CLAIM_DELAY_MS, share_claim_retry, NULL);
+	else if (ctl_claim_tries <= 0)
+		notice_show("could not take the keyboard: still held");
+}
+
+static void
+share_claim_retry(struct iox_loop *lp, void *arg)
+{
+	(void)arg;
+
+	share_claim_token(lp);
+}
+
+/* Act on a control message, at most once each.
+ *
+ * Read on every session directory change, and on a timer when the watch is
+ * unavailable, so passing the keyboard still works on a system that cannot
+ * give us an inotify instance.
+ */
+static void
+share_ctl_poll(struct iox_loop *lp)
+{
+	struct sessdir_ctl m;
+	char msg[160];
+
+	if (!session_name || is_remote)
+		return;
+	if (sessdir_ctl_read(session_name, &m) < 0)
+		return;
+	if (m.seq <= ctl_seq_seen)
+		return;
+	ctl_seq_seen = m.seq;
+
+	switch (m.verb) {
+	case SESSDIR_CTL_REQUEST:
+		if (m.actor == client_id)
+			break;			/* our own request */
+		if (client_role != IPC_ROLE_WRITE)
+			break;			/* not ours to give */
+		ctl_request_id = m.actor;
+		snprintf(ctl_request_name, sizeof(ctl_request_name), "%s",
+		    m.name);
+		snprintf(msg, sizeof(msg),
+		    "%s wants the keyboard: share menu to answer", m.name);
+		notice_show(msg);
+		break;
+
+	case SESSDIR_CTL_GRANT:
+		if (m.target == client_id) {
+			/* the client stepping down may not have let go
+			 * yet, so keep trying for a moment */
+			ctl_claim_tries = CTL_CLAIM_TRIES;
+			share_claim_token(lp);
+		} else if (sessdir_token_held()) {
+			/* someone decided the keyboard goes elsewhere:
+			 * let go, and let the servers demote us when the
+			 * new holder announces itself */
+			sessdir_token_release();
+			client_attach_flags &= (uint8_t)~IPC_ATTACH_F_TOKEN;
+			snprintf(msg, sizeof(msg), "keyboard passed to %s",
+			    m.name[0] ? m.name : "another client");
+			notice_show(msg);
+		}
+		break;
+
+	case SESSDIR_CTL_DENY:
+		if (m.target == client_id)
+			notice_show("your request for the keyboard was "
+			    "declined");
+		break;
+
+	case SESSDIR_CTL_KICK:
+		if (m.target == client_id) {
+			dbg_trace("detaching: kicked by %s\n", m.name);
+			if (lp)
+				iox_loop_stop(lp);
+		}
+		break;
+
+	default:
+		break;
+	}
+}
+
+/* ---- presence ----
+ *
+ * Who else is attached, shown two ways: a notice when it changes, and a
+ * field on the taskbar row for as long as it is true. The notice can be
+ * missed; the marker cannot, which is the point. A session must not be
+ * watchable without the people in it knowing.
+ */
+
+static char share_indicator_fmt[32] = "share:%ww+%vv";
+
+/* share_resize_negotiate (declared above): whether a read-only client
+ * takes part in deciding the window size.
+ *
+ * Off by default: a viewer with a small terminal would otherwise shrink
+ * the window of the person actually working, who never asked to be
+ * resized. Such a viewer crops instead. share.resize = negotiate opts in,
+ * which is what screen -x does for every client. */
+
+/* Is the focused window bigger than the room we have to draw it?
+ *
+ * Only possible for a client that opted out of sizing: everyone else gets
+ * a window sized to fit. */
+static int
+view_clipped(void)
+{
+	if (!(client_attach_flags & IPC_ATTACH_F_SIZE_OBSERVE))
+		return 0;
+	if (!vt || !vt->buf)
+		return 0;
+	return vt_buf_rows(vt->buf) > content_rows ||
+	    vt_buf_cols(vt->buf) > content_cols;
+}
+
+/* Recount the roster and rebuild the taskbar marker.
+ *
+ * share_marker is read by render_taskbar(), which draws it whatever the
+ * user's taskbar format says, the same way the degraded-watch marker is
+ * drawn. Configuration decides how it looks, not whether it appears.
+ */
+
+/* Minimal mode has no taskbar, so the marker lives in the terminal title
+ * there, and the title is only rewritten when something asks. */
+static void
+share_marker_changed(int was_shared)
+{
+	if (taskbar_visible)
+		return;
+	if (was_shared != (share_marker[0] != '\0'))
+		sync_keybinds_title();
+}
+
+static void
+share_marker_update(void)
+{
+	struct sessdir_client list[SESSDIR_CLIENT_MAX];
+	int n, i, writers = 0, viewers = 0;
+	int was_shared = share_marker[0] != '\0';
+	const char *p;
+	size_t out = 0;
+
+	share_marker[0] = '\0';
+	share_marker_foreign = 0;
+	if (is_remote) {
+		/* no session directory to read: the servers told us how
+		 * many connections they have, which is the same number.
+		 * This client reached the session through a broker, so it
+		 * is itself a foreign uid -- the marker is always colored
+		 * as such once it is shown at all. */
+		if (share_remote_clients > 1) {
+			snprintf(share_marker, sizeof(share_marker),
+			    "share:%d ", share_remote_clients);
+			share_marker_foreign = 1;
+		}
+		share_writer_count = 1;	/* not visible from here; see above */
+		share_marker_changed(was_shared);
+		return;
+	}
+	if (!session_name) {
+		share_writer_count = 1;
+		share_marker_changed(was_shared);
+		return;
+	}
+	n = sessdir_client_list(session_name, list, SESSDIR_CLIENT_MAX);
+	if (n <= 1) {
+		share_writer_count = 1;
+		share_marker_changed(was_shared);
+		return;		/* alone: nothing to say */
+	}
+	for (i = 0; i < n; i++) {
+		if (strcmp(list[i].role, "write") == 0)
+			writers++;
+		else
+			viewers++;
+		/* who is empty only for a tier-0 (same-uid) attach.c
+		 * client; any broker-relayed entry has it set. */
+		if (list[i].who[0])
+			share_marker_foreign = 1;
+	}
+	share_writer_count = writers;
+
+	for (p = share_indicator_fmt; *p && out + 8 < sizeof(share_marker);
+	    p++) {
+		if (*p != '%') {
+			share_marker[out++] = *p;
+			continue;
+		}
+		switch (*++p) {
+		case 'w':
+			out += (size_t)snprintf(share_marker + out,
+			    sizeof(share_marker) - out, "%d", writers);
+			break;
+		case 'v':
+			out += (size_t)snprintf(share_marker + out,
+			    sizeof(share_marker) - out, "%d", viewers);
+			break;
+		case 'n':
+			out += (size_t)snprintf(share_marker + out,
+			    sizeof(share_marker) - out, "%d", n);
+			break;
+		case '\0':
+			p--;
+			break;
+		default:
+			share_marker[out++] = *p;
+			break;
+		}
+	}
+	if (out + 1 < sizeof(share_marker))
+		share_marker[out++] = ' ';
+	share_marker[out] = '\0';
+
+	/* A client that opted out of sizing sees whatever fits and crops
+	 * the rest. Saying so is the difference between "the window is
+	 * bigger than my terminal" and "this program is drawing wrong". */
+	if (view_clipped() && out + 6 < sizeof(share_marker)) {
+		memcpy(share_marker + out, "clip ", 6);
+		out += 5;
+	}
+	taskbar_invalidate();
+	need_taskbar = 1;
+	share_marker_changed(was_shared);
+}
+
+/* A client arrived, left, or took the keyboard.
+ *
+ * One client holds one connection per window, so the same event arrives
+ * once per window. Only the first is worth a notice. */
+static void
+share_client_event(const char *payload, uint32_t len)
+{
+	static uint8_t last_kind;
+	static uint32_t last_id;
+	static time_t last_at;
+	uint8_t kind;
+	uint32_t id;
+	char name[64], msg[128];
+	time_t now = time(NULL);
+
+	if (len < 5)
+		return;
+	kind = (uint8_t)payload[0];
+	id = ((uint32_t)(uint8_t)payload[1] << 24) |
+	    ((uint32_t)(uint8_t)payload[2] << 16) |
+	    ((uint32_t)(uint8_t)payload[3] << 8) |
+	    (uint32_t)(uint8_t)payload[4];
+	snprintf(name, sizeof(name), "%.*s", (int)(len - 5), payload + 5);
+
+	share_marker_update();
+
+	if (kind == last_kind && id == last_id && now - last_at < 3)
+		return;			/* the same event from another window */
+	last_kind = kind;
+	last_id = id;
+	last_at = now;
+
+	switch (kind) {
+	case IPC_CLIENT_JOIN:
+		snprintf(msg, sizeof(msg), "%s attached",
+		    name[0] ? name : "another client");
+		break;
+	case IPC_CLIENT_LEAVE:
+		snprintf(msg, sizeof(msg), "%s detached",
+		    name[0] ? name : "another client");
+		break;
+	case IPC_CLIENT_ROLE:
+		snprintf(msg, sizeof(msg), "%s changed role",
+		    name[0] ? name : "another client");
+		break;
+	default:
+		return;
+	}
+	notice_show(msg);		/* sanitizes the name it is given */
+}
+
+/* ---- mirroring the client that has the keyboard ----
+ *
+ * A viewer that is watching someone work wants to see what they see, not
+ * navigate on its own. The client with the keyboard publishes its focused
+ * window and its layout into the session directory; a mirroring viewer
+ * follows both. Only the keyboard holder writes, so there is nobody to
+ * contend with.
+ */
+
+static uint32_t published_focus;
+static time_t layout_saved_at;
+static time_t mirror_layout_mtime;
+static unsigned long mirror_layout_gen;	/* 13-d: the generation this
+						 * process last applied or
+						 * saved, so a shared-display
+						 * writer can tell whether it
+						 * has caught up */
+
+#define LAYOUT_SAVE_INTERVAL	1	/* seconds between published saves */
+
+/* 13-d: multi-writer plus share.display=shared means every writer also
+ * follows the shared layout and focus, on top of a VIEW-role client's own
+ * -v/--free choice (IPC_ATTACH_F_MIRROR), which does not apply to a
+ * writer -- a writer never sets that flag, so this is a separate path
+ * rather than an extension of it. Meaningless outside multi-writer mode:
+ * a lone writer has nothing to follow. */
+static int
+mirror_display_shared(void)
+{
+	return !is_remote && session_name &&
+	    sessdir_share_mode_get(session_name) ==
+	    SESSDIR_SHARE_MULTI_WRITER &&
+	    sessdir_share_display_get(session_name) ==
+	    SESSDIR_SHARE_DISPLAY_SHARED;
+}
+
+static int
+mirror_following(void)
+{
+	if (is_remote || !session_name)
+		return 0;
+	if (client_role == IPC_ROLE_WRITE)
+		return mirror_display_shared();
+	return (client_attach_flags & IPC_ATTACH_F_MIRROR) != 0;
+}
+
+static void
+layout_file_path(char *buf, size_t bufsz)
+{
+	char *dir;
+
+	buf[0] = '\0';
+	dir = sessdir_session_path(session_name);
+	if (!dir)
+		return;
+	snprintf(buf, bufsz, "%s/layout", dir);
+	free(dir);
+}
+
+/* Record that this process's own view is current with what is on disk,
+ * so mirror_sync() does not treat this process's own write (or its own
+ * just-applied import) as a newer change still waiting to be picked up. */
+static void
+mirror_layout_mark_current(void)
+{
+	char path[PATH_MAX];
+	struct stat sb;
+
+	layout_file_path(path, sizeof(path));
+	if (path[0] && stat(path, &sb) == 0)
+		mirror_layout_mtime = sb.st_mtime;
+	mirror_layout_gen = sessdir_layout_generation(session_name);
+}
+
+/* Apply whatever is currently on disk to this process's own live tiling
+ * state -- the half of mirror_sync() that a shared-display writer also
+ * needs when catching up on a newer generation before publishing its own
+ * change (mirror_publish()), not just a MIRROR-coupled viewer following
+ * along (mirror_sync()). */
+static void
+mirror_apply_layout(void)
+{
+	/* a not-yet-published local edit (layout_dirty) must not be
+	 * clobbered by importing the disk tree out from under it --
+	 * tile_import_tree()/turbo_apply_layout() replace this process's
+	 * live tiling state outright, and the pending edit lives only
+	 * there until it is saved. Skipping here just defers catching up
+	 * until this writer is no longer dirty. */
+	if (layout_dirty)
+		return;
+
+	if (client_mode == CLIENT_MODE_TURBO) {
+		turbo_apply_layout(session_name);
+		turbo_need_full = 1;
+	} else if (screen_apply_layout(session_name) == 0) {
+		overlay_repaint_fn = tiled_repaint;
+		tile_each_pane(tilemgr, tiled_resize_pane_cb, NULL);
+		tile_need_full = 1;
+	}
+	need_render = 1;
+	need_taskbar = 1;
+}
+
+/* Publish what we are looking at, so a mirroring viewer can follow.
+ *
+ * Called once per main-loop pass rather than from each of the places that
+ * can change focus or layout, which is why the focus is compared and the
+ * save is rate-limited instead of being written on every keystroke.
+ */
+static void
+mirror_publish(void)
+{
+	struct sessdir_state *st;
+	time_t now;
+
+	if (is_remote || !session_name || client_role != IPC_ROLE_WRITE)
+		return;
+
+	if (watching && watched_id && watched_id != published_focus) {
+		st = sessdir_state_open(session_name);
+		if (st) {
+			if (sessdir_state_set_focus(st,
+			    (pid_t)watched_id) == 0)
+				published_focus = watched_id;
+			sessdir_state_close(st);
+		}
+	}
+
+	if (!layout_dirty)
+		return;
+	now = time(NULL);
+	if (now - layout_saved_at < LAYOUT_SAVE_INTERVAL)
+		return;			/* a drag would write continuously */
+
+	/* 13-d: a shared-display writer's pending edit is exported as-is
+	 * here (last-writer-wins on disk, same as single-writer mode --
+	 * this is not a merge). mirror_apply_layout() refuses to catch up
+	 * on a newer generation while layout_dirty is set, precisely to
+	 * avoid discarding this edit; catching up on another writer's
+	 * change happens separately, via mirror_sync()'s own timer, in
+	 * whatever gap this writer is not dirty. */
+	layout_saved_at = now;
+	layout_dirty = 0;
+	if (client_mode == CLIENT_MODE_TURBO)
+		turbo_save_layout(session_name);
+	else if (tilemgr)
+		screen_save_layout(session_name);
+	mirror_layout_mark_current();
+}
+
+/* Follow the published focus and layout. */
+static void
+mirror_sync(void)
+{
+	struct sessdir_state *st;
+	char path[PATH_MAX];
+	struct stat sb;
+	pid_t focus = 0;
+
+	if (!mirror_following())
+		return;
+
+	st = sessdir_state_open(session_name);
+	if (st) {
+		focus = sessdir_state_focus(st);
+		sessdir_state_close(st);
+	}
+	if (focus > 0 && (uint32_t)focus != watched_id &&
+	    mconn_find_by_pid(focus))
+		micro_select_window((uint32_t)focus);
+
+	/* the layout file is rewritten rather than appended to, so its
+	 * modification time is enough to know there is something new */
+	layout_file_path(path, sizeof(path));
+	if (!path[0] || stat(path, &sb) < 0)
+		return;
+	if (sb.st_mtime == mirror_layout_mtime)
+		return;
+	mirror_layout_mtime = sb.st_mtime;
+	mirror_layout_gen = sessdir_layout_generation(session_name);
+
+	mirror_apply_layout();
+}
+
+/* ---- what the share menu asks of us ---- */
+
+unsigned long
+share_self_id(void)
+{
+	return client_id;
+}
+
+int
+share_self_has_keyboard(void)
+{
+	return client_role == IPC_ROLE_WRITE;
+}
+
+unsigned long
+share_pending_request(void)
+{
+	return ctl_request_id;
+}
+
+void
+share_menu_grant(unsigned long target, const char *who)
+{
+	share_grant_to(target, who);
+}
+
+void
+share_menu_deny(unsigned long target)
+{
+	share_deny(target);
+}
+
+void
+share_menu_request(void)
+{
+	share_request();
+}
+
+void
+share_menu_kick(unsigned long target, const char *who)
+{
+	share_kick(target, who);
+}
+
+void
+share_menu_toggle_lock(void)
+{
+	int locked;
+
+	if (!session_name || is_remote)
+		return;
+	locked = !sessdir_share_locked(session_name);
+	sessdir_share_set_locked(session_name, locked);
+	notice_show(locked ? "session locked against new clients"
+	    : "session open to new clients");
+}
+
+int
+share_menu_locked(void)
+{
+	if (!session_name || is_remote)
+		return 0;
+	return sessdir_share_locked(session_name);
+}
+
+/* poll intervals used when there is no directory watch: passing the
+ * keyboard can wait a second, but a viewer following someone's focus
+ * cannot without looking broken. */
+#define SHARE_CTL_POLL_MS	1000
+#define MIRROR_POLL_MS		250
+
+static void
+share_ctl_timer(struct iox_loop *lp, void *arg)
+{
+	(void)arg;
+
+	share_ctl_poll(lp);
+	share_marker_update();
+	mirror_sync();
+	if (lp)
+		iox_timer_add(lp, mirror_following() ? MIRROR_POLL_MS
+		    : SHARE_CTL_POLL_MS, share_ctl_timer, NULL);
+}
+
+static void
+share_ctl_timer_arm(struct iox_loop *lp)
+{
+	if (lp)
+		iox_timer_add(lp, SHARE_CTL_POLL_MS, share_ctl_timer, NULL);
+}
 
 /* bound blocking I/O on a socket. secs == 0 restores indefinite blocking,
  * which we do once the handshake succeeds so the steady-state event loop
@@ -4513,16 +5824,21 @@ mconn_discover(struct iox_loop *lp)
 		/* send ATTACH carrying our content-area size so the server
 		 * resizes and generates the replay at that size (avoids a
 		 * blank/garbled pane when the server's size differs from
-		 * ours).  receive ATTACH_REPLY with the resulting VT size so
-		 * we create a matching client VT. */
+		 * ours), plus who we are and the role we want.  receive
+		 * ATTACH_REPLY with the resulting VT size and the role we
+		 * were actually granted. */
 		{
-			struct ipc_size sz;
-			uint8_t abuf[16];
+			struct ipc_attach at;
+			uint8_t abuf[128];
 			int an;
 
-			sz.rows = (uint16_t)content_rows;
-			sz.cols = (uint16_t)content_cols;
-			an = ipc_size_encode(&sz, abuf, sizeof(abuf));
+			at.rows = (uint16_t)content_rows;
+			at.cols = (uint16_t)content_cols;
+			at.flags = client_attach_flags;
+			at.client_id = client_id;
+			at.name = client_name;
+			at.name_len = (uint16_t)strlen(client_name);
+			an = ipc_attach_encode(&at, abuf, sizeof(abuf));
 			if (an < 0 ||
 			    ipc_msg_send(fd, IPC_MSG_ATTACH, abuf,
 			    (uint32_t)an) < 0) {
@@ -4540,13 +5856,28 @@ mconn_discover(struct iox_loop *lp)
 			continue;
 		}
 		{
-			struct ipc_size sz;
+			struct ipc_attach_reply rep;
 
-			if (ipc_size_decode(&sz, (const uint8_t *)rbuf,
-			    (int)rlen) >= 0 && sz.rows > 0 &&
-			    sz.cols > 0) {
-				srv_rows = sz.rows;
-				srv_cols = sz.cols;
+			/* an old server replies with an ipc_size, which
+			 * decodes here with role 0, meaning WRITE: what it
+			 * would in fact give us. */
+			if (ipc_attach_reply_decode(&rep,
+			    (const uint8_t *)rbuf, (int)rlen) >= 0) {
+				if (rep.rows > 0 && rep.cols > 0) {
+					srv_rows = rep.rows;
+					srv_cols = rep.cols;
+				}
+				/* asked to type and was refused: say so
+				 * once, rather than leaving the user to
+				 * work it out from keys doing nothing */
+				if (rep.role != IPC_ROLE_WRITE &&
+				    client_role == IPC_ROLE_WRITE &&
+				    !(client_attach_flags & IPC_ATTACH_F_VIEW))
+					notice_show("attached read-only: "
+					    "another client has the keyboard");
+				client_role = rep.role;
+				if (rep.nclients > share_remote_clients)
+					share_remote_clients = rep.nclients;
 			}
 		}
 
@@ -5323,6 +6654,15 @@ proxy_dispatch(struct iox_loop *lp, uint32_t window_id, uint32_t type,
 			}
 			break;
 
+		case IPC_MSG_ROLE_CHANGE:
+			if (len >= 1)
+				client_role_set((uint8_t)buf[0]);
+			break;
+
+		case IPC_MSG_CLIENT_EVENT:
+			share_client_event(buf, len);
+			break;
+
 		case IPC_MSG_DETACH:
 			iox_loop_stop(lp);
 			break;
@@ -5451,7 +6791,7 @@ on_net_timer(struct iox_loop *lp, void *arg)
 	(void)arg;
 	net_service_timer = -1;
 	net_pump_and_drain(lp);
-	if (!iox_loop_stopped(lp)) {
+	if (!iox_loop_is_stopped(lp)) {
 		net_maybe_roam(lp);
 		net_rearm_timer(lp);
 	}
@@ -5719,6 +7059,15 @@ on_mserver_read(struct iox_loop *lp, int fd, unsigned events, void *arg)
 			}
 			break;
 
+		case IPC_MSG_ROLE_CHANGE:
+			if (len >= 1)
+				client_role_set((uint8_t)buf[0]);
+			break;
+
+		case IPC_MSG_CLIENT_EVENT:
+			share_client_event(buf, len);
+			break;
+
 		case IPC_MSG_DETACH:
 			iox_loop_stop(lp);
 			return;
@@ -5771,9 +7120,18 @@ micro_switch_session(struct iox_loop *loop, const char *name)
 	tile_free(tilemgr);
 	tilemgr = NULL;
 
-	/* switch session name */
+	/* switch session name.  the token and the roster entry belong to
+	 * the session we are leaving, so give them up before taking the
+	 * new session's. */
+	if (session_name) {
+		sessdir_token_release();
+		sessdir_client_unregister(session_name, client_id);
+	}
 	free(session_name);
 	session_name = strdup(name);
+	client_role = IPC_ROLE_WRITE;
+	client_attach_flags &= (uint8_t)~IPC_ATTACH_F_VIEW;
+	client_claim_role();
 
 	/* connect to new session's servers */
 	mconn_discover(loop);
@@ -5833,7 +7191,13 @@ micro_switch_session(struct iox_loop *loop, const char *name)
 		 * (micro_spawn_window schedules an active rescan), but windows
 		 * created or closed by OTHER attach clients will not update
 		 * live. If that becomes a problem, add a periodic timer-driven
-		 * mconn_refresh() fallback here (the "#2 polling" option). */
+		 * mconn_refresh() fallback here (the "#2 polling" option).
+		 *
+		 * Passing the keyboard does get a fallback: it is driven by
+		 * a message in the session directory, and a session where
+		 * nobody can hand over the keyboard is worse than a slow
+		 * poll. */
+		share_ctl_timer_arm(loop);
 		sessdir_watch_degraded = 1;
 		log_warn("sessdir watch unavailable (inotify?); windows from "
 		    "other clients will not appear live");
@@ -5913,9 +7277,22 @@ mconn_refresh(struct iox_loop *lp)
 
 	/* screen mode: assign new windows to empty tile panes first,
 	 * then update focus. only try newly added windows so we don't
-	 * assign an already-displayed window to an empty pane. */
+	 * assign an already-displayed window to an empty pane.
+	 *
+	 * Each newly added pid gets exactly one placement attempt, whether
+	 * or not an earlier one in the same batch already found a pane --
+	 * a previous version of this loop broke after the first success,
+	 * silently dropping every other window spawned in the same refresh
+	 * (e.g. two splits close enough together to both register between
+	 * one discovery pass). tile_pane_geometry() skips a pid that is
+	 * somehow already placed, so a window can never end up bound to
+	 * two leaves at once -- the direct cause, confirmed by dumping the
+	 * tree at exit, of a heap-use-after-free crash: two leaves sharing
+	 * one window_id, one of them later spliced into the tree a second
+	 * time as still-empty, producing a node reachable from two parents
+	 * that node_free() then visited (and freed) twice. */
 	{
-		int pane_assigned = 0;
+		int any_assigned = 0;
 
 		if (added > 0) {
 			int i;
@@ -5927,45 +7304,46 @@ mconn_refresh(struct iox_loop *lp)
 				cw = cwin_find(pid);
 				if (!cw)
 					continue;
+				if (tile_pane_geometry(tilemgr, pid,
+				    NULL, NULL, NULL, NULL) == 0)
+					continue;	/* already placed */
+
 				if (tile_set_window(tilemgr, 0,
 				    pid, cw->vt) == 0) {
-					tile_each_pane(tilemgr,
-					    tiled_resize_pane_cb, NULL);
 					tile_focus(tilemgr, pid);
-					tile_sync_focus();
-					pane_assigned = 1;
-					break;
+					any_assigned = 1;
+					continue;
 				}
+
+				/* no empty pane left for this one -- swap it
+				 * into the currently focused pane, like
+				 * C-a c would */
+				{
+					uint32_t old_id =
+					    tile_focused_id(tilemgr);
+
+					if (tile_set_window(tilemgr, old_id,
+					    pid, cw->vt) == 0) {
+						tile_focus(tilemgr, pid);
+						any_assigned = 1;
+					}
+				}
+			}
+			if (any_assigned) {
+				tile_each_pane(tilemgr,
+				    tiled_resize_pane_cb, NULL);
+				tile_sync_focus();
 			}
 		}
 
-		if (added > 0 && !pane_assigned && mconn_count > 0) {
-			/* no empty pane -- swap focused pane to show
-			 * newest window (C-a c new-window behavior) */
-			uint32_t old_id = tile_focused_id(tilemgr);
-			uint32_t new_id;
-			struct client_window *cw;
-
-			new_id = (uint32_t)mconns[mconn_count - 1].pid;
-			cw = cwin_find(new_id);
-			if (cw) {
-				tile_set_window(tilemgr, old_id,
-				    new_id, cw->vt);
-				tile_focus(tilemgr, new_id);
-				tile_sync_focus();
-			}
-		} else if (!watching && mconn_count > 0) {
+		if (!watching && mconn_count > 0) {
 			/* current focus died -- swap to first window */
-			uint32_t old_id = tile_focused_id(tilemgr);
-			uint32_t new_id;
+			uint32_t new_id = (uint32_t)mconns[0].pid;
 			struct client_window *cw;
 
-			new_id = (uint32_t)mconns[0].pid;
 			cw = cwin_find(new_id);
 			if (cw) {
-				tile_set_window(tilemgr, old_id,
-				    new_id, cw->vt);
-				tile_focus(tilemgr, new_id);
+				tile_show_window(new_id, cw->vt);
 				tile_sync_focus();
 			}
 		}
@@ -5986,8 +7364,12 @@ on_sessdir_watch(struct iox_loop *lp, int fd, unsigned events, void *arg)
 	(void)arg;
 
 	flags = sessdir_watch_read(fd);
-	if (flags & SESSDIR_WATCH_CHANGED)
+	if (flags & SESSDIR_WATCH_CHANGED) {
 		mconn_refresh(lp);
+		share_ctl_poll(lp);
+		share_marker_update();
+		mirror_sync();
+	}
 }
 
 static void
@@ -6078,10 +7460,13 @@ static void
 usage(void)
 {
 	fprintf(stderr,
-	    "usage: lumi-attach [-f window] [-m mode] [-n] [-V] [-s name]\n");
+	    "usage: lumi-attach [-f window] [-m mode] [-n] [-v] [-F] [-V] "
+	    "[-s name]\n");
 	fprintf(stderr,
 	    "  -f window   focus this window (by PID) after startup\n"
 	    "  -m mode     UI mode: screen (default), turbo, minimal\n"
+	    "  -v          attach read-only: watch without typing\n"
+	    "  -F          do not follow the other client's window and layout\n"
 	    "  -n          connect via the session's net-proxy (netchan)\n"
 	    "  -V          verify the net-proxy's host identity key (with -n)\n"
 	    "  -s name     session name (default: 0)\n");
@@ -6096,6 +7481,7 @@ cmd_attach_main(int argc, char **argv)
 	uint32_t focus_window = 0;
 	int rows, cols;
 	int opt;
+	int free_view = 0;
 	int use_netchan = 0;
 	int use_verify = 0;
 
@@ -6106,7 +7492,7 @@ cmd_attach_main(int argc, char **argv)
 		return 1;
 	}
 
-	while ((opt = getopt(argc, argv, "f:m:nVs:")) != -1) {
+	while ((opt = getopt(argc, argv, "Ff:m:nvVs:")) != -1) {
 		switch (opt) {
 		case 'f':
 			focus_window = (uint32_t)strtoul(optarg, NULL, 10);
@@ -6116,6 +7502,18 @@ cmd_attach_main(int argc, char **argv)
 			break;
 		case 'n':
 			use_netchan = 1;
+			break;
+		case 'v':
+			/* ask every server for view-only; they would grant
+			 * it anyway if someone else holds the keyboard.
+			 * watching usually means watching what the other
+			 * client is doing, so follow it by default. */
+			client_attach_flags |= IPC_ATTACH_F_VIEW;
+			client_attach_flags |= IPC_ATTACH_F_MIRROR;
+			client_role = IPC_ROLE_VIEW;
+			break;
+		case 'F':
+			free_view = 1;		/* do not follow */
 			break;
 		case 'V':
 			use_verify = 1;
@@ -6130,6 +7528,11 @@ cmd_attach_main(int argc, char **argv)
 	}
 	if (optind < argc)
 		name = argv[optind];
+
+	/* -F after -v, or on its own for a client that ends up read-only
+	 * because someone else already has the keyboard */
+	if (free_view)
+		client_attach_flags &= (uint8_t)~IPC_ATTACH_F_MIRROR;
 
 	if (use_verify && !use_netchan) {
 		fprintf(stderr, "lumi-attach: -V requires -n\n");
@@ -6156,6 +7559,7 @@ cmd_attach_main(int argc, char **argv)
 
 	dbg_init();
 	rune_width_init();
+	client_identity_init();
 	get_terminal_size(&rows, &cols);
 	update_content_size(rows, cols);
 
@@ -6214,6 +7618,18 @@ cmd_attach_main(int argc, char **argv)
 		} else {
 			session_name = strdup(name);
 		}
+	}
+
+	/* A session closed to further clients: stay out, before touching
+	 * the terminal, so the refusal is a plain line of text rather than
+	 * something printed into a screen we just took over. Cooperating
+	 * clients honor this; it prevents joining by accident and is not a
+	 * defense against a client that does not care. */
+	if (!is_remote && session_name && sessdir_share_locked(session_name)) {
+		fprintf(stderr, "lumi-attach: session '%s' is locked "
+		    "against new clients\n", session_name);
+		free(session_name);
+		return 1;
 	}
 
 	{
@@ -6275,6 +7691,17 @@ cmd_attach_main(int argc, char **argv)
 			    strcmp(val, "yes") == 0 ||
 			    strcmp(val, "1") == 0))
 				altscreen_scrollback = 1;
+
+			/* how the presence marker reads, not whether it
+			 * appears: %w writers, %v viewers, %n clients */
+			val = cfg_get(cfg, "share.indicator");
+			if (val && val[0])
+				snprintf(share_indicator_fmt,
+				    sizeof(share_indicator_fmt), "%s", val);
+
+			val = cfg_get(cfg, "share.resize");
+			if (val && strcmp(val, "negotiate") == 0)
+				share_resize_negotiate = 1;
 		}
 
 		cfg_free(cfg);
@@ -6307,6 +7734,19 @@ cmd_attach_main(int argc, char **argv)
 		return 1;
 	}
 
+	/* catches the outer terminal's reply to an OSC 10/11 color query
+	 * forwarded on a window's behalf (osc_passthru()); an all-NULL ops
+	 * table means every other escape this sees is a harmless no-op --
+	 * tkbd_parse() sees the same stdin bytes independently for keys. */
+	{
+		static const struct vt_ops osc_only_ops;
+
+		stdin_osc_parser = vt_parse_new(&osc_only_ops, NULL);
+		if (stdin_osc_parser)
+			vt_parse_set_osc_cb(stdin_osc_parser, stdin_osc_reply,
+			    NULL);
+	}
+
 	if (client_mode == CLIENT_MODE_TURBO) {
 		wmgr = wm_new(content_rows, content_cols);
 		if (!wmgr) {
@@ -6330,6 +7770,7 @@ cmd_attach_main(int argc, char **argv)
 	tio_flush(STDOUT_FILENO);
 
 	loop = iox_loop_new();
+	ui_loop = loop;
 	if (!loop) {
 		emit_mode(2004, 0);
 		tio_flush(STDOUT_FILENO);
@@ -6340,6 +7781,22 @@ cmd_attach_main(int argc, char **argv)
 	}
 
 	iox_fd_add(loop, STDIN_FILENO, IOX_READ, on_stdin_read, NULL);
+
+	/* messages posted before we existed are not ours to act on */
+	{
+		struct sessdir_ctl m;
+
+		if (!is_remote && session_name &&
+		    sessdir_ctl_read(session_name, &m) == 0)
+			ctl_seq_seen = m.seq;
+	}
+
+	/* decide the role before the first ATTACH goes out, so every
+	 * window is asked for the same thing, and the sizing stance with
+	 * it: the handshake carries both */
+	client_claim_role();
+	if (client_role != IPC_ROLE_WRITE && !share_resize_negotiate)
+		client_attach_flags |= IPC_ATTACH_F_SIZE_OBSERVE;
 
 	{
 		/* discover mservers: remote via proxy, local via sessdir */
@@ -6362,6 +7819,7 @@ cmd_attach_main(int argc, char **argv)
 		watched_id = is_remote ? (uint32_t)mconns[0].pid
 		    : mconn_initial_focus();
 		watching = 1;
+		client_roster_update();	/* we are attached: say so */
 		{
 			struct client_window *cw;
 
@@ -6424,6 +7882,11 @@ cmd_attach_main(int argc, char **argv)
 				log_warn("sessdir watch unavailable (inotify?); "
 				    "windows from other clients will not "
 				    "appear live");
+				/* passing the keyboard is driven by a
+				 * message in the session directory, and a
+				 * session where the keyboard cannot change
+				 * hands is worse than a slow poll */
+				share_ctl_timer_arm(loop);
 			}
 		}
 	}
@@ -6446,7 +7909,7 @@ cmd_attach_main(int argc, char **argv)
 	 * in poll; events/rendering may move the cursor arbitrarily.
 	 * prefix timeout is driven by iox_timer via sync_prefix_timer(). */
 	iox_loop_start(loop);
-	while (!iox_loop_stopped(loop)) {
+	while (!iox_loop_is_stopped(loop)) {
 		flush_render();
 		set_cursor_vis(app_cursor_vis());
 		tio_flush(STDOUT_FILENO);
@@ -6461,6 +7924,15 @@ cmd_attach_main(int argc, char **argv)
 		screen_save_layout(name);
 
 	mconn_disconnect_all(NULL);
+
+	/* give up the keyboard and stop being listed as attached.  the
+	 * lock would be released by process exit anyway, and a roster
+	 * entry whose process is gone is pruned by the next client to
+	 * look, so this is about not making anyone wait for either. */
+	if (session_name) {
+		sessdir_token_release();
+		sessdir_client_unregister(session_name, client_id);
+	}
 
 	/* clean up remote proxy */
 	if (remote_netchan) {
@@ -6507,9 +7979,10 @@ cmd_attach_main(int argc, char **argv)
 	if (sessdir_watch_fd >= 0)
 		sessdir_watch_stop(sessdir_watch_fd);
 	render_free(renderer);
+	vt_parse_free(stdin_osc_parser);
+	cwin_free_all();
 	tile_free(tilemgr);
 	wm_free(wmgr);
-	cwin_free_all();
 	tui_term_free(tb);
 	txl_free(txl);
 	keys_free(keybinds);

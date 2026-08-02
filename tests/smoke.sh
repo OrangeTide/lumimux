@@ -73,5 +73,37 @@ case "$out" in
 esac
 unset LUMI_SESSION
 
+# "lumi new" must pass the session name through to the mserver even when no
+# lumi-mserver symlink exists, so the sub-command runs in-process.  Rewriting
+# the process title used to blank the argument strings on that path, and the
+# window then registered at the root of the runtime directory instead of
+# inside its session.  A lone copy of the binary in a private directory, with
+# a PATH that has no lumi in it, is what forces the in-process path.
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/lumi-smoke-XXXXXX")
+cp "$BINDIR/lumi" "$tmp/lumi"
+mkdir -p "$tmp/run"
+(
+	unset LUMI_SESSION LUMI_LIBEXEC_PATH
+	XDG_RUNTIME_DIR="$tmp/run" PATH=/usr/bin:/bin \
+	    "$tmp/lumi" new -d -s smokesess >/dev/null 2>&1
+)
+sleep 1
+if [ -d "$tmp/run/lumi/smokesess" ] &&
+   [ -n "$(find "$tmp/run/lumi/smokesess" -name socket -print -quit)" ] &&
+   [ -z "$(find "$tmp/run/lumi" -maxdepth 1 -name '[0-9]*' -print -quit)" ]; then
+	pass "lumi new registers the window inside its session"
+else
+	fail "lumi new registers the window inside its session" \
+	    "window missing from the session directory"
+fi
+for p in $(ls "$tmp/run/lumi/smokesess" 2>/dev/null) \
+         $(ls "$tmp/run/lumi" 2>/dev/null); do
+	case "$p" in
+		[0-9]*) kill -TERM "$p" 2>/dev/null || true ;;
+	esac
+done
+sleep 0.5
+rm -rf "$tmp"
+
 printf "smoke: %d tests, %d failures\n" "$total" "$fail"
 [ "$fail" -eq 0 ]

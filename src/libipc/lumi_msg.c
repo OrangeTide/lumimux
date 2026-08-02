@@ -57,6 +57,141 @@ ipc_size_decode(struct ipc_size *msg, const uint8_t *buf, int len)
 }
 
 int
+ipc_attach_encode(const struct ipc_attach *msg, uint8_t *buf, int len)
+{
+	int pos = 2;
+
+	pos = ms_write_tag_u16(buf, pos, len, 1, msg->rows);
+	if (pos < 0)
+		return -1;
+	pos = ms_write_tag_u16(buf, pos, len, 2, msg->cols);
+	if (pos < 0)
+		return -1;
+	pos = ms_write_tag_u8(buf, pos, len, 3, msg->flags);
+	if (pos < 0)
+		return -1;
+	pos = ms_write_tag_u32(buf, pos, len, 4, msg->client_id);
+	if (pos < 0)
+		return -1;
+	pos = ms_write_tag_bytes(buf, pos, len, 5,
+	    (const void *)msg->name, msg->name_len);
+	if (pos < 0)
+		return -1;
+
+	buf[0] = (uint8_t)((pos - 2) & 0xff);
+	buf[1] = (uint8_t)(((pos - 2) >> 8) & 0xff);
+	return pos;
+}
+
+int
+ipc_attach_decode(struct ipc_attach *msg, const uint8_t *buf, int len)
+{
+	int end, pos = 2;
+
+	if (len < 2)
+		return -1;
+	end = (int)((uint16_t)buf[0] | ((uint16_t)buf[1] << 8)) + 2;
+	if (end > len)
+		return -1;
+	memset(msg, 0, sizeof(*msg));
+
+	while (pos < end) {
+		uint8_t tag = buf[pos++];
+
+		switch (tag >> 3) {
+		case 1:
+			pos = ms_read_u16(buf, pos, end, &msg->rows);
+			break;
+		case 2:
+			pos = ms_read_u16(buf, pos, end, &msg->cols);
+			break;
+		case 3:
+			pos = ms_read_u8(buf, pos, end, &msg->flags);
+			break;
+		case 4:
+			pos = ms_read_u32(buf, pos, end, &msg->client_id);
+			break;
+		case 5:
+			{
+				const uint8_t *_tmp;
+
+				pos = ms_read_bytes(buf, pos, end,
+				    &_tmp, 65535, &msg->name_len);
+				msg->name = (const char *)_tmp;
+			}
+			break;
+		default:
+			pos = ms_skip(buf, pos, end, tag & 7);
+			break;
+		}
+		if (pos < 0)
+			return -1;
+	}
+	return end;
+}
+
+int
+ipc_attach_reply_encode(const struct ipc_attach_reply *msg, uint8_t *buf, int len)
+{
+	int pos = 2;
+
+	pos = ms_write_tag_u16(buf, pos, len, 1, msg->rows);
+	if (pos < 0)
+		return -1;
+	pos = ms_write_tag_u16(buf, pos, len, 2, msg->cols);
+	if (pos < 0)
+		return -1;
+	pos = ms_write_tag_u8(buf, pos, len, 3, msg->role);
+	if (pos < 0)
+		return -1;
+	pos = ms_write_tag_u8(buf, pos, len, 4, msg->nclients);
+	if (pos < 0)
+		return -1;
+
+	buf[0] = (uint8_t)((pos - 2) & 0xff);
+	buf[1] = (uint8_t)(((pos - 2) >> 8) & 0xff);
+	return pos;
+}
+
+int
+ipc_attach_reply_decode(struct ipc_attach_reply *msg, const uint8_t *buf, int len)
+{
+	int end, pos = 2;
+
+	if (len < 2)
+		return -1;
+	end = (int)((uint16_t)buf[0] | ((uint16_t)buf[1] << 8)) + 2;
+	if (end > len)
+		return -1;
+	memset(msg, 0, sizeof(*msg));
+
+	while (pos < end) {
+		uint8_t tag = buf[pos++];
+
+		switch (tag >> 3) {
+		case 1:
+			pos = ms_read_u16(buf, pos, end, &msg->rows);
+			break;
+		case 2:
+			pos = ms_read_u16(buf, pos, end, &msg->cols);
+			break;
+		case 3:
+			pos = ms_read_u8(buf, pos, end, &msg->role);
+			break;
+		case 4:
+			pos = ms_read_u8(buf, pos, end, &msg->nclients);
+			break;
+		default:
+			pos = ms_skip(buf, pos, end, tag & 7);
+			break;
+		}
+		if (pos < 0)
+			return -1;
+	}
+	return end;
+}
+
+int
 ipc_win_id_encode(const struct ipc_win_id *msg, uint8_t *buf, int len)
 {
 	int pos = 2;
