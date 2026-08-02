@@ -249,9 +249,10 @@ state_write(struct sessdir_state *st, pid_t focus,
 		return -1;
 	}
 
-	/* reopen the fd to pick up the new inode */
+	/* reopen the fd to pick up the new inode; read-only for the same
+	 * reason as the initial open above */
 	close(st->fd);
-	st->fd = open(st->path, O_RDWR | O_CREAT, 0600);
+	st->fd = open(st->path, O_RDONLY | O_CREAT, 0600);
 	return st->fd < 0 ? -1 : 0;
 }
 
@@ -356,7 +357,15 @@ sessdir_state_open(const char *session)
 	}
 	free(sess_path);
 
-	st->fd = open(st->path, O_RDWR | O_CREAT, 0600);
+	/* only ever used for flock() plus read(): actual writes go
+	 * through state_write()'s own temp file and rename(), never
+	 * through this fd, so it needs no write access. O_RDWR here
+	 * would make every reader's close() raise IN_CLOSE_WRITE on the
+	 * session directory -- which sessdir_watch_start() watches for
+	 * specifically to catch a file rewritten in place -- retriggering
+	 * on_sessdir_watch() forever, since it itself reads state via
+	 * mconn_refresh() -> mconn_sync_winlist() on every firing. */
+	st->fd = open(st->path, O_RDONLY | O_CREAT, 0600);
 	if (st->fd < 0) {
 		free(st);
 		return NULL;

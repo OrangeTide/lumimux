@@ -4,6 +4,21 @@
 
 # DONE
 
+- [x] lumi attach hangs and pegs the CPU at 100%, slowing down the whole
+      system, on nothing more than an ordinary two-client attach (one
+      WRITE, one auto-demoted VIEW). `sessdir_state_open()` opened
+      `<session>/state` with `O_RDWR`, but that fd is only ever used for
+      `flock()` plus `read()`; real writes go through a separate temp
+      file and `rename()`. Closing that needlessly write-capable fd
+      raised `IN_CLOSE_WRITE` on the session directory -- watched
+      specifically to catch a file rewritten in place -- and
+      `on_sessdir_watch()`'s own handler reads `state` again on every
+      firing, so every firing triggered another one: an unconditional,
+      unbounded busy loop from the moment a second client attached,
+      unrelated to role or multi-writer mode. Opening the fd `O_RDONLY`
+      fixes it; genuine state changes still land via `rename()`, already
+      in the watch mask.
+
 - [x] in GNOME terminal: the numbered lists display in Claude CLI while inside
       lumi show up as blank, instead of:
       ```
