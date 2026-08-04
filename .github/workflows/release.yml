@@ -24,7 +24,7 @@ jobs:
           - arch: x86_64
             march: x86-64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
@@ -77,19 +77,19 @@ jobs:
           echo "deb=$(ls lumimux_*.deb)" >> "$GITHUB_OUTPUT"
 
       - name: Upload bare binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lumi-linux-${{ matrix.arch }}
           path: ${{ env.LUMI_BIN }}
 
       - name: Upload tarball
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tarball-linux-${{ matrix.arch }}
           path: ${{ steps.package.outputs.tarball }}
 
       - name: Upload .deb
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: deb-linux-${{ matrix.arch }}
           path: ${{ steps.deb.outputs.deb }}
@@ -99,7 +99,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           merge-multiple: true
 

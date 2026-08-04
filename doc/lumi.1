@@ -52,6 +52,11 @@ Create a new session and attach to it.
 .TP
 .B \-A
 If the session already exists, reattach to it instead of failing.
+The reattach takes the session over, the same as a plain
+.BR "lumi attach" ;
+there is no way to join a session from here, use
+.B "lumi attach \-x"
+for that.
 .TP
 .B \-d
 Detach mode.
@@ -81,15 +86,29 @@ Attach to an existing session.
 .RB [ "\-m mode" ]
 .RB [ \-n ]
 .RB [ \-v ]
+.RB [ \-x ]
 .RB [ \-F ]
 .RB [ \-V ]
 .RB [ "\-s name" ]
 .RI [ name ]
 .PP
-Several clients may be attached to one session at the same time.
+By default an attach takes the session over: any client already attached is
+told to detach, and this client gets the keyboard.
+Attaching to a session usually means wanting to work in it rather than
+wanting to watch someone else work in it.
+.PP
+Several clients may be attached to one session at the same time instead.
+.B \-x
+asks for that, and so does
+.BR \-v .
 One of them holds the keyboard; the others watch.
 The client that attaches first holds it, and it passes to another attached
 client if that one leaves.
+.B "lumi share \-M multi-writer"
+lifts the one-keyboard rule for a session, and a session in that mode is
+never taken over: a plain attach joins it as though
+.B \-x
+had been given.
 .TP
 .BI \-f " window"
 Focus the given window (by server PID) after startup.
@@ -106,9 +125,9 @@ The session is displayed and followed live, but nothing typed here reaches
 it, and the window is neither resized nor killed by this client.
 Scrollback, copy mode, the window list, and the menus all work as usual,
 since they are local to this client.
-Without this flag a client asks for the keyboard and is given it only if no
-other client holds it, so an attach that finds one already there becomes
-read-only and says so.
+This implies
+.BR \-x :
+a client that came to watch does not displace the client it came to watch.
 .IP
 A read-only client does not take part in deciding the window size.
 A window has one size and its clients may have several, so the smallest
@@ -126,6 +145,21 @@ That is usually the point of watching.
 turns the following off.
 A client that is read-only only because someone else got there first keeps
 its own view either way, since it did not ask to watch.
+.TP
+.B \-x
+Share the session instead of taking it over.
+The clients already attached stay attached, and this one asks for the
+keyboard rather than taking it: in single-writer mode it gets the keyboard
+only if nobody holds it, and otherwise attaches read-only and says so.
+Use
+.B "lumi share"
+or the share menu to move the keyboard afterwards.
+.IP
+Unlike
+.BR \-v ,
+a client attached this way did not ask to watch, so it keeps its own focus
+and layout rather than following the client holding the keyboard, and it is
+given the keyboard as soon as the holder leaves.
 .TP
 .B \-F
 Do not follow the client holding the keyboard.
@@ -231,14 +265,46 @@ or
 .B .
 are always treated as local.
 .SS lumi detach
-Detach a client from its session.
+Detach clients from a session, without attaching to it.
 .PP
 .B lumi detach
 .RB [ "\-s name" ]
+.RB [ "\-c id" ]
+.PP
+With no
+.B \-c
+every client attached to the session is told to detach, which is how a
+session that has been left shared is made private again from another
+terminal.
+The session and the programs running in it are untouched; only the clients
+watching it go.
+.PP
+Detaching is cooperative.
+Each client acts on the request when it next reads the session directory,
+so this waits a moment for them and reports any that did not go.
+A client attached through a broker (a cross-user client, or
+.BR "lumi attach \-n" )
+does not read that directory and is not detached this way.
 .TP
 .BI \-s " name"
 Session name (default:
 .BR 0 ).
+.TP
+.BI \-c " id"
+Detach just this client, by the id
+.B "lumi share \-l"
+prints.
+The keyboard passes to another attached client if there is one.
+.PP
+This command moves clients, not settings.
+A session left in multi-writer mode stays in it, and the next client to
+attach shares it again rather than taking it over.
+.B "lumi share \-M single\-writer"
+turns that off, and
+.B "lumi share \-L"
+closes the session to further clients.
+Setting single-writer and then detaching everyone is how a session that was
+shared by accident is made private again from another terminal.
 .SS lumi share
 Show the clients attached to a session, and move the keyboard between them.
 .PP
@@ -260,8 +326,17 @@ Show the clients attached to a session, and move the keyboard between them.
 .RB "{" "\-u user" \||\| "\-G group" \||\| \-B "}"
 .PP
 By default one client at a time holds the keyboard; the rest watch.
+Sharing has to be asked for, since a plain
+.B "lumi attach"
+takes the session over instead of joining it: see
+.B \-x
+and
+.B \-v
+under
+.BR "lumi attach" .
 .B \-M multi\-writer
-lifts that, letting every attached client type (see below).
+lifts the one-keyboard rule, letting every attached client type (see
+below).
 The client ids printed by
 .B \-l
 are what the other options take.
@@ -346,6 +421,12 @@ In
 .B multi\-writer
 mode a client asking to type is granted it even while another client
 already holds it; nobody already typing is demoted.
+A session in this mode is also never taken over: a plain
+.B "lumi attach"
+joins it as though
+.B \-x
+had been given, since displacing the other clients would defeat the
+setting.
 Takes effect for the next client that attaches, including a client that
 reattaches; it does not retroactively change the role of a client already
 attached, which stays as it was until it reattaches or is given the
@@ -758,6 +839,18 @@ y	Sync internal clipboard to system
 :	Open the command input line
 l, Ctrl\-L	Redisplay (resync and repaint the screen)
 .TE
+.PP
+The
+.B session picker
+moves this client to another session.
+Unlike
+.BR "lumi attach" ,
+it joins that session rather than taking it over: the clients already
+there stay, and this one gets the keyboard only if nobody holds it.
+Moving between sessions is looking in on them, and a key that moves this
+client is not a request to end someone else's.
+Ask for the keyboard from the share menu, or take the session over by
+attaching to it in the usual way.
 .PP
 Window numbers are stable: closing a window does not renumber the
 others, so a closed window leaves a gap (a spare number) in the

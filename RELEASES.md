@@ -1,5 +1,104 @@
 # lumiMUX Release Notes
 
+## v26.08.2 -- 2026-08-03
+
+### Attaching takes the session over again
+
+Session sharing arrived in v26.08.0 and took the default with it. A
+second `lumi attach` joined the session as a read-only viewer, and the
+only way to displace the client already there was to look up its id and
+run `lumi share -k`. Attaching to a session almost always means wanting
+to work in it, not wanting to watch someone else work in it, so the
+default is now the other way around.
+
+A plain `lumi attach` asks the clients already attached to detach and
+takes the keyboard. `-x` asks for the old behavior and joins them
+instead, and `-v` still implies it, since a client that came to watch
+should not displace the client it came to watch. A session put into
+multi-writer mode with `lumi share -M` is never taken over either:
+displacing anyone there would defeat the setting.
+
+This is a change in behavior for anyone who was relying on the v26.08.x
+default. Add `-x` to get it back.
+
+### lumi detach did nothing
+
+`lumi detach` connected to each mserver and sent `IPC_MSG_DETACH`, but
+that message disconnects the connection that sent it. The command was
+dropping its own throwaway connection and leaving the attached client
+exactly where it was. It now detaches every client of the session, or a
+single one with `-c id`, which is what makes a session left shared
+recoverable from another terminal without attaching to it.
+
+The session and the programs running in it are untouched either way.
+Only the clients watching go.
+
+### Reaching a client older than the mechanism
+
+Detaching is cooperative: the session directory carries the request and
+each client acts on it when it next reads that directory. A kick
+addressed to every client at once is new in this release, so a client
+that has been attached since before the upgrade does not understand it,
+and a long-lived session is exactly where such a process lives.
+`sessdir_kick_others()` therefore follows the broadcast with one kick
+addressed to each client by id, a form every client back to the first
+sharing release understands, and waits for each process to go before
+posting the next. The mailbox holds one message at a time, so posting
+the next kick early would take it away from the client it was addressed
+to.
+
+A message keeps no record of who was present when it was posted, and
+`control.msg` holds the last one indefinitely, so a client now ignores
+whatever a session was saying before it joined. It always did that at
+startup; it now does it when switching sessions too, where carrying the
+sequence number from the session it left meant comparing two unrelated
+counters and could act on a kick posted before it arrived.
+
+### Switching sessions
+
+The session picker joins the session it moves to rather than taking it
+over. Attaching and switching are different acts: one arrives at a
+session to work in it, the other looks in on one, and a key that moves
+this client is not a request to end somebody else's. The keyboard comes
+only if nobody holds it, and is asked for through the share menu if
+somebody does.
+
+Making the switch join uncovered two bugs that taking over had hidden,
+by removing the other client before either could matter. The client kept
+claiming the write token it had just released, so the servers in the
+session it joined took the keyboard off whoever held it. Announcing that
+demotion then reached the joining client ahead of its own
+`ATTACH_REPLY`, which it reads as the first message after `ATTACH`, so
+it declared the window unresponsive and ended up attached to nothing at
+all, having spawned a stray window on the way. A connection is now told
+nothing until its reply is queued, and a client reads past anything that
+arrives ahead of the reply, which is what lets it join a session whose
+servers predate the fix.
+
+A client that switches now also appears in the roster of the session it
+joined, which it did not before: it had left the old session's roster
+and joined no new one.
+
+### Release build
+
+The v26.08.0 release build failed a test and published no artifacts. The
+mserver test that proves a stalled client is dropped lowered the drop cap
+to 64 KiB but left the watermarks that pause and resume PTY reads at
+their production 1 MiB and 256 KiB, which inverted the order the two
+mechanisms have in a real session. The throttle could never engage before
+the cap, so the client that was keeping up survived only while the test
+was scheduled often enough to drain it, and on a small shared runner it
+was not. The watermarks are now variables the test brings down together
+with the cap.
+
+Also in this release: the vendored build system moves to modular-make
+v1.8.8, which adds the `-L` for `LIBDIR` only when the project builds
+shared libraries. lumi builds none, so the flag leaves the link line
+entirely, and with it a warning from Apple's linker about a search path
+that does not exist.
+
+---
+
 ## v26.06.0 -- 2026-06-02
 
 ### mserver robustness under load

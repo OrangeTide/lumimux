@@ -9,6 +9,7 @@
 #include "sessdir_layout.h"
 
 #include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -778,6 +779,101 @@ test_ctl_messages(void)
 	printf("ok\n");
 }
 
+/* Each session counts its control messages from 1, independently of every
+ * other session. A client that carries the sequence it last acted on from
+ * one session into another therefore compares two unrelated counters, and
+ * a "kick everyone" left behind in the session it joins is a message that
+ * ends the client. attach.c resyncs on every join for this reason; this
+ * pins down the property that makes the resync necessary. */
+static void
+test_ctl_seq_is_per_session(void)
+{
+	struct sessdir_ctl m;
+
+	printf("  control sequences are per session ... ");
+	sessdir_session_create("seqa");
+	sessdir_session_create("seqb");
+
+	CHECK(sessdir_ctl_post("seqa", SESSDIR_CTL_KICK, 0, 11, "a") == 0,
+	    "post to seqa failed");
+	CHECK(sessdir_ctl_post("seqa", SESSDIR_CTL_KICK, 0, 11, "a") == 0,
+	    "second post to seqa failed");
+	CHECK(sessdir_ctl_read("seqa", &m) == 0 && m.seq == 2,
+	    "seqa should have reached 2");
+
+	CHECK(sessdir_ctl_post("seqb", SESSDIR_CTL_KICK, 0, 22, "b") == 0,
+	    "post to seqb failed");
+	CHECK(sessdir_ctl_read("seqb", &m) == 0 && m.seq == 1,
+	    "seqb should start at 1, not continue seqa");
+	printf("ok\n");
+}
+
+static void
+test_kick_others(void)
+{
+	struct sessdir_client c;
+	struct sessdir_ctl m;
+	pid_t dead, stubborn;
+	int status;
+
+	printf("  a kick reaches every client but the one asking ... ");
+	sessdir_session_create("kick");
+
+	/* the client doing the asking stays: it is taking the session
+	 * over, not leaving it */
+	memset(&c, 0, sizeof(c));
+	c.client_id = (unsigned long)getpid();
+	c.pid = getpid();
+	snprintf(c.name, sizeof(c.name), "me@host");
+	snprintf(c.role, sizeof(c.role), "view");
+	CHECK(sessdir_client_register("kick", &c) == 0, "register failed");
+
+	CHECK(sessdir_kick_others("kick", (unsigned long)getpid(),
+	    "me@host", 100) == 0, "the actor should not be kicked");
+	CHECK(sessdir_ctl_read("kick", &m) == 0, "no message posted");
+	CHECK(m.verb == SESSDIR_CTL_KICK && m.target == 0,
+	    "expected a kick addressed to everyone");
+
+	/* an entry left behind by a client that is already gone is not
+	 * something to wait for */
+	dead = fork();
+	if (dead == 0)
+		_exit(0);
+	waitpid(dead, &status, 0);
+	memset(&c, 0, sizeof(c));
+	c.client_id = (unsigned long)dead;
+	c.pid = dead;
+	snprintf(c.name, sizeof(c.name), "gone@host");
+	CHECK(sessdir_client_register("kick", &c) == 0, "register failed");
+	CHECK(sessdir_kick_others("kick", (unsigned long)getpid(),
+	    "me@host", 100) == 0, "a dead client should not count");
+
+	/* one that stays is reported rather than waited on forever, and is
+	 * addressed by id: a client too old to know the broadcast is the
+	 * reason the per-client pass exists */
+	stubborn = fork();
+	if (stubborn == 0) {
+		sleep(30);
+		_exit(0);
+	}
+	memset(&c, 0, sizeof(c));
+	c.client_id = (unsigned long)stubborn;
+	c.pid = stubborn;
+	snprintf(c.name, sizeof(c.name), "stays@host");
+	CHECK(sessdir_client_register("kick", &c) == 0, "register failed");
+	CHECK(sessdir_kick_others("kick", (unsigned long)getpid(),
+	    "me@host", 100) == 1, "a client that stayed was not reported");
+	CHECK(sessdir_ctl_read("kick", &m) == 0, "no message posted");
+	CHECK(m.verb == SESSDIR_CTL_KICK &&
+	    m.target == (unsigned long)stubborn,
+	    "expected a kick addressed to the client that stayed");
+
+	kill(stubborn, SIGKILL);
+	waitpid(stubborn, &status, 0);
+	sessdir_client_unregister("kick", (unsigned long)getpid());
+	printf("ok\n");
+}
+
 static void
 test_share_lock(void)
 {
@@ -928,6 +1024,8 @@ main(void)
 	test_client_prune();
 	test_client_name_sanitized();
 	test_ctl_messages();
+	test_ctl_seq_is_per_session();
+	test_kick_others();
 	test_share_lock();
 	test_share_mode();
 	test_share_display();

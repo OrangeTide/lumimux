@@ -262,6 +262,60 @@ sessdir_ctl_post(const char *session, int verb, unsigned long target,
 	return 0;
 }
 
+/* How long a client is given to notice a kick, and how often its pid is
+ * checked while it does. A client acts on the message when the session
+ * directory changes, so this is normally over in one or two ticks; the
+ * poll fallback for a system with no watch is what the rest is for. */
+#define KICK_TICK_MS	25
+
+static int
+client_gone(pid_t pid)
+{
+	if (pid <= 0)
+		return 1;
+	return kill(pid, 0) < 0 && errno == ESRCH;
+}
+
+int
+sessdir_kick_others(const char *session, unsigned long actor,
+    const char *name, int wait_ms)
+{
+	struct sessdir_client roster[SESSDIR_CLIENT_MAX];
+	int n, i, budget, left = 0;
+
+	n = sessdir_client_list(session, roster, SESSDIR_CLIENT_MAX);
+	if (n < 0)
+		return -1;
+	budget = wait_ms / KICK_TICK_MS;
+	sessdir_ctl_post(session, SESSDIR_CTL_KICK, 0, actor, name);
+	for (i = 0; i < n; i++) {
+		if (roster[i].client_id == actor)
+			continue;
+		if (client_gone(roster[i].pid))
+			continue;	/* left on the broadcast, or stale */
+		if (sessdir_ctl_post(session, SESSDIR_CTL_KICK,
+		    roster[i].client_id, actor, name) < 0)
+			continue;
+		while (budget > 0 && !client_gone(roster[i].pid)) {
+			usleep(KICK_TICK_MS * 1000);
+			budget--;
+		}
+	}
+
+	/* Count at the end rather than as we go. The budget is shared, so a
+	 * client that will not leave can use all of it and the ones after
+	 * it are posted a kick and never waited for; counting those as
+	 * refusals would report clients that simply have not had a moment
+	 * yet. What the caller asked is how many are still here. */
+	for (i = 0; i < n; i++) {
+		if (roster[i].client_id == actor)
+			continue;
+		if (!client_gone(roster[i].pid))
+			left++;
+	}
+	return left;
+}
+
 /* ---- attach lock ---- */
 
 int

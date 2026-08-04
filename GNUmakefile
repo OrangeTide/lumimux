@@ -1,5 +1,5 @@
-# modular-make -- A modular GNUmakefile for C, C++, D, Fortran, Objective-C, Objective-C++, Pascal, Modula-2, and Assembly projects [v1.8.7]
-# updated: 20 Jul 2026
+# modular-make -- A modular GNUmakefile for C, C++, D, Fortran, Objective-C, Objective-C++, Pascal, Modula-2, and Assembly projects [v1.8.8]
+# updated: 3 Aug 2026
 # Requires GNU Make 3.81 or later.  compile_commands.json needs the $(file)
 # function (GNU Make 4.0); it is skipped on 3.81.
 #
@@ -835,7 +835,10 @@ endef
 EXTENSIONS := c cc cpp d m mm f f90 S asm pas mod
 
 # Command Macros
-link.c      = $(_quiet.ld)$(MKDIR_P) $(@D) && $(if $(CXX_MODE),$(CXX),$(CC)) -o $@ $(_BUILD_MODE_LDFLAGS) $(PROJECT_LDFLAGS) $(LDFLAGS) $(if $(LIBDIR),-L$(LIBDIR)) $^ $(PROJECT_LDLIBS) $(LDLIBS)
+# $(LIBDIR) only ever holds shared libraries built from SHARED_LIBS, so the
+# search path is added only when there are any.  Apple's ld warns about a
+# -L that names a directory which does not exist.
+link.c      = $(_quiet.ld)$(MKDIR_P) $(@D) && $(if $(CXX_MODE),$(CXX),$(CC)) -o $@ $(_BUILD_MODE_LDFLAGS) $(PROJECT_LDFLAGS) $(LDFLAGS) $(if $(SHARED_LIBS),-L$(LIBDIR)) $^ $(PROJECT_LDLIBS) $(LDLIBS)
 link.a      = $(_quiet.ar)$(MKDIR_P) $(@D) && $(RM) $@.tmp && $(AR) $(ARFLAGS) $@.tmp $(filter %.o,$^) $(_ar_redir) && mv -f $@.tmp $@
 link.so     = $(_quiet.so)$(MKDIR_P) $(@D) && $(if $(CXX_MODE),$(CXX),$(CC)) -shared -o $@ $(_BUILD_MODE_LDFLAGS) $(PROJECT_LDFLAGS) $(LDFLAGS) $^ $(PROJECT_LDLIBS) $(LDLIBS)
 compile.c   = $(_quiet.cc)$(MKDIR_P) $(@D) && $(CC) -c -o $@ $< -MMD -MP -MF $(@:.o=.dep) $(_BUILD_MODE_CFLAGS) $(_BUILD_MODE_CPPFLAGS) $(PROJECT_CFLAGS) $(PROJECT_CPPFLAGS) $(CFLAGS) $(CPPFLAGS)

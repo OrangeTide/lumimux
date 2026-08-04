@@ -29,7 +29,7 @@ Information for developers working on lumimux.
 | src/libwm/           | Overlapping window manager compositor (z-order, hit test) |
 | src/cmd/attach/      | lumi-attach -- connect to server, relay I/O, menu overlay |
 | src/cmd/attr/        | lumi-attr -- get/set/delete per-session attributes        |
-| src/cmd/detach/      | lumi-detach -- tell server to detach a client             |
+| src/cmd/detach/      | lumi-detach -- detach clients from a session              |
 | src/cmd/kill/        | lumi-kill -- terminate a session                          |
 | src/cmd/list/        | lumi-list -- list active sessions                         |
 | src/cmd/mserver/     | lumi-mserver -- single-PTY micro-server (one per window)  |
@@ -292,6 +292,43 @@ the child shell's environment. `lumi-attach` checks this variable at
 startup to prevent recursive attach (which would deadlock).
 
 ## Client Roles and Coupling
+
+### Takeover vs. Sharing
+
+Sharing is opt-in. A plain `lumi attach` takes the session over: the
+clients already attached detach and the new one gets the keyboard.
+`client_claim_role()` (`attach.c`) runs before the first `ATTACH` goes out,
+tries `sessdir_token_acquire()`, and on failure calls `client_takeover()`
+unless the client asked to join (`-x`, `share_join`) or asked to watch
+(`-v`, `IPC_ATTACH_F_VIEW`), or the session is in multi-writer mode.
+
+Its `may_take_over` argument is what separates attaching from switching.
+`micro_switch_session()` passes 0: moving this client to another session
+joins that session, since a key that moves this client is not a request to
+end anybody else's, and the picker gives no warning that it might. That
+also keeps the switch path off the blocking wait below, which matters
+because it runs inside the event loop where startup does not.
+
+`client_takeover()` calls `sessdir_kick_others()` (`libsessdir`) and then
+retries the token acquire. The token is an `flock` held for the lifetime of
+the holder, so the acquire only succeeds once that process is gone, which
+is why the takeover waits rather than assuming. Blocking there is safe: it
+only runs before the event loop starts. A client reached through a broker
+does not read this session directory and so is not displaced; the takeover
+then fails and the new client attaches read-only with a notice saying so.
+
+`sessdir_kick_others()` posts a `SESSDIR_CTL_KICK` addressed to every
+client at once (`target = 0`, honored by `share_ctl_poll()` as "everyone
+but the actor"), then walks the roster posting one addressed to each
+client in turn, waiting for its pid to go before posting the next. Both
+passes are needed. The broadcast is the fast path, but target 0 is newer
+than the sessions it has to work on: a client that has been attached since
+before the last upgrade only understands a kick addressed to it by id, and
+a long-lived session is exactly where such a process lives. The per-client
+posts are serialized because the mailbox holds one message, so posting the
+next before the current one has been read would take it away from the
+client it was addressed to. `lumi detach` is the same call with actor 0,
+and `lumi share -k` / `lumi detach -c` post a single addressed kick.
 
 ### Single-Writer vs. Multi-Writer
 

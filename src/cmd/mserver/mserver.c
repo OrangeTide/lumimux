@@ -103,12 +103,11 @@ write_to_pty(const char *data, size_t len)
 
 #define MCLIENT_MAX	MSERVER_CLIENT_MAX
 
-#define OUTQ_HIGH_WATER	(1u << 20)		/* 1 MiB */
-#define OUTQ_LOW_WATER	(256u * 1024)		/* 256 KiB */
-
 /* see mserver.h: variables so a test can lower them before startup */
 size_t mserver_outq_hard_limit = 4u << 20;	/* 4 MiB: drop, not throttle */
 int mserver_stall_secs = 10;			/* no progress for this long */
+size_t mserver_outq_high_water = 1u << 20;	/* 1 MiB: pause PTY reads */
+size_t mserver_outq_low_water = 256u * 1024;	/* 256 KiB: resume them */
 
 struct mclient {
 	int		fd;		/* -1 when the slot is free */
@@ -128,6 +127,14 @@ struct mclient {
 	uint16_t	rows, cols;	/* the size this client asked for */
 	char		name[64];	/* display only, never a decision */
 	time_t		last_deny;	/* rate limit for refusal messages */
+
+	/* ATTACH_REPLY has been queued, so this connection may be told
+	 * about the session. Until then it is still handshaking and
+	 * expects its reply first: anything sent ahead of that arrives
+	 * where the client is looking for the reply and costs it the
+	 * window. Granting the keyboard is what makes this reachable,
+	 * since demoting the previous holder announces itself. */
+	int		ready;
 
 	/* 13-b: a bracketed multi-message input run (INPUT_BEGIN..INPUT_END)
 	 * is buffered here and flushed to the PTY as one write, so another
@@ -189,6 +196,7 @@ mclient_alloc(int fd)
 			clients[i].rows = clients[i].cols = 0;
 			clients[i].name[0] = '\0';
 			clients[i].last_deny = 0;
+			clients[i].ready = 0;
 			return &clients[i];
 		}
 	}
@@ -342,7 +350,7 @@ mclient_flush(struct mclient *mc)
 	else if (!mc->stall_since)
 		mc->stall_since = time(NULL);
 
-	if (mc->hiwater && mclient_pending(mc) <= OUTQ_LOW_WATER) {
+	if (mc->hiwater && mclient_pending(mc) <= mserver_outq_low_water) {
 		mc->hiwater = 0;
 		update_master_interest();
 	}
@@ -401,7 +409,7 @@ mclient_enqueue(struct mclient *mc, uint32_t type, const void *payload,
 		return;			/* sized above; should not happen */
 	mc->outq_len += (size_t)n;
 
-	if (!mc->hiwater && mclient_pending(mc) >= OUTQ_HIGH_WATER) {
+	if (!mc->hiwater && mclient_pending(mc) >= mserver_outq_high_water) {
 		mc->hiwater = 1;
 		update_master_interest();
 	}
@@ -567,7 +575,7 @@ client_event(struct mclient *about, uint8_t kind)
 
 	for (mc = mclient_first(); mc; mc = next) {
 		next = mclient_next(mc);
-		if (mc == about)
+		if (mc == about || !mc->ready)
 			continue;
 		mclient_enqueue(mc, IPC_MSG_CLIENT_EVENT, buf,
 		    (uint32_t)(5 + nlen));
@@ -1167,6 +1175,7 @@ on_new_client(struct iox_loop *lp, int fd, unsigned events, void *arg)
 			mclient_enqueue(mc, IPC_MSG_ATTACH_REPLY, sbuf,
 			    (uint32_t)sn);
 	}
+	mc->ready = 1;
 	send_replay(mc);
 
 	/* and tell the others who just arrived */

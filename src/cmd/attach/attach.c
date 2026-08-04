@@ -227,6 +227,11 @@ static struct iox_loop *ui_loop;
 static uint8_t client_role = IPC_ROLE_WRITE;
 static uint8_t client_attach_flags;	/* what we ask each server for */
 
+/* -x: attach alongside whoever is already there instead of displacing
+ * them. Without it an attach takes the session over, which is what a
+ * person reattaching to their own work almost always means. */
+static int share_join;
+
 /* Writers currently in the roster, kept in step with share_marker_update()
  * rather than rescanned per keystroke. Defaults to 1 ("just me") whenever
  * the roster is not something this process can see, so prediction stays on
@@ -4909,6 +4914,12 @@ on_stdin_read(struct iox_loop *loop, int fd, unsigned events, void *arg)
  * directory even after the server stops servicing it). */
 #define MCONN_HANDSHAKE_TIMEOUT 5
 
+/* how many messages may arrive ahead of the ATTACH_REPLY before the server
+ * is treated as talking about something else entirely. A server sends at
+ * most one presence event per other client, and the socket timeout above
+ * bounds the wait regardless of this count. */
+#define MCONN_HANDSHAKE_SKIP_MAX 8
+
 /* ---- shared attach identity ----
  *
  * One attach process is one client, however many windows it connects to.
@@ -5043,6 +5054,42 @@ client_roster_update(void)
 	share_marker_update();
 }
 
+/* Take the session over from the clients already attached.
+ *
+ * The token is an advisory lock held for the lifetime of the holding
+ * process, so the only way to get it from a live client is for that client
+ * to leave. Ask the others to detach, then wait for the lock to come free.
+ * The wait is bounded, and blocking through it is safe: this only runs
+ * before the event loop starts, so nothing else needs the time.
+ *
+ * Only tier-0 clients act on the message, since a client reached through a
+ * broker does not read this session directory. A remote client therefore
+ * keeps watching rather than being detached, and we stay read-only.
+ *
+ * Returns 0 when the token is ours, -1 when it is still held.
+ */
+#define TAKEOVER_WAIT_MS	1500
+#define TAKEOVER_TRIES		8
+#define TAKEOVER_DELAY_US	25000
+
+static int
+client_takeover(int wait_ms)
+{
+	int i;
+
+	sessdir_kick_others(session_name, client_id, client_name, wait_ms);
+	/* the lock goes with the process, so it is normally free the
+	 * moment the last client is, but a client can also be on its way
+	 * out without being the holder: keep asking for a moment */
+	for (i = 0; i < TAKEOVER_TRIES; i++) {
+		if (sessdir_token_acquire(session_name, client_id,
+		    client_name) == 0)
+			return 0;
+		usleep(TAKEOVER_DELAY_US);
+	}
+	return -1;
+}
+
 /* Decide our role before attaching to anything.
  *
  * The keyboard is one thing per session, so the decision cannot be left to
@@ -5051,7 +5098,7 @@ client_roster_update(void)
  * keyboard; everyone else asks to watch. The servers still enforce it,
  * which is what stops a client that lies about the token. */
 static void
-client_claim_role(void)
+client_claim_role(int may_take_over, int takeover_wait_ms)
 {
 	char holder[64];
 
@@ -5066,6 +5113,30 @@ client_claim_role(void)
 		 * keyboard to a client attaching alongside us has to hand
 		 * it over, or the session ends up split window by window */
 		client_attach_flags |= IPC_ATTACH_F_TOKEN;
+		return;
+	}
+
+	/* Someone else holds it. Attaching to a session usually means
+	 * wanting to work in it, not wanting to watch someone else work in
+	 * it, so the client arriving takes it over and the ones already
+	 * there detach. Three things say otherwise: -x, which asks to join
+	 * them; a session put in multi-writer mode on purpose, where
+	 * everyone types and displacing anybody would defeat the setting;
+	 * and a caller that is not attaching at all, which is what
+	 * may_take_over is for -- switching to a session is looking in on
+	 * one, not arriving at it, and nobody expects a key that moves
+	 * this client to end somebody else's.
+	 */
+	if (may_take_over && !share_join &&
+	    sessdir_share_mode_get(session_name) !=
+	    SESSDIR_SHARE_MULTI_WRITER) {
+		if (client_takeover(takeover_wait_ms) == 0) {
+			client_attach_flags |= IPC_ATTACH_F_TOKEN;
+			return;
+		}
+		client_role = IPC_ROLE_VIEW;
+		notice_show("attached read-only: the other client did not "
+		    "detach");
 		return;
 	}
 
@@ -5101,6 +5172,27 @@ client_claim_role(void)
 static unsigned long ctl_seq_seen;	/* last control message acted on */
 static unsigned long ctl_request_id;	/* client waiting for our answer */
 static char ctl_request_name[64];
+
+/* Ignore whatever the session was saying before we joined it.
+ *
+ * A kick or a grant is an instruction to whoever was there at the time,
+ * and control.msg keeps the last one indefinitely, so a client that
+ * arrives later must not act on it. The sequence is per session and each
+ * one counts from 1, which is the other half of the reason this has to be
+ * called on every join: comparing a new session's sequence against the
+ * number reached in the old one otherwise decides by accident, and a stale
+ * "kick everyone" is a message that ends the client.
+ */
+static void
+ctl_seq_sync(void)
+{
+	struct sessdir_ctl m;
+
+	ctl_seq_seen = 0;
+	if (!is_remote && session_name &&
+	    sessdir_ctl_read(session_name, &m) == 0)
+		ctl_seq_seen = m.seq;
+}
 
 /* tell every server what we are claiming now */
 static void
@@ -5281,7 +5373,12 @@ share_ctl_poll(struct iox_loop *lp)
 		break;
 
 	case SESSDIR_CTL_KICK:
-		if (m.target == client_id) {
+		/* target 0 is everyone but the client that posted it: one
+		 * message displaces a whole session, which is what an
+		 * attach taking over needs and what a kick addressed to a
+		 * single client cannot do without a post per client */
+		if (m.target == client_id ||
+		    (m.target == 0 && m.actor != client_id)) {
 			dbg_trace("detaching: kicked by %s\n", m.name);
 			if (lp)
 				iox_loop_stop(lp);
@@ -5846,8 +5943,30 @@ mconn_discover(struct iox_loop *lp)
 				continue;
 			}
 		}
-		if (ipc_msg_recv(fd, &rtype, rbuf, sizeof(rbuf),
-		    &rlen) != 0 || rtype != IPC_MSG_ATTACH_REPLY) {
+		/* The reply comes first, but a server can have something
+		 * else queued to us by the time it answers: an older one
+		 * announces a role change to every client the moment our
+		 * token claim demotes somebody, this connection included.
+		 * Read past what arrives ahead of the reply rather than
+		 * calling the window unresponsive and losing it. Nothing
+		 * skipped here is needed, since the reply and the replay
+		 * that follows carry the state it described.
+		 */
+		{
+			int skipped;
+
+			for (skipped = 0; skipped <= MCONN_HANDSHAKE_SKIP_MAX;
+			    skipped++) {
+				if (ipc_msg_recv(fd, &rtype, rbuf,
+				    sizeof(rbuf), &rlen) != 0) {
+					rtype = 0;
+					break;
+				}
+				if (rtype == IPC_MSG_ATTACH_REPLY)
+					break;
+			}
+		}
+		if (rtype != IPC_MSG_ATTACH_REPLY) {
 			/* unresponsive: skip this window rather than hang.
 			 * the other windows still attach normally. */
 			log_warn("window %ld not responding, skipping",
@@ -7130,8 +7249,25 @@ micro_switch_session(struct iox_loop *loop, const char *name)
 	free(session_name);
 	session_name = strdup(name);
 	client_role = IPC_ROLE_WRITE;
-	client_attach_flags &= (uint8_t)~IPC_ATTACH_F_VIEW;
-	client_claim_role();
+	/* the token was released above along with the old session, so stop
+	 * saying we hold one: claiming it here would tell the new
+	 * session's servers to take the keyboard off whoever has it, which
+	 * is the opposite of joining, and claim a lock this process does
+	 * not hold. client_claim_role() sets it again if it wins the
+	 * token here. */
+	client_attach_flags &= (uint8_t)~(IPC_ATTACH_F_VIEW |
+	    IPC_ATTACH_F_TOKEN);
+	/* joining a session is joining its conversation from here on, not
+	 * from wherever the one we left had got to */
+	ctl_seq_sync();
+	/* join, never take over: a key that moves this client from one
+	 * session to another is not a request to end anyone else's, and
+	 * the picker gives no warning that it might. The keyboard is here
+	 * if nobody holds it, and asked for through the share menu if
+	 * somebody does. Not taking over also keeps this off the blocking
+	 * path, which matters here in a way it does not at startup: this
+	 * runs inside the event loop, where a wait is a frozen screen. */
+	client_claim_role(0, 0);
 
 	/* connect to new session's servers */
 	mconn_discover(loop);
@@ -7202,6 +7338,13 @@ micro_switch_session(struct iox_loop *loop, const char *name)
 		log_warn("sessdir watch unavailable (inotify?); windows from "
 		    "other clients will not appear live");
 	}
+
+	/* take a place in the new session's roster. the entry belonging to
+	 * the session we left was removed above, and without this the
+	 * client is in a session that cannot see it: absent from
+	 * "lumi share -l", and reachable by a kick addressed to everyone
+	 * but not by one addressed to it. */
+	client_roster_update();
 
 	need_render = 1;
 	need_taskbar = 1;
@@ -7460,12 +7603,14 @@ static void
 usage(void)
 {
 	fprintf(stderr,
-	    "usage: lumi-attach [-f window] [-m mode] [-n] [-v] [-F] [-V] "
-	    "[-s name]\n");
+	    "usage: lumi-attach [-f window] [-m mode] [-n] [-v] [-x] [-F] "
+	    "[-V] [-s name]\n");
 	fprintf(stderr,
 	    "  -f window   focus this window (by PID) after startup\n"
 	    "  -m mode     UI mode: screen (default), turbo, minimal\n"
 	    "  -v          attach read-only: watch without typing\n"
+	    "  -x          share: attach alongside the other clients\n"
+	    "              (default: take over, detaching them)\n"
 	    "  -F          do not follow the other client's window and layout\n"
 	    "  -n          connect via the session's net-proxy (netchan)\n"
 	    "  -V          verify the net-proxy's host identity key (with -n)\n"
@@ -7492,7 +7637,7 @@ cmd_attach_main(int argc, char **argv)
 		return 1;
 	}
 
-	while ((opt = getopt(argc, argv, "Ff:m:nvVs:")) != -1) {
+	while ((opt = getopt(argc, argv, "Ff:m:nvxVs:")) != -1) {
 		switch (opt) {
 		case 'f':
 			focus_window = (uint32_t)strtoul(optarg, NULL, 10);
@@ -7511,6 +7656,9 @@ cmd_attach_main(int argc, char **argv)
 			client_attach_flags |= IPC_ATTACH_F_VIEW;
 			client_attach_flags |= IPC_ATTACH_F_MIRROR;
 			client_role = IPC_ROLE_VIEW;
+			break;
+		case 'x':
+			share_join = 1;		/* join, do not displace */
 			break;
 		case 'F':
 			free_view = 1;		/* do not follow */
@@ -7783,18 +7931,12 @@ cmd_attach_main(int argc, char **argv)
 	iox_fd_add(loop, STDIN_FILENO, IOX_READ, on_stdin_read, NULL);
 
 	/* messages posted before we existed are not ours to act on */
-	{
-		struct sessdir_ctl m;
-
-		if (!is_remote && session_name &&
-		    sessdir_ctl_read(session_name, &m) == 0)
-			ctl_seq_seen = m.seq;
-	}
+	ctl_seq_sync();
 
 	/* decide the role before the first ATTACH goes out, so every
 	 * window is asked for the same thing, and the sizing stance with
 	 * it: the handshake carries both */
-	client_claim_role();
+	client_claim_role(1, TAKEOVER_WAIT_MS);
 	if (client_role != IPC_ROLE_WRITE && !share_resize_negotiate)
 		client_attach_flags |= IPC_ATTACH_F_SIZE_OBSERVE;
 

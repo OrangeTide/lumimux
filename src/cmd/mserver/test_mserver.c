@@ -204,6 +204,30 @@ client_expect(int fd, const char *want, int timeout_ms)
 	}
 }
 
+/* drain until nothing has arrived for quiet_ms, or budget_ms runs out.
+ *
+ * A flood leaves a backlog queued for even a client that kept up, and the
+ * question asked next has a deadline on it. Chewing the backlog first is
+ * the difference between measuring whether the client is alive and
+ * measuring how fast the machine can move bytes it no longer cares about. */
+static void
+client_drain_quiet(int fd, int quiet_ms, int budget_ms)
+{
+	char buf[IPC_MAX_PAYLOAD];
+	uint32_t type, len;
+	struct pollfd pfd;
+	time_t deadline = time(NULL) + (budget_ms + 999) / 1000;
+
+	while (time(NULL) <= deadline) {
+		pfd.fd = fd;
+		pfd.events = POLLIN;
+		if (poll(&pfd, 1, quiet_ms) <= 0)
+			return;		/* quiet for long enough */
+		if (ipc_msg_recv(fd, &type, buf, sizeof(buf), &len) != 0)
+			return;		/* gone: the caller will say so */
+	}
+}
+
 /* drain whatever is readable without looking at it */
 static void
 client_drain(int fd)
@@ -339,12 +363,19 @@ test_slow_client_dropped(void)
 {
 	char *path;
 	int good = -1, slow = -1;
-	int i, dropped = 0;
+	int i, rc, dropped = 0;
 
 	TEST("a client that stops reading is dropped, not throttled");
 
-	/* a small limit keeps this test to kilobytes instead of megabytes */
+	/* a small limit keeps this test to kilobytes instead of megabytes.
+	 * the watermarks come down with it and stay in the order they have
+	 * in production, low < high < hard: the throttle has to be able to
+	 * engage before the drop cap, or the client that is keeping up is
+	 * dropped for being descheduled on a busy machine rather than for
+	 * anything this test is about. */
 	mserver_outq_hard_limit = 64 * 1024;
+	mserver_outq_high_water = 16 * 1024;
+	mserver_outq_low_water = 8 * 1024;
 
 	path = server_start();
 	if (!path) {
@@ -393,10 +424,23 @@ test_slow_client_dropped(void)
 		goto out;
 	}
 
-	/* and the client that kept reading is still attached and live */
-	if (client_input(good, "echo LUMI-SURVIVOR\n") < 0 ||
-	    client_expect(good, "LUMI-SURVIVOR", 5000) != 1) {
-		FAIL("the healthy client did not survive");
+	/* and the client that kept reading is still attached and live.
+	 * the two ways this can fail are worth telling apart: a connection
+	 * that is gone means the server dropped a client that was keeping
+	 * up, and a deadline that passes means it is alive but the flood
+	 * did not stop. */
+	client_drain_quiet(good, 200, 5000);
+	if (client_input(good, "echo LUMI-SURVIVOR\n") < 0) {
+		FAIL("the healthy client's connection was already gone");
+		goto out;
+	}
+	rc = client_expect(good, "LUMI-SURVIVOR", 5000);
+	if (rc < 0) {
+		FAIL("the healthy client was dropped");
+		goto out;
+	}
+	if (rc == 0) {
+		FAIL("the healthy client never saw its own echo");
 		goto out;
 	}
 	PASS();
@@ -407,6 +451,8 @@ out:
 	server_stop();
 restore:
 	mserver_outq_hard_limit = 4u << 20;
+	mserver_outq_high_water = 1u << 20;
+	mserver_outq_low_water = 256u * 1024;
 }
 
 /* The point of roles: a view-only client watches and cannot change

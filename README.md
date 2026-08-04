@@ -81,6 +81,10 @@ lumi kill -s work
   (`lumi attach user@host:session`).
 - **Multi-session switching:** jump between sessions with the session
   picker (Ctrl-A U).
+- **Session sharing:** opt in with `lumi attach -x` (share) or `-v`
+  (read-only); a plain attach takes the session over and detaches the
+  other clients. `lumi share` lists the clients and moves the keyboard
+  between them.
 - **Scrollback:** browse history with keyboard or mouse wheel; mouse drag
   to select and copy text.
 - **Configurable key bindings:** remap keys, define state-dependent binding
@@ -104,8 +108,8 @@ lumi kill -s work
 | Command | Description |
 |---------|-------------|
 | `lumi new [-Ad] [-f window] [-m mode] [-s name] [shell]` | Create a session and attach (`-d` detached, `-A` reattach) |
-| `lumi attach [-f window] [-m mode] [-s name] [name]` | Attach to a local or remote session |
-| `lumi detach [-s name]` | Detach a client from its session |
+| `lumi attach [-f window] [-m mode] [-s name] [-v] [-x] [name]` | Attach to a local or remote session (`-x` share, `-v` read-only) |
+| `lumi detach [-s name] [-c id]` | Detach every client from a session, or one with `-c` |
 | `lumi list` | List active sessions |
 | `lumi kill [-s name]` | Terminate a session |
 | `lumi new-window [-s name] [shell]` | Create a window in a running session |
@@ -206,7 +210,6 @@ format, and library dependency graph.
 
 ## Known Issues
 
-- Single client per session -- a new attach disconnects the previous one.
 - QUIC networked connections are not yet implemented (Unix sockets and SSH
   tunneling only).
 

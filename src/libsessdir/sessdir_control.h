@@ -137,6 +137,30 @@ int sessdir_ctl_post(const char *session, int verb, unsigned long target,
  * one it acted on. */
 int sessdir_ctl_read(const char *session, struct sessdir_ctl *out);
 
+/* Ask every client but the actor to detach, and wait for them to go.
+ *
+ * Used by an attach taking a session over and by "lumi detach". Detaching
+ * is cooperative: a client acts on the message when it next reads the
+ * session directory, so this waits for the process rather than assuming.
+ * wait_ms bounds the whole call, not each client.
+ *
+ * A kick addressed to every client at once (target 0) goes out first, then
+ * one addressed to each roster entry in turn. The broadcast is the fast
+ * path; the per-client pass is what reaches a client old enough to predate
+ * target 0, and a session is exactly the place to find a process that has
+ * been running since before the last upgrade. Posting one at a time is not
+ * an oversight: the mailbox holds a single message, so posting the next
+ * before the current one has been read would take it away from the client
+ * it was addressed to.
+ *
+ * actor is the posting client's id, or 0 for a command with no client of
+ * its own; a roster entry with that id is skipped. Returns the number of
+ * clients still attached when the wait ran out, so 0 means the session is
+ * clear, or -1 if the roster could not be read.
+ */
+int sessdir_kick_others(const char *session, unsigned long actor,
+    const char *name, int wait_ms);
+
 /* ---- attach lock ----
  *
  * Marks a session as closed to further clients. Cooperating clients

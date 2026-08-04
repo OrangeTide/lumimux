@@ -24,7 +24,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Build
         run: make -j$(nproc)
@@ -41,7 +41,7 @@ jobs:
   build-release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Build (release)
         run: make -j$(nproc) RELEASE=1
@@ -58,7 +58,7 @@ jobs:
   build-static:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
