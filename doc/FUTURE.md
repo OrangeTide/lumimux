@@ -509,6 +509,37 @@ startup). A config option to gate the behavior may be warranted.
 
 ---
 
+## Kitty Keyboard Flag Forwarding Leak (DONE)
+
+**Status:** Fixed (commit 614f9b3), regression test added (commit e60d303).
+
+**Symptom:** With many windows open, switching between applications that use
+the kitty keyboard protocol (vim, the claude CLI) and plain shells (bash)
+would sometimes leave the outer terminal unable to enter a newline. Exiting
+the terminal emulator and reattaching cleared it.
+
+**Cause:** The attach client mirrors the focused window's effective kitty
+keyboard flags onto the outer terminal. `sync_keyboard_proto()` did so with
+a stack push (`CSI > flags u`) and pop (`CSI < u`). Those manipulate the
+outer terminal's own flag stack. Switching between windows that requested
+different nonzero flag sets pushed extra entries without popping them, so the
+outer stack grew. Landing on a plain window emitted a single pop, which left
+a stale enhanced-keyboard entry active. With report-all-keys in that entry,
+Enter arrives as `CSI 13 u`, so plain programs never see a carriage return.
+
+**Fix:** Forward the value with a set (`CSI = flags u`) and reset with
+`CSI = 0 u`. The client tracks one effective value and the outer terminal is
+a surface it fully owns, so the flag stack never grows. Two lines in
+`src/cmd/attach/attach.c`.
+
+**Verification:** `tests/kbd_leak.sh` drives a window through flags
+`0 -> 1 -> 15 -> 0` while a real attach client runs on a pty, captures the
+bytes sent outward, and asserts they use set ops and never push/pop ops. The
+test fails on the pre-fix client and passes on the current one; it is wired
+into CI next to the smoke tests.
+
+---
+
 ## Layout Persistence Hardening (SCOPED)
 
 **Status:** Not started. The blank-screen and lost-title bugs it came from

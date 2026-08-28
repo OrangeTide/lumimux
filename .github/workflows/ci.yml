@@ -38,6 +38,9 @@ jobs:
       - name: Smoke tests
         run: tests/smoke.sh
 
+      - name: Keyboard-leak regression test
+        run: tests/kbd_leak.sh
+
   build-release:
     runs-on: ubuntu-latest
     steps:
@@ -54,6 +57,9 @@ jobs:
 
       - name: Smoke tests (release)
         run: tests/smoke.sh "_out/$(cc -dumpmachine)/release/bin"
+
+      - name: Keyboard-leak regression test (release)
+        run: tests/kbd_leak.sh "_out/$(cc -dumpmachine)/release/bin"
 
   build-static:
     runs-on: ubuntu-latest

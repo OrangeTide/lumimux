@@ -780,7 +780,7 @@ op_csi(void *ctx, const int *params, int nparam, int intermed, int final)
 		if (n == 0)
 			vt_state_tab_clear(st, st->cursor_col);
 		else if (n == 3)
-			vt_state_tab_reset(st);
+			vt_state_tab_clear_all(st);
 		break;
 
 	case 't':	/* XTWINOPS -- window operations */

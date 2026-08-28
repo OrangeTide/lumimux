@@ -223,7 +223,6 @@ static void
 process_ground(struct vt_parse *p, unsigned char c)
 {
 	uint32_t rune;
-	int n;
 
 	/* UTF-8 multi-byte continuation */
 	if (p->utf8_need > 0) {
@@ -265,7 +264,6 @@ process_ground(struct vt_parse *p, unsigned char c)
 	/* UTF-8 lead byte */
 	p->utf8_buf[0] = c;
 	p->utf8_len = 1;
-	n = utf8_runelen(0); /* just use byte count heuristic */
 	if ((c & 0xE0) == 0xC0)
 		p->utf8_need = 2;
 	else if ((c & 0xF0) == 0xE0)
@@ -278,7 +276,6 @@ process_ground(struct vt_parse *p, unsigned char c)
 		p->utf8_need = 0;
 		p->utf8_len = 0;
 	}
-	(void)n;
 }
 
 static void

@@ -1189,6 +1189,205 @@ test_keyboard_stack(void)
 	PASS();
 }
 
+static void
+test_integrated_tbc(void)
+{
+	struct vt_state *st;
+	struct vt_parse *p;
+
+	TEST("integrated: TBC tab clear");
+	st = vt_state_new(24, 80, 0);
+	ASSERT(st != NULL, "state new failed");
+	p = vt_parse_new(vt_ops_default(), st);
+	ASSERT(p != NULL, "parse new failed");
+
+	/* default stops every 8 columns */
+	vt_parse_feed(p, "\r\t", 2);
+	ASSERT(st->cursor_col == 8, "default tab not at 8");
+
+	/* TBC 0 clears the stop under the cursor */
+	vt_parse_feed(p, "\033[0g\r\t", 6);
+	ASSERT(st->cursor_col == 16, "TBC 0 did not clear stop at 8");
+
+	/* TBC 3 clears every stop, so HT runs to the right margin */
+	vt_parse_feed(p, "\033[3g\r\t", 6);
+	ASSERT(st->cursor_col == 79, "TBC 3 left tab stops behind");
+
+	/* a stop set afterwards is the only one left */
+	vt_parse_feed(p, "\r", 1);
+	vt_parse_feed(p, "\033[5G\033H", 7);	/* CHA col 5, HTS */
+	vt_parse_feed(p, "\r\t", 2);
+	ASSERT(st->cursor_col == 4, "HTS after TBC 3 not honored");
+
+	/* RIS restores the defaults */
+	vt_parse_feed(p, "\033c", 2);
+	vt_parse_feed(p, "\r\t", 2);
+	ASSERT(st->cursor_col == 8, "RIS did not restore default stops");
+
+	vt_parse_free(p);
+	vt_state_free(st);
+	PASS();
+}
+
+/* ---- dump round trip ---- */
+
+struct dump_buf {
+	char	data[65536];
+	size_t	len;
+};
+
+static void
+dump_collect(void *ctx, const char *data, size_t len)
+{
+	struct dump_buf *db = ctx;
+
+	if (db->len + len <= sizeof(db->data)) {
+		memcpy(db->data + db->len, data, len);
+		db->len += len;
+	}
+}
+
+/* dump a and replay it into b.  returns 0 on success. */
+static int
+dump_replay(struct vt_state *a, struct vt_state *b)
+{
+	static struct dump_buf db;
+	struct vt_parse *p;
+
+	db.len = 0;
+	vt_state_dump(a, dump_collect, &db);
+
+	p = vt_parse_new(vt_ops_default(), b);
+	if (!p)
+		return -1;
+	vt_parse_feed(p, db.data, db.len);
+	vt_parse_free(p);
+	return 0;
+}
+
+/* compare the visible grids of two states cell by cell */
+static int
+grids_match(struct vt_state *a, struct vt_state *b)
+{
+	int rows = vt_buf_rows(a->buf);
+	int cols = vt_buf_cols(a->buf);
+	int row, col;
+
+	if (vt_buf_rows(b->buf) != rows || vt_buf_cols(b->buf) != cols)
+		return 0;
+
+	for (row = 0; row < rows; row++) {
+		for (col = 0; col < cols; col++) {
+			struct vt_cell *ca = vt_buf_cell(a->buf, row, col);
+			struct vt_cell *cb = vt_buf_cell(b->buf, row, col);
+
+			if (!ca || !cb)
+				return 0;
+			if (ca->codepoint != cb->codepoint)
+				return 0;
+			if (ca->attrs != cb->attrs)
+				return 0;
+			if (ca->fg.type != cb->fg.type ||
+			    ca->bg.type != cb->bg.type)
+				return 0;
+			if (ca->fg.type == VT_COLOR_INDEXED &&
+			    ca->fg.index != cb->fg.index)
+				return 0;
+			if (ca->bg.type == VT_COLOR_INDEXED &&
+			    ca->bg.index != cb->bg.index)
+				return 0;
+		}
+	}
+	return 1;
+}
+
+static void
+test_dump_roundtrip(void)
+{
+	struct vt_state *a, *b;
+	struct vt_parse *p;
+
+	TEST("dump: round trip preserves the grid");
+	a = vt_state_new(6, 20, 0);
+	b = vt_state_new(6, 20, 0);
+	ASSERT(a != NULL && b != NULL, "state new failed");
+
+	p = vt_parse_new(vt_ops_default(), a);
+	ASSERT(p != NULL, "parse new failed");
+
+	/* styled text followed by plain text on the same row, then a row
+	 * that is plain from the start.  before the style-tracking fix the
+	 * plain cells inherit underline|reverse from "fancy". */
+	vt_parse_feed(p, "\033[4;7mfancy\033[0m tail\r\nplain", 27);
+	/* a background colour left open at the end of a row */
+	vt_parse_feed(p, "\r\n\033[41mred\033[0m rest", 19);
+	vt_parse_free(p);
+
+	ASSERT(dump_replay(a, b) == 0, "dump replay failed");
+	ASSERT(grids_match(a, b), "replayed grid differs from original");
+
+	vt_state_free(a);
+	vt_state_free(b);
+	PASS();
+}
+
+static void
+test_dump_cursor_state(void)
+{
+	struct vt_state *a, *b;
+	struct vt_parse *p;
+
+	TEST("dump: round trip preserves cursor state");
+	a = vt_state_new(6, 20, 0);
+	b = vt_state_new(6, 20, 0);
+	ASSERT(a != NULL && b != NULL, "state new failed");
+
+	p = vt_parse_new(vt_ops_default(), a);
+	ASSERT(p != NULL, "parse new failed");
+
+	/* hidden cursor, steady bar shape, parked away from the origin */
+	vt_parse_feed(p, "\033[?25l\033[6 q\033[3;7H", 17);
+	vt_parse_free(p);
+
+	ASSERT(dump_replay(a, b) == 0, "dump replay failed");
+	ASSERT(b->cursor_row == a->cursor_row, "cursor row not restored");
+	ASSERT(b->cursor_col == a->cursor_col, "cursor col not restored");
+	ASSERT((b->modes & VT_MODE_CURSOR_VIS) ==
+	    (a->modes & VT_MODE_CURSOR_VIS), "cursor visibility lost");
+	ASSERT(b->cursor_shape == a->cursor_shape, "cursor shape lost");
+
+	vt_state_free(a);
+	vt_state_free(b);
+	PASS();
+}
+
+static void
+test_dump_altscreen(void)
+{
+	struct vt_state *a, *b;
+	struct vt_parse *p;
+
+	TEST("dump: round trip on the alt screen");
+	a = vt_state_new(6, 20, 0);
+	b = vt_state_new(6, 20, 0);
+	ASSERT(a != NULL && b != NULL, "state new failed");
+
+	p = vt_parse_new(vt_ops_default(), a);
+	ASSERT(p != NULL, "parse new failed");
+
+	vt_parse_feed(p, "primary\033[?1049h", 15);
+	vt_parse_feed(p, "\033[32malt\033[0m text", 16);
+	vt_parse_free(p);
+
+	ASSERT(dump_replay(a, b) == 0, "dump replay failed");
+	ASSERT(b->modes & VT_MODE_ALTSCREEN, "replay not on alt screen");
+	ASSERT(grids_match(a, b), "replayed alt grid differs");
+
+	vt_state_free(a);
+	vt_state_free(b);
+	PASS();
+}
+
 /* ---- main ---- */
 
 int
@@ -1242,8 +1441,14 @@ main(void)
 	test_integrated_scroll_region();
 	test_integrated_altscreen();
 	test_integrated_cursor_shape();
+	test_integrated_tbc();
 	test_keyboard_query();
 	test_keyboard_stack();
+
+	/* screen dump */
+	test_dump_roundtrip();
+	test_dump_cursor_state();
+	test_dump_altscreen();
 
 	printf("\n%d tests, %d failures\n", test_count, fail_count);
 	return fail_count ? 1 : 0;

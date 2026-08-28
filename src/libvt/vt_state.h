@@ -139,10 +139,13 @@ void vt_state_title_pop(struct vt_state *st);
 /* write a character at cursor, advance cursor */
 void vt_state_putchar(struct vt_state *st, uint32_t cp, int width);
 
-/* tab stops */
+/* tab stops.  reset restores the default stop every 8 columns, which is
+ * the power-on and RIS behavior.  clear_all leaves no stops at all, which
+ * is what TBC with parameter 3 asks for. */
 void vt_state_tab_reset(struct vt_state *st);
 void vt_state_tab_set(struct vt_state *st, int col);
 void vt_state_tab_clear(struct vt_state *st, int col);
+void vt_state_tab_clear_all(struct vt_state *st);
 int vt_state_tab_next(struct vt_state *st, int col);
 int vt_state_tab_prev(struct vt_state *st, int col);
 

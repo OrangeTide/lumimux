@@ -424,6 +424,12 @@ vt_state_tab_reset(struct vt_state *st)
 }
 
 void
+vt_state_tab_clear_all(struct vt_state *st)
+{
+	memset(st->tabstops, 0, (size_t)vt_buf_cols(st->buf));
+}
+
+void
 vt_state_tab_set(struct vt_state *st, int col)
 {
 	if (col >= 0 && col < vt_buf_cols(st->buf))
@@ -562,6 +568,7 @@ vt_state_dump(struct vt_state *st, vt_dump_fn emit, void *ctx)
 	int row, col;
 	char esc[32];
 	int esc_len;
+	int sgr_active = 0;
 
 	/* reset terminal state */
 	emit(ctx, "\033[0m\033[2J\033[H", 11);
@@ -610,13 +617,19 @@ vt_state_dump(struct vt_state *st, vt_dump_fn emit, void *ctx)
 			if (c->width == 0)
 				continue;
 
-			/* emit SGR if cell has any attributes or colors */
+			/* emit SGR if cell has any attributes or colors.
+			 * a plain cell needs an explicit reset whenever a
+			 * style is still in effect, otherwise the style
+			 * bleeds across the rest of the dump. */
 			if (c->attrs != 0 ||
 			    c->fg.type != VT_COLOR_DEFAULT ||
-			    c->bg.type != VT_COLOR_DEFAULT)
+			    c->bg.type != VT_COLOR_DEFAULT) {
 				dump_sgr(emit, ctx, c);
-			else if (col == 0 || row == 0)
+				sgr_active = 1;
+			} else if (sgr_active || col == 0 || row == 0) {
 				emit(ctx, "\033[0m", 4);
+				sgr_active = 0;
+			}
 
 			/* emit character */
 			ulen = utf8_encode(ubuf, c->codepoint);

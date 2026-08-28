@@ -1054,12 +1054,17 @@ sync_keyboard_proto(struct vt_state *st)
 	int dirty = 0;
 
 	if (flags != synced_kitty_kbd) {
-		if (flags) {
-			n = snprintf(buf, sizeof(buf),
-			    "\033[>%du", flags);
-		} else {
-			n = snprintf(buf, sizeof(buf), "\033[<u");
-		}
+		/*
+		 * Mirror the focused window's effective flags with a set
+		 * (CSI = flags u), not a push (CSI > flags u).  The outer
+		 * terminal is a single surface we fully own, so we track one
+		 * value.  Pushing on every change grows the outer terminal's
+		 * kitty flag stack without bound; a later single pop then
+		 * leaves a stale enhanced-keyboard entry active, which can
+		 * make Enter report as CSI 13 u so plain apps never see a
+		 * newline.
+		 */
+		n = snprintf(buf, sizeof(buf), "\033[=%du", flags);
 		tio_write(STDOUT_FILENO, buf, n);
 		synced_kitty_kbd = flags;
 		dirty = 1;
@@ -1091,7 +1096,7 @@ reset_terminal_modes(void)
 	if (synced_cursor_shape != 0)
 		emit_cursor_shape(0);
 	if (synced_kitty_kbd) {
-		tio_write(STDOUT_FILENO, "\033[<u", 4);
+		tio_write(STDOUT_FILENO, "\033[=0u", 5);
 		synced_kitty_kbd = 0;
 		dirty = 1;
 	}
