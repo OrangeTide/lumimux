@@ -1276,6 +1276,15 @@ to sync the internal clipboard to the system clipboard.
 Bracketed paste sequences from the outer terminal are forwarded to
 the focused window when the application has enabled bracketed paste
 mode (DECSET 2004).
+.PP
+Inside a terminal emulator the mouse works out of the box using the
+terminal's own reporting. On the raw Linux text console the terminal
+reports no mouse events; there
+.B lumi
+reads them from the
+.BR gpm (8)
+daemon instead, provided it was built with libgpm support. The build
+auto-detects the libgpm development headers and enables this when present.
 .SH TERMINAL COMPATIBILITY
 .B lumi
 sets the host terminal's title to reflect the current window title.

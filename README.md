@@ -21,6 +21,13 @@ make RELEASE=1          # optimized build (LTO, -O2)
 make clean-all          # remove all build artifacts
 ```
 
+Mouse input on the bare Linux text console (where the terminal reports no
+mouse events) is provided by talking to the gpm daemon. This is an optional
+feature: the build auto-detects the libgpm development headers (the
+`libgpm-dev` package on Debian and Ubuntu) and enables it when present.
+Force it on or off with `make GPM=1` or `make GPM=0`. Inside a terminal
+emulator the mouse works without gpm.
+
 Output goes to `_out/<triplet>/bin/` (binaries) and `_build/<triplet>/`
 (objects), where `<triplet>` comes from `$(CC) -dumpmachine`.
 
@@ -231,6 +238,30 @@ lumimux draws ideas and inspiration from several projects:
   window manager inspired lumimux's turbo attach mode with mouse-driven
   move, resize, minimize, and maximize.
 - [tvterm][9] -- Terminal emulator built around Turbo Vision (by magiblot)
+
+## See Also
+
+Other terminal multiplexers and text-mode window managers worth a look:
+
+- [GNU Screen][3] -- the original terminal multiplexer.
+- [tmux][4] -- modern client-server multiplexer.
+- [Zellij][17] -- terminal workspace and multiplexer with a plugin system
+  (Rust).
+- [WezTerm][12] -- GPU-accelerated terminal emulator with a built-in
+  multiplexer.
+- [Jexer][18] -- Java text-user-interface library that includes a windowing
+  terminal multiplexer.
+- [3mux][19] -- terminal multiplexer written in Go.
+- [boo][20] -- detachable terminal sessions built on Ghostty's terminal
+  core (Zig).
+- [twin][21] -- text-mode windowing environment: a terminal emulator and
+  multiplexer with overlapping windows and networked clients.
+- [dtach][5] -- minimal detach and reattach tool.
+- [TUIOS][22] -- terminal multiplexer and window manager with vim-like
+  modal navigation, tiling, and workspaces (Go).
+- [VWM][23] -- lightweight console window manager with virtual desktops and
+  embedded terminals.
+
 ## License
 
 MIT-0 OR Public Domain.
@@ -251,3 +282,10 @@ MIT-0 OR Public Domain.
 [14]: https://wiki.gnome.org/Apps/Terminal
 [15]: https://invisible-island.net/xterm/
 [16]: https://github.com/microsoft/terminal
+[17]: https://zellij.dev/
+[18]: https://jexer.sourceforge.io/
+[19]: https://github.com/aaronjanse/3mux
+[20]: https://github.com/coder/boo
+[21]: https://github.com/cosmos72/twin
+[22]: https://github.com/Gaurav-Gosain/tuios
+[23]: https://github.com/TragicWarrior/vwm

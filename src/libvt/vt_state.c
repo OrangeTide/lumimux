@@ -237,7 +237,7 @@ vt_state_altscreen_enter(struct vt_state *st)
 		st->targets[VT_TARGET_ALT] = vt_buf_new(rows, cols, 0);
 
 	vt_state_set_target(st, VT_TARGET_ALT);
-	vt_buf_clear_rows(st->buf, 0, rows);
+	vt_buf_clear_rows(st->buf, 0, rows, st->bg);
 	st->cursor_row = 0;
 	st->cursor_col = 0;
 	st->scroll_top = 0;
@@ -336,6 +336,34 @@ vt_state_cursor_clamp(struct vt_state *st)
 }
 
 void
+vt_state_index(struct vt_state *st)
+{
+	int rows = vt_buf_rows(st->buf);
+
+	/* scroll the region up only when the cursor is on the bottom margin.
+	 * below the region, move down within the physical screen and do not
+	 * scroll.  above or inside the region, just move down one line. */
+	if (st->cursor_row == st->scroll_bot - 1)
+		vt_buf_scroll(st->buf, st->scroll_top, st->scroll_bot, 1,
+		    st->bg);
+	else if (st->cursor_row < rows - 1)
+		st->cursor_row++;
+}
+
+void
+vt_state_reverse_index(struct vt_state *st)
+{
+	/* mirror of vt_state_index: scroll the region down only when the
+	 * cursor is on the top margin.  above the region, move up within the
+	 * physical screen and do not scroll. */
+	if (st->cursor_row == st->scroll_top)
+		vt_buf_scroll(st->buf, st->scroll_top, st->scroll_bot, -1,
+		    st->bg);
+	else if (st->cursor_row > 0)
+		st->cursor_row--;
+}
+
+void
 vt_state_putchar(struct vt_state *st, uint32_t cp, int width)
 {
 	struct vt_cell *c;
@@ -350,12 +378,7 @@ vt_state_putchar(struct vt_state *st, uint32_t cp, int width)
 			if (r)
 				r->flags |= VT_ROW_WRAPPED;
 			st->cursor_col = 0;
-			st->cursor_row++;
-			if (st->cursor_row >= st->scroll_bot) {
-				st->cursor_row = st->scroll_bot - 1;
-				vt_buf_scroll(st->buf, st->scroll_top,
-				    st->scroll_bot, 1);
-			}
+			vt_state_index(st);
 		} else {
 			st->cursor_col = cols - width;
 		}
@@ -661,6 +684,25 @@ vt_state_dump(struct vt_state *st, vt_dump_fn emit, void *ctx)
 	if (st->cursor_shape > 0) {
 		esc_len = snprintf(esc, sizeof(esc),
 		    "\033[%d q", st->cursor_shape);
+		if (esc_len > 0)
+			emit(ctx, esc, (size_t)esc_len);
+	}
+
+	/*
+	 * keyboard enhancement state.  the dump above replays only visible
+	 * state.  a client that attaches after the program already turned on
+	 * the kitty keyboard protocol or modifyOtherKeys would otherwise start
+	 * with these off and never forward the enable to the outer terminal,
+	 * so Shift+Enter and other modified keys arrive as their legacy bytes.
+	 * emit the current values (a set, not a stack push) so the replay
+	 * leaves the client VT holding the authoritative flags.
+	 */
+	esc_len = snprintf(esc, sizeof(esc), "\033[=%du", st->kitty_kbd_flags);
+	if (esc_len > 0)
+		emit(ctx, esc, (size_t)esc_len);
+	if (st->modify_other_keys != 0) {
+		esc_len = snprintf(esc, sizeof(esc),
+		    "\033[>4;%dm", st->modify_other_keys);
 		if (esc_len > 0)
 			emit(ctx, esc, (size_t)esc_len);
 	}

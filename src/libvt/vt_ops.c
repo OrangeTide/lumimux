@@ -107,12 +107,7 @@ op_execute(void *ctx, uint8_t c)
 	case 0x0A:	/* LF */
 	case 0x0B:	/* VT */
 	case 0x0C:	/* FF */
-		st->cursor_row++;
-		if (st->cursor_row >= st->scroll_bot) {
-			st->cursor_row = st->scroll_bot - 1;
-			vt_buf_scroll(st->buf, st->scroll_top,
-			    st->scroll_bot, 1);
-		}
+		vt_state_index(st);
 		break;
 
 	case 0x0D:	/* CR -- carriage return */
@@ -298,14 +293,14 @@ csi_erase_display(struct vt_state *st, int mode)
 			r = vt_buf_row(st->buf, st->cursor_row);
 			if (r) {
 				for (i = st->cursor_col; i < cols; i++)
-					vt_cell_clear(&r->cells[i]);
+					vt_cell_erase(&r->cells[i], st->bg);
 				r->flags |= VT_ROW_DIRTY;
 			}
 		}
-		vt_buf_clear_rows(st->buf, st->cursor_row + 1, rows);
+		vt_buf_clear_rows(st->buf, st->cursor_row + 1, rows, st->bg);
 		break;
 	case 1:		/* above */
-		vt_buf_clear_rows(st->buf, 0, st->cursor_row);
+		vt_buf_clear_rows(st->buf, 0, st->cursor_row, st->bg);
 		/* clear beginning of current row */
 		{
 			struct vt_row *r;
@@ -315,14 +310,14 @@ csi_erase_display(struct vt_state *st, int mode)
 			if (r) {
 				for (i = 0; i <= st->cursor_col && i < cols;
 				    i++)
-					vt_cell_clear(&r->cells[i]);
+					vt_cell_erase(&r->cells[i], st->bg);
 				r->flags |= VT_ROW_DIRTY;
 			}
 		}
 		break;
 	case 2:		/* entire display */
 	case 3:		/* entire display + scrollback (xterm) */
-		vt_buf_clear_rows(st->buf, 0, rows);
+		vt_buf_clear_rows(st->buf, 0, rows, st->bg);
 		break;
 	}
 }
@@ -358,7 +353,7 @@ csi_erase_line(struct vt_state *st, int mode)
 	}
 
 	for (i = start; i < end; i++)
-		vt_cell_clear(&r->cells[i]);
+		vt_cell_erase(&r->cells[i], st->bg);
 	r->flags |= VT_ROW_DIRTY;
 }
 
@@ -368,7 +363,7 @@ csi_insert_lines(struct vt_state *st, int count)
 	if (st->cursor_row < st->scroll_top ||
 	    st->cursor_row >= st->scroll_bot)
 		return;
-	vt_buf_scroll(st->buf, st->cursor_row, st->scroll_bot, -count);
+	vt_buf_scroll(st->buf, st->cursor_row, st->scroll_bot, -count, st->bg);
 }
 
 static void
@@ -377,7 +372,7 @@ csi_delete_lines(struct vt_state *st, int count)
 	if (st->cursor_row < st->scroll_top ||
 	    st->cursor_row >= st->scroll_bot)
 		return;
-	vt_buf_scroll(st->buf, st->cursor_row, st->scroll_bot, count);
+	vt_buf_scroll(st->buf, st->cursor_row, st->scroll_bot, count, st->bg);
 }
 
 static void
@@ -400,7 +395,7 @@ csi_insert_chars(struct vt_state *st, int count)
 
 	/* clear inserted area */
 	for (i = st->cursor_col; i < st->cursor_col + count; i++)
-		vt_cell_clear(&r->cells[i]);
+		vt_cell_erase(&r->cells[i], st->bg);
 
 	r->flags |= VT_ROW_DIRTY;
 }
@@ -425,7 +420,7 @@ csi_delete_chars(struct vt_state *st, int count)
 
 	/* clear vacated area */
 	for (i = cols - count; i < cols; i++)
-		vt_cell_clear(&r->cells[i]);
+		vt_cell_erase(&r->cells[i], st->bg);
 
 	r->flags |= VT_ROW_DIRTY;
 }
@@ -445,7 +440,7 @@ csi_erase_chars(struct vt_state *st, int count)
 		count = cols - st->cursor_col;
 
 	for (i = st->cursor_col; i < st->cursor_col + count; i++)
-		vt_cell_clear(&r->cells[i]);
+		vt_cell_erase(&r->cells[i], st->bg);
 
 	r->flags |= VT_ROW_DIRTY;
 }
@@ -681,12 +676,14 @@ op_csi(void *ctx, const int *params, int nparam, int intermed, int final)
 
 	case 'S':	/* SU -- scroll up */
 		n = param_or(params, nparam, 0, 1);
-		vt_buf_scroll(st->buf, st->scroll_top, st->scroll_bot, n);
+		vt_buf_scroll(st->buf, st->scroll_top, st->scroll_bot, n,
+		    st->bg);
 		break;
 
 	case 'T':	/* SD -- scroll down */
 		n = param_or(params, nparam, 0, 1);
-		vt_buf_scroll(st->buf, st->scroll_top, st->scroll_bot, -n);
+		vt_buf_scroll(st->buf, st->scroll_top, st->scroll_bot, -n,
+		    st->bg);
 		break;
 
 	case 'X':	/* ECH -- erase characters */
@@ -819,32 +816,17 @@ op_esc(void *ctx, int intermed, int final)
 			vt_state_cursor_restore(st);
 			break;
 		case 'D':	/* IND -- index (scroll up) */
-			st->cursor_row++;
-			if (st->cursor_row >= st->scroll_bot) {
-				st->cursor_row = st->scroll_bot - 1;
-				vt_buf_scroll(st->buf, st->scroll_top,
-				    st->scroll_bot, 1);
-			}
+			vt_state_index(st);
 			break;
 		case 'E':	/* NEL -- next line */
 			st->cursor_col = 0;
-			st->cursor_row++;
-			if (st->cursor_row >= st->scroll_bot) {
-				st->cursor_row = st->scroll_bot - 1;
-				vt_buf_scroll(st->buf, st->scroll_top,
-				    st->scroll_bot, 1);
-			}
+			vt_state_index(st);
 			break;
 		case 'H':	/* HTS -- horizontal tab set */
 			vt_state_tab_set(st, st->cursor_col);
 			break;
 		case 'M':	/* RI -- reverse index */
-			st->cursor_row--;
-			if (st->cursor_row < st->scroll_top) {
-				st->cursor_row = st->scroll_top;
-				vt_buf_scroll(st->buf, st->scroll_top,
-				    st->scroll_bot, -1);
-			}
+			vt_state_reverse_index(st);
 			break;
 		case '=':	/* DECKPAM -- application keypad mode */
 			st->modes |= VT_MODE_DECKPAM;

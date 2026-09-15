@@ -13,3 +13,10 @@ vt_cell_clear(struct vt_cell *c)
 	c->codepoint = ' ';
 	c->width = 1;
 }
+
+void
+vt_cell_erase(struct vt_cell *c, struct vt_color bg)
+{
+	vt_cell_clear(c);
+	c->bg = bg;
+}

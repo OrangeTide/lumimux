@@ -475,6 +475,66 @@ test_state_window_nums(void)
 	printf("ok\n");
 }
 
+/* concurrent registration: many processes each add a distinct window at
+ * once.  the state file commits with an atomic rename(), so the lock must
+ * live on a stable file (state.lock) rather than the state inode itself.
+ * with the lock on the renamed inode, waiters lock a stale inode and lost
+ * updates drop windows from WINDOW_NUMS.  every child's pid must survive. */
+static void
+test_state_concurrent_add(void)
+{
+	struct sessdir_state *st;
+	pid_t nums[64];
+	int i, n, found;
+	const int N = 24;
+	pid_t kids[24];
+
+	printf("  state concurrent add is race-free ... ");
+	sessdir_session_create("st7");
+
+	for (i = 0; i < N; i++) {
+		pid_t c = fork();
+
+		if (c == 0) {
+			struct sessdir_state *cst;
+
+			cst = sessdir_state_open("st7");
+			if (cst) {
+				/* a distinct, stable per-child number so the
+				 * parent can look each one up afterwards */
+				sessdir_state_add_server(cst,
+				    (pid_t)(1000 + i));
+				sessdir_state_close(cst);
+			}
+			_exit(0);
+		}
+		kids[i] = c;
+	}
+	for (i = 0; i < N; i++)
+		waitpid(kids[i], NULL, 0);
+
+	st = sessdir_state_open("st7");
+	if (!st)
+		return;
+	n = sessdir_state_nums(st, nums, 64);
+	CHECK(n >= N, "every concurrently added window is recorded");
+
+	found = 0;
+	for (i = 0; i < N; i++) {
+		int j;
+
+		for (j = 0; j < n; j++) {
+			if (nums[j] == (pid_t)(1000 + i)) {
+				found++;
+				break;
+			}
+		}
+	}
+	CHECK(found == N, "no window is lost to a race");
+	sessdir_state_close(st);
+	printf("ok\n");
+}
+
 /* ---- inotify watch test ---- */
 
 static void
@@ -1013,6 +1073,7 @@ main(void)
 	test_state_remove_server();
 	test_state_persistence();
 	test_state_window_nums();
+	test_state_concurrent_add();
 
 	/* inotify watch */
 	test_watch();

@@ -17,7 +17,7 @@
 #include <unistd.h>
 
 struct sessdir_state {
-	int fd;
+	int lockfd;		/* stable "state.lock", never renamed */
 	char path[PATH_MAX];
 };
 
@@ -164,22 +164,33 @@ write_kv(FILE *f, const char *key, const char *val)
 
 /* ---- state file internals ---- */
 
-/* read the entire state file into a malloc'd buffer. caller frees. */
+/* read the entire state file into a malloc'd buffer. caller frees.
+ *
+ * the file is opened fresh by path on every call rather than through a
+ * cached descriptor. state_write() replaces "state" with an atomic rename,
+ * so any descriptor opened before that rename still points at the old,
+ * now-unlinked inode. reopening by path under the lock guarantees the read
+ * sees the current committed contents. opened O_RDONLY so close() raises
+ * IN_CLOSE_NOWRITE, which the session-directory watch does not act on. */
 static char *
 state_read_all(struct sessdir_state *st)
 {
 	struct stat sb;
 	char *buf;
 	ssize_t n;
+	int fd;
 
-	if (fstat(st->fd, &sb) < 0)
+	fd = open(st->path, O_RDONLY);
+	if (fd < 0)
 		return xstrdup("");
-	if (sb.st_size == 0)
+	if (fstat(fd, &sb) < 0 || sb.st_size == 0) {
+		close(fd);
 		return xstrdup("");
+	}
 
 	buf = xmalloc((size_t)sb.st_size + 1);
-	lseek(st->fd, 0, SEEK_SET);
-	n = read(st->fd, buf, (size_t)sb.st_size);
+	n = read(fd, buf, (size_t)sb.st_size);
+	close(fd);
 	if (n < 0) {
 		free(buf);
 		return xstrdup("");
@@ -249,11 +260,7 @@ state_write(struct sessdir_state *st, pid_t focus,
 		return -1;
 	}
 
-	/* reopen the fd to pick up the new inode; read-only for the same
-	 * reason as the initial open above */
-	close(st->fd);
-	st->fd = open(st->path, O_RDONLY | O_CREAT, 0600);
-	return st->fd < 0 ? -1 : 0;
+	return 0;
 }
 
 /* ---- callback context for parsing ---- */
@@ -343,6 +350,7 @@ sessdir_state_open(const char *session)
 {
 	struct sessdir_state *st;
 	char *sess_path;
+	char lockpath[PATH_MAX];
 
 	sess_path = sessdir_session_path(session);
 	if (!sess_path)
@@ -350,23 +358,29 @@ sessdir_state_open(const char *session)
 
 	st = xcalloc(1, sizeof(*st));
 	if (snprintf(st->path, sizeof(st->path), "%s/state",
-	    sess_path) >= PATH_MAX) {
+	    sess_path) >= PATH_MAX ||
+	    snprintf(lockpath, sizeof(lockpath), "%s/state.lock",
+	    sess_path) >= (int)sizeof(lockpath)) {
 		free(sess_path);
 		free(st);
 		return NULL;
 	}
 	free(sess_path);
 
-	/* only ever used for flock() plus read(): actual writes go
-	 * through state_write()'s own temp file and rename(), never
-	 * through this fd, so it needs no write access. O_RDWR here
-	 * would make every reader's close() raise IN_CLOSE_WRITE on the
-	 * session directory -- which sessdir_watch_start() watches for
-	 * specifically to catch a file rewritten in place -- retriggering
-	 * on_sessdir_watch() forever, since it itself reads state via
-	 * mconn_refresh() -> mconn_sync_winlist() on every firing. */
-	st->fd = open(st->path, O_RDONLY | O_CREAT, 0600);
-	if (st->fd < 0) {
+	/* Lock a dedicated file, never the "state" file itself. state_write()
+	 * commits with an atomic rename() that swaps "state" to a new inode,
+	 * so an flock() on the state descriptor grants no mutual exclusion: a
+	 * process that opened the file before the rename locks the old inode
+	 * while one that opened it after locks the new inode, and the two run
+	 * concurrently. "state.lock" is created once and never renamed, so its
+	 * inode is stable and every writer contends on the same lock.
+	 *
+	 * Opened O_RDONLY (flock() needs no write access) so close() raises
+	 * only IN_CLOSE_NOWRITE, which sessdir_watch_start() does not act on;
+	 * O_RDWR would raise IN_CLOSE_WRITE and retrigger the watch, whose own
+	 * handler reads state and would loop. */
+	st->lockfd = open(lockpath, O_RDONLY | O_CREAT, 0600);
+	if (st->lockfd < 0) {
 		free(st);
 		return NULL;
 	}
@@ -379,8 +393,8 @@ sessdir_state_close(struct sessdir_state *st)
 {
 	if (!st)
 		return;
-	if (st->fd >= 0)
-		close(st->fd);
+	if (st->lockfd >= 0)
+		close(st->lockfd);
 	free(st);
 }
 
@@ -389,9 +403,9 @@ sessdir_state_focus(struct sessdir_state *st)
 {
 	struct parse_ctx ctx;
 
-	flock(st->fd, LOCK_SH);
+	flock(st->lockfd, LOCK_SH);
 	state_parse(st, &ctx);
-	flock(st->fd, LOCK_UN);
+	flock(st->lockfd, LOCK_UN);
 	return ctx.focus;
 }
 
@@ -401,9 +415,9 @@ sessdir_state_order(struct sessdir_state *st, pid_t *out, int max)
 	struct parse_ctx ctx;
 	int n;
 
-	flock(st->fd, LOCK_SH);
+	flock(st->lockfd, LOCK_SH);
 	state_parse(st, &ctx);
-	flock(st->fd, LOCK_UN);
+	flock(st->lockfd, LOCK_UN);
 
 	n = ctx.norder < max ? ctx.norder : max;
 	memcpy(out, ctx.order, (size_t)n * sizeof(pid_t));
@@ -416,12 +430,12 @@ sessdir_state_set_focus(struct sessdir_state *st, pid_t pid)
 	struct parse_ctx ctx;
 	int rc;
 
-	flock(st->fd, LOCK_EX);
+	flock(st->lockfd, LOCK_EX);
 	state_parse(st, &ctx);
 	ctx.focus = pid;
 	rc = state_write(st, ctx.focus, ctx.order, ctx.norder,
 	    ctx.nums, ctx.nnums);
-	flock(st->fd, LOCK_UN);
+	flock(st->lockfd, LOCK_UN);
 	return rc;
 }
 
@@ -431,19 +445,19 @@ sessdir_state_add_server(struct sessdir_state *st, pid_t pid)
 	struct parse_ctx ctx;
 	int i, slot, rc;
 
-	flock(st->fd, LOCK_EX);
+	flock(st->lockfd, LOCK_EX);
 	state_parse(st, &ctx);
 
 	/* check for duplicate */
 	for (i = 0; i < ctx.norder; i++) {
 		if (ctx.order[i] == pid) {
-			flock(st->fd, LOCK_UN);
+			flock(st->lockfd, LOCK_UN);
 			return 0;
 		}
 	}
 
 	if (ctx.norder >= 64) {
-		flock(st->fd, LOCK_UN);
+		flock(st->lockfd, LOCK_UN);
 		return -1;
 	}
 
@@ -467,7 +481,7 @@ sessdir_state_add_server(struct sessdir_state *st, pid_t pid)
 		ctx.focus = pid;
 	rc = state_write(st, ctx.focus, ctx.order, ctx.norder,
 	    ctx.nums, ctx.nnums);
-	flock(st->fd, LOCK_UN);
+	flock(st->lockfd, LOCK_UN);
 	return rc;
 }
 
@@ -477,7 +491,7 @@ sessdir_state_remove_server(struct sessdir_state *st, pid_t pid)
 	struct parse_ctx ctx;
 	int i, rc;
 
-	flock(st->fd, LOCK_EX);
+	flock(st->lockfd, LOCK_EX);
 	state_parse(st, &ctx);
 
 	/* remove from the dense layout order (shifts remaining entries) */
@@ -510,7 +524,7 @@ sessdir_state_remove_server(struct sessdir_state *st, pid_t pid)
 
 	rc = state_write(st, ctx.focus, ctx.order, ctx.norder,
 	    ctx.nums, ctx.nnums);
-	flock(st->fd, LOCK_UN);
+	flock(st->lockfd, LOCK_UN);
 	return rc;
 }
 
@@ -520,9 +534,9 @@ sessdir_state_num(struct sessdir_state *st, pid_t pid)
 	struct parse_ctx ctx;
 	int i, num = -1;
 
-	flock(st->fd, LOCK_SH);
+	flock(st->lockfd, LOCK_SH);
 	state_parse(st, &ctx);
-	flock(st->fd, LOCK_UN);
+	flock(st->lockfd, LOCK_UN);
 
 	for (i = 0; i < ctx.nnums; i++) {
 		if (ctx.nums[i] == pid) {
@@ -539,9 +553,9 @@ sessdir_state_nums(struct sessdir_state *st, pid_t *out, int max)
 	struct parse_ctx ctx;
 	int n;
 
-	flock(st->fd, LOCK_SH);
+	flock(st->lockfd, LOCK_SH);
 	state_parse(st, &ctx);
-	flock(st->fd, LOCK_UN);
+	flock(st->lockfd, LOCK_UN);
 
 	n = ctx.nnums < max ? ctx.nnums : max;
 	memcpy(out, ctx.nums, (size_t)n * sizeof(pid_t));
@@ -557,7 +571,7 @@ sessdir_state_swap_num(struct sessdir_state *st, pid_t a, pid_t b)
 	if (a == b)
 		return 0;
 
-	flock(st->fd, LOCK_EX);
+	flock(st->lockfd, LOCK_EX);
 	state_parse(st, &ctx);
 
 	for (i = 0; i < ctx.nnums; i++) {
@@ -567,7 +581,7 @@ sessdir_state_swap_num(struct sessdir_state *st, pid_t a, pid_t b)
 			sb = i;
 	}
 	if (sa < 0 || sb < 0) {
-		flock(st->fd, LOCK_UN);
+		flock(st->lockfd, LOCK_UN);
 		return -1;
 	}
 
@@ -575,7 +589,7 @@ sessdir_state_swap_num(struct sessdir_state *st, pid_t a, pid_t b)
 	ctx.nums[sb] = a;
 	rc = state_write(st, ctx.focus, ctx.order, ctx.norder,
 	    ctx.nums, ctx.nnums);
-	flock(st->fd, LOCK_UN);
+	flock(st->lockfd, LOCK_UN);
 	return rc;
 }
 
@@ -589,7 +603,7 @@ sessdir_state_set_num(struct sessdir_state *st, pid_t pid, int target)
 	if (target < 0 || target >= cap)
 		return -1;
 
-	flock(st->fd, LOCK_EX);
+	flock(st->lockfd, LOCK_EX);
 	state_parse(st, &ctx);
 
 	for (i = 0; i < ctx.nnums; i++) {
@@ -599,11 +613,11 @@ sessdir_state_set_num(struct sessdir_state *st, pid_t pid, int target)
 		}
 	}
 	if (sa < 0) {
-		flock(st->fd, LOCK_UN);
+		flock(st->lockfd, LOCK_UN);
 		return -1;
 	}
 	if (target == sa) {
-		flock(st->fd, LOCK_UN);
+		flock(st->lockfd, LOCK_UN);
 		return 0;
 	}
 
@@ -626,6 +640,6 @@ sessdir_state_set_num(struct sessdir_state *st, pid_t pid, int target)
 
 	rc = state_write(st, ctx.focus, ctx.order, ctx.norder,
 	    ctx.nums, ctx.nnums);
-	flock(st->fd, LOCK_UN);
+	flock(st->lockfd, LOCK_UN);
 	return rc;
 }

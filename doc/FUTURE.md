@@ -21,6 +21,65 @@ below records the details.
 
 ---
 
+## Background Color Erase (BCE) (DONE)
+
+**Status:** Fixed. Regression test `test_state_bce` added to
+`src/libvt/test_vt.c`.
+
+**Symptom:** `dialog(1)` (for example `dialog --dselect /tmp 20 60`) and
+other curses apps that paint solid colored panels rendered with the panel
+interiors showing the terminal default background instead of the widget
+color. Only the cells that held text carried color; the padding did not.
+
+**Cause:** The VT erase operations cleared cells to hard defaults rather
+than to the current SGR background color. Curses libraries set a background
+color and then use ECH (`CSI n X`), EL (`CSI K`), ED (`CSI J`), and scroll
+fills to paint a region. Without background color erase those cleared cells
+reverted to the default background.
+
+**Fix:** Added `vt_cell_erase(cell, bg)` and threaded the current
+background (`st->bg`) through every erase and scroll path. `vt_buf_scroll`
+and `vt_buf_clear_rows` take a `bg` argument; ECH, EL, ED, ICH, DCH, IL,
+DL, SU, SD, LF/IND/RI scrolling, and alt-screen clear all fill with the
+current background.
+
+| File | Change |
+|------|--------|
+| `src/libvt/vt_cell.c/.h` | `vt_cell_erase(cell, bg)` |
+| `src/libvt/vt_buf.c/.h` | `vt_buf_scroll`/`vt_buf_clear_rows` take a `bg`, fill with it |
+| `src/libvt/vt_ops.c` | erase/insert/delete/scroll ops pass `st->bg` |
+| `src/libvt/vt_state.c` | index/reverse-index scroll and alt-screen clear pass `st->bg` |
+
+---
+
+## GPM Mouse on the Linux Console (DONE)
+
+**Status:** Landed as an optional, auto-detected build feature.
+
+**Goal:** Mouse support on the raw Linux text console, where the terminal
+reports no xterm-style mouse sequences. There the gpm daemon is the source
+of mouse events.
+
+**Design:** A small module `src/cmd/attach/gpm_mouse.c` connects to gpm
+(only when `TERM=linux`), registers the gpm socket on the event loop, and
+translates `Gpm_Event` records into `struct tkbd_seq` mouse events fed
+through the same `dispatch_input` path as terminal mouse sequences. Built
+without gpm it compiles to no-op stubs, so the call sites in `attach.c` are
+unconditional.
+
+**Build:** libgpm is auto-detected with a compile-and-link probe in
+`src/module.mk`, the way an autoconf script would. `make GPM=1` forces it
+on, `make GPM=0` off. Requires the libgpm development headers
+(`libgpm-dev` on Debian and Ubuntu).
+
+| File | Change |
+|------|--------|
+| `src/cmd/attach/gpm_mouse.c/.h` | gpm connection, event translation, stubs |
+| `src/cmd/attach/attach.c` | init after stdin watcher, shutdown before loop free |
+| `src/module.mk` | auto-detect probe, `-DHAVE_GPM` and `-lgpm` when present |
+
+---
+
 ## 11A: State-Dependent Key Bindings (DONE)
 
 **Goal:** Bindings that activate conditionally based on window title regex
@@ -537,6 +596,39 @@ a surface it fully owns, so the flag stack never grows. Two lines in
 bytes sent outward, and asserts they use set ops and never push/pop ops. The
 test fails on the pre-fix client and passes on the current one; it is wired
 into CI next to the smoke tests.
+
+---
+
+## Window Number Map Race (DONE)
+
+**Status:** Fixed (commit 7f6a0ce), regression test added in the same commit.
+
+**Symptom:** Creating windows quickly could drop some of them from the
+session's window-number map, so numbering jumped. Past window 9 the next
+window could appear as 13 rather than 10, and the missing windows were absent
+from `WINDOW_NUMS` in the session state file.
+
+**Cause:** `sessdir_state.c` commits every state change with a temp file plus
+an atomic `rename()`, which swaps `state` to a fresh inode on each write. The
+read-modify-write sections `flock()`'d the `state` descriptor itself, which
+gave no mutual exclusion: a process that opened the file before a rename
+locked the old inode while one that opened it after locked the new inode, so
+the two ran at once. A waiter that had blocked on the old inode then read
+stale contents and overwrote the other's addition, dropping a window from the
+slot map.
+
+**Fix:** Lock a dedicated `state.lock` file that is created once and never
+renamed, so every writer contends on the same stable inode, and read the
+state file fresh by path inside the lock so each read sees the committed
+contents. The lock is opened `O_RDONLY` so its `close()` raises only
+`IN_CLOSE_NOWRITE` and does not retrigger the session-directory watch. All
+changes are in `src/libsessdir/sessdir_state.c`.
+
+**Verification:** `test_state_concurrent_add` in
+`src/libsessdir/test_sessdir.c` forks 24 processes that each register a
+distinct window at once, then asserts every one survives in `WINDOW_NUMS`.
+The test fails on the pre-fix code and passes on the current one, and it runs
+with the rest of the `test_sessdir` suite.
 
 ---
 

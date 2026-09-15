@@ -75,6 +75,7 @@ apps_menu_show(void)
 	struct tui_pad *p;
 
 	apps_menu_sel = 0;
+	apps_menu_state.scroll = 0;
 	apps_menu_visible = 1;
 
 	p = tui_stack_push(&overlay);

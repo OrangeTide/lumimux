@@ -714,6 +714,46 @@ test_menu_draw_submenu_indicator(void)
 	PASS();
 }
 
+static void
+test_menu_draw_scroll(void)
+{
+	struct tui_pad p;
+	struct tui_menu m;
+	const struct tui_theme *t;
+	int i, r, c, up = 0, down = 0;
+
+	TEST("menu_draw scrolls to keep selection visible");
+	t = tui_theme_by_name("ascii");
+	ASSERT(t != NULL, "need ascii theme");
+
+	memset(&m, 0, sizeof(m));
+	m.count = 30;
+	m.sel = 20;
+	for (i = 0; i < m.count; i++) {
+		snprintf(m.items[i].keys, sizeof(m.items[i].keys), "k");
+		snprintf(m.items[i].label, sizeof(m.items[i].label),
+		    "item%d", i);
+	}
+
+	/* small screen: 10 rows -> box height 8, 6 visible content rows */
+	tui_menu_draw(&p, &m, t, "test", "ESC", 10, 80);
+
+	ASSERT(m.visible == 6, "6 content rows visible");
+	ASSERT(m.scroll == 15, "scroll keeps selection in view");
+
+	/* both indicators present: items exist above and below the frame */
+	for (r = 0; r < p.h; r++)
+		for (c = 0; c < p.w; c++) {
+			if (p.cells[r][c].codepoint == '^')
+				up = 1;
+			if (p.cells[r][c].codepoint == 'v')
+				down = 1;
+		}
+	ASSERT(up, "up scroll indicator present");
+	ASSERT(down, "down scroll indicator present");
+	PASS();
+}
+
 /* ---- list tests ---- */
 
 static void
@@ -858,6 +898,7 @@ main(void)
 	test_menu_measure_submenu();
 	test_menu_draw_content();
 	test_menu_draw_submenu_indicator();
+	test_menu_draw_scroll();
 
 	/* list widget */
 	test_list_draw();

@@ -33,6 +33,18 @@ row_alloc(int cols)
 	return r;
 }
 
+/* allocate a blank row whose cells carry bg (background color erase) */
+static struct vt_row *
+row_alloc_bg(int cols, struct vt_color bg)
+{
+	struct vt_row *r = row_alloc(cols);
+	int i;
+
+	for (i = 0; i < cols; i++)
+		r->cells[i].bg = bg;
+	return r;
+}
+
 static void
 row_free(struct vt_row *r)
 {
@@ -51,16 +63,6 @@ row_resize(struct vt_row *r, int old_cols, int new_cols)
 	for (i = old_cols; i < new_cols; i++)
 		vt_cell_clear(&r->cells[i]);
 	r->flags |= VT_ROW_DIRTY;
-}
-
-static void
-row_clear(struct vt_row *r, int cols)
-{
-	int i;
-
-	for (i = 0; i < cols; i++)
-		vt_cell_clear(&r->cells[i]);
-	r->flags = VT_ROW_DIRTY;
 }
 
 struct vt_buf *
@@ -214,7 +216,8 @@ ring_push(struct vt_buf *buf, struct vt_row *r)
 }
 
 void
-vt_buf_scroll(struct vt_buf *buf, int top, int bottom, int count)
+vt_buf_scroll(struct vt_buf *buf, int top, int bottom, int count,
+    struct vt_color bg)
 {
 	int i;
 
@@ -246,7 +249,7 @@ vt_buf_scroll(struct vt_buf *buf, int top, int bottom, int count)
 
 		/* fill bottom with blank rows */
 		for (i = bottom - count; i < bottom; i++)
-			buf->grid[i] = row_alloc(buf->cols);
+			buf->grid[i] = row_alloc_bg(buf->cols, bg);
 	} else {
 		/* scroll down: lines at bottom are lost */
 		count = -count;
@@ -263,7 +266,7 @@ vt_buf_scroll(struct vt_buf *buf, int top, int bottom, int count)
 
 		/* fill top with blank rows */
 		for (i = top; i < top + count; i++)
-			buf->grid[i] = row_alloc(buf->cols);
+			buf->grid[i] = row_alloc_bg(buf->cols, bg);
 	}
 
 	/* mark all rows in scroll region dirty for renderer */
@@ -272,16 +275,21 @@ vt_buf_scroll(struct vt_buf *buf, int top, int bottom, int count)
 }
 
 void
-vt_buf_clear_rows(struct vt_buf *buf, int from, int to)
+vt_buf_clear_rows(struct vt_buf *buf, int from, int to, struct vt_color bg)
 {
-	int i;
+	int i, j;
 
 	if (from < 0)
 		from = 0;
 	if (to > buf->rows)
 		to = buf->rows;
-	for (i = from; i < to; i++)
-		row_clear(buf->grid[i], buf->cols);
+	for (i = from; i < to; i++) {
+		struct vt_row *r = buf->grid[i];
+
+		for (j = 0; j < buf->cols; j++)
+			vt_cell_erase(&r->cells[j], bg);
+		r->flags = VT_ROW_DIRTY;
+	}
 }
 
 void

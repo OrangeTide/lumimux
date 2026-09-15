@@ -16,7 +16,7 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-#define MENU_MAX_ITEMS 32
+#define MENU_MAX_ITEMS TUI_MENU_MAX
 
 struct menu_item {
 	char keys[16];
@@ -212,6 +212,7 @@ menu_show(void)
 	menu_sel = 0;
 	menu_acc = -1;
 	menu_visible = 1;
+	tui_menu_state.scroll = 0;
 	menu_draw();
 }
 
@@ -262,6 +263,34 @@ menu_input(struct iox_loop *loop, const struct tkbd_seq *seq)
 			menu_sel++;
 		else
 			menu_sel = 0;
+		menu_draw();
+		return;
+	case TKBD_KEY_PGUP: {
+		int page = tui_menu_state.visible > 1 ?
+		    tui_menu_state.visible - 1 : 1;
+
+		menu_sel -= page;
+		if (menu_sel < 0)
+			menu_sel = 0;
+		menu_draw();
+		return;
+	}
+	case TKBD_KEY_PGDN: {
+		int page = tui_menu_state.visible > 1 ?
+		    tui_menu_state.visible - 1 : 1;
+
+		menu_sel += page;
+		if (menu_sel > menu_count - 1)
+			menu_sel = menu_count - 1;
+		menu_draw();
+		return;
+	}
+	case TKBD_KEY_HOME:
+		menu_sel = 0;
+		menu_draw();
+		return;
+	case TKBD_KEY_END:
+		menu_sel = menu_count - 1;
 		menu_draw();
 		return;
 	case TKBD_KEY_RIGHT:

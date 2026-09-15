@@ -113,6 +113,13 @@ void vt_state_cursor_save(struct vt_state *st);
 void vt_state_cursor_restore(struct vt_state *st);
 void vt_state_cursor_clamp(struct vt_state *st);
 
+/* index / reverse index: move the cursor down / up one line, scrolling the
+ * scroll region only when the cursor sits on the bottom / top margin.  when
+ * the cursor is outside the region these move within the physical screen
+ * without scrolling.  shared by LF/IND/NEL, RI, and autowrap. */
+void vt_state_index(struct vt_state *st);
+void vt_state_reverse_index(struct vt_state *st);
+
 /* set the fd for DSR/DA reply writes (-1 to disable) */
 void vt_state_set_reply_fd(struct vt_state *st, int fd);
 

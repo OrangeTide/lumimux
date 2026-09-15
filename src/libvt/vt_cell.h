@@ -46,4 +46,8 @@ struct vt_cell {
 
 void vt_cell_clear(struct vt_cell *c);
 
+/* clear a cell to a blank space using bg as the background color (the
+ * "background color erase" behavior). foreground and attributes reset. */
+void vt_cell_erase(struct vt_cell *c, struct vt_color bg);
+
 #endif /* VT_CELL_H */

@@ -8,7 +8,7 @@
 #include "tui_pad.h"
 #include "tui_theme.h"
 
-#define TUI_MENU_MAX 32
+#define TUI_MENU_MAX 64
 
 /* Per-item flags. */
 #define TUI_MENU_SUBMENU	(1 << 0)	/* show > indicator */
@@ -24,11 +24,13 @@ struct tui_menu {
 	struct tui_menu_item	items[TUI_MENU_MAX];
 	int			count;
 	int			sel;	/* highlighted index */
+	int			scroll;	/* index of first visible item */
+	int			visible;/* visible rows, set by tui_menu_draw */
 };
 
 void tui_menu_measure(const struct tui_menu *m, int *w, int *h);
 
-void tui_menu_draw(struct tui_pad *p, const struct tui_menu *m,
+void tui_menu_draw(struct tui_pad *p, struct tui_menu *m,
     const struct tui_theme *theme, const char *title,
     const char *footer, int screen_rows, int screen_cols);
 

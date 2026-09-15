@@ -13,6 +13,7 @@
 #include "color_picker.h"
 #include "selection.h"
 #include "theme_cfg.h"
+#include "gpm_mouse.h"
 
 #include "iox_loop.h"
 #include "iox_fd.h"
@@ -7935,6 +7936,12 @@ cmd_attach_main(int argc, char **argv)
 
 	iox_fd_add(loop, STDIN_FILENO, IOX_READ, on_stdin_read, NULL);
 
+	/* on a raw Linux console the terminal reports no mouse events; get
+	 * them from the gpm daemon instead. a no-op elsewhere and when built
+	 * without gpm support. */
+	if (client_mode != CLIENT_MODE_MINIMAL)
+		gpm_mouse_init(loop, dispatch_input);
+
 	/* messages posted before we existed are not ours to act on */
 	ctl_seq_sync();
 
@@ -8101,6 +8108,7 @@ cmd_attach_main(int argc, char **argv)
 			waitpid(rproxy_pid, NULL, 0);
 	}
 
+	gpm_mouse_shutdown(loop);
 	iox_loop_free(loop);
 	reset_terminal_modes();
 	emit_mode(2004, 0);

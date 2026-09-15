@@ -41,12 +41,12 @@ tui_menu_measure(const struct tui_menu *m, int *w, int *h)
 }
 
 void
-tui_menu_draw(struct tui_pad *p, const struct tui_menu *m,
+tui_menu_draw(struct tui_pad *p, struct tui_menu *m,
     const struct tui_theme *theme, const char *title,
     const char *footer, int screen_rows, int screen_cols)
 {
 	int key_w = 0, lbl_w = 0;
-	int bw, bh, i;
+	int bw, bh, i, vis;
 	int has_submenu = 0;
 	struct tui_box box;
 
@@ -67,11 +67,30 @@ tui_menu_draw(struct tui_pad *p, const struct tui_menu *m,
 	bw = 2 + 1 + key_w + 2 + lbl_w + (has_submenu ? 2 : 0) + 1;
 	if (bw < 16)
 		bw = 16;
-	bh = m->count + 2;
 	if (bw > TUI_PAD_MAX_COLS)
 		bw = TUI_PAD_MAX_COLS;
+
+	/* box height: count + 2 borders, clamped to fit the screen */
+	bh = m->count + 2;
+	if (bh > screen_rows - 2)
+		bh = screen_rows - 2;
+	if (bh < 3)
+		bh = 3;
 	if (bh > TUI_PAD_MAX_ROWS)
 		bh = TUI_PAD_MAX_ROWS;
+
+	vis = bh - 2; /* visible content rows */
+	m->visible = vis;
+
+	/* adjust scroll so the selected item stays visible */
+	if (m->sel < m->scroll)
+		m->scroll = m->sel;
+	if (m->sel >= m->scroll + vis)
+		m->scroll = m->sel - vis + 1;
+	if (m->scroll > m->count - vis)
+		m->scroll = m->count - vis;
+	if (m->scroll < 0)
+		m->scroll = 0;
 
 	/* recompute lbl_w to fill the row when bw was clamped */
 	lbl_w = bw - key_w - 6 - (has_submenu ? 2 : 0);
@@ -83,11 +102,12 @@ tui_menu_draw(struct tui_pad *p, const struct tui_menu *m,
 	box.h = bh;
 	tui_box_center(p, &box, screen_rows, screen_cols);
 
-	/* content rows */
-	for (i = 0; i < m->count && i + 1 < bh - 1; i++) {
+	/* content rows (windowed by m->scroll) */
+	for (i = 0; i < vis && m->scroll + i < m->count; i++) {
+		int idx = m->scroll + i;
 		int row = i + 1;
 		int col = 1; /* skip left border */
-		int is_sel = (i == m->sel);
+		int is_sel = (idx == m->sel);
 		struct vt_color fg = is_sel ? theme->sel_fg : theme->content_fg;
 		struct vt_color bg = is_sel ? theme->sel_bg : theme->content_bg;
 		struct vt_color kfg = is_sel ? theme->sel_key_fg : theme->key_fg;
@@ -98,8 +118,8 @@ tui_menu_draw(struct tui_pad *p, const struct tui_menu *m,
 		tui_pad_put(p, row, col++, ' ', fg, bg, attrs, TUI_OPAQUE);
 
 		/* key column (left-aligned, padded) */
-		kl = (int)strlen(m->items[i].keys);
-		tui_pad_puts(p, row, col, m->items[i].keys,
+		kl = (int)strlen(m->items[idx].keys);
+		tui_pad_puts(p, row, col, m->items[idx].keys,
 		    kfg, bg, attrs, TUI_OPAQUE);
 		col += kl;
 		for (j = kl; j < key_w; j++)
@@ -111,8 +131,8 @@ tui_menu_draw(struct tui_pad *p, const struct tui_menu *m,
 		tui_pad_put(p, row, col++, ' ', fg, bg, attrs, TUI_OPAQUE);
 
 		/* label column */
-		ll = (int)strlen(m->items[i].label);
-		tui_pad_puts(p, row, col, m->items[i].label,
+		ll = (int)strlen(m->items[idx].label);
+		tui_pad_puts(p, row, col, m->items[idx].label,
 		    fg, bg, attrs, TUI_OPAQUE);
 		col += ll;
 		for (j = ll; j < lbl_w; j++)
@@ -121,13 +141,13 @@ tui_menu_draw(struct tui_pad *p, const struct tui_menu *m,
 
 		/* submenu indicator */
 		if (has_submenu) {
-			if (m->items[i].flags & TUI_MENU_SUBMENU)
+			if (m->items[idx].flags & TUI_MENU_SUBMENU)
 				tui_pad_put(p, row, col++, ' ', fg, bg,
 				    attrs, TUI_OPAQUE);
 			else
 				tui_pad_put(p, row, col++, ' ', fg, bg,
 				    attrs, TUI_OPAQUE);
-			if (m->items[i].flags & TUI_MENU_SUBMENU)
+			if (m->items[idx].flags & TUI_MENU_SUBMENU)
 				tui_pad_put(p, row, col++, '>', fg, bg,
 				    attrs, TUI_OPAQUE);
 			else
@@ -138,4 +158,12 @@ tui_menu_draw(struct tui_pad *p, const struct tui_menu *m,
 		/* trailing space */
 		tui_pad_put(p, row, col++, ' ', fg, bg, attrs, TUI_OPAQUE);
 	}
+
+	/* scroll indicators when the list is taller than the frame */
+	if (m->scroll > 0)
+		tui_pad_put(p, 1, bw - 2, '^',
+		    theme->border_fg, theme->content_bg, 0, TUI_OPAQUE);
+	if (m->scroll + vis < m->count)
+		tui_pad_put(p, bh - 2, bw - 2, 'v',
+		    theme->border_fg, theme->content_bg, 0, TUI_OPAQUE);
 }

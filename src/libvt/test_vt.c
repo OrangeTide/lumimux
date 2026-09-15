@@ -106,12 +106,14 @@ test_buf_scroll_up(void)
 	{
 		unsigned gen0 = vt_buf_scroll_gen(buf);
 
-		vt_buf_scroll(buf, 0, 3, 0);
+		vt_buf_scroll(buf, 0, 3, 0,
+		    (struct vt_color){ .type = VT_COLOR_DEFAULT });
 		ASSERT(vt_buf_scroll_gen(buf) == gen0,
 		    "no-op scroll bumped gen");
 
 		/* scroll up 1 line -- row 0 goes to scrollback */
-		vt_buf_scroll(buf, 0, 3, 1);
+		vt_buf_scroll(buf, 0, 3, 1,
+		    (struct vt_color){ .type = VT_COLOR_DEFAULT });
 		ASSERT(vt_buf_scroll_gen(buf) != gen0,
 		    "real scroll did not bump gen");
 	}
@@ -152,7 +154,8 @@ test_buf_scroll_down(void)
 	vt_buf_cell(buf, 2, 0)->codepoint = 'C';
 
 	/* scroll down 1 */
-	vt_buf_scroll(buf, 0, 3, -1);
+	vt_buf_scroll(buf, 0, 3, -1,
+	    (struct vt_color){ .type = VT_COLOR_DEFAULT });
 
 	c = vt_buf_cell(buf, 0, 0);
 	ASSERT(c->codepoint == ' ', "row 0 should be blank");
@@ -339,6 +342,50 @@ test_state_altscreen_scrollback_off(void)
 	ASSERT(vt_buf_scrollback_lines(st->targets[VT_TARGET_PRIMARY]) == 0,
 	    "alt content captured while feature disabled");
 
+	vt_state_free(st);
+	PASS();
+}
+
+/* background color erase: ECH, EL, and scroll fills must carry the current
+ * SGR background color, not revert cleared cells to the terminal default.
+ * apps like dialog(1) rely on this to paint solid colored panels. */
+static void
+test_state_bce(void)
+{
+	struct vt_state *st;
+	struct vt_parse *p;
+	struct vt_cell *c;
+
+	TEST("background color erase (ECH/EL/scroll)");
+	st = vt_state_new(24, 80, 100);
+	ASSERT(st != NULL, "state new failed");
+	p = vt_parse_new(vt_ops_default(), st);
+	ASSERT(p != NULL, "parse new failed");
+
+	/* SGR 44 = background blue (indexed 4), then ECH 10 at column 0 */
+	vt_parse_feed(p, "\033[44m\033[10X", strlen("\033[44m\033[10X"));
+	c = vt_buf_cell(st->buf, 0, 0);
+	ASSERT(c->codepoint == ' ', "ECH cell not blank");
+	ASSERT(c->bg.type == VT_COLOR_INDEXED && c->bg.index == 4,
+	    "ECH did not carry the background color");
+	/* a cell past the erased span keeps the default background */
+	c = vt_buf_cell(st->buf, 0, 20);
+	ASSERT(c->bg.type == VT_COLOR_DEFAULT, "ECH erased too far");
+
+	/* EL (erase to end of line) on row 1 also carries the bg */
+	vt_parse_feed(p, "\033[2;1H\033[41m\033[K",
+	    strlen("\033[2;1H\033[41m\033[K"));
+	c = vt_buf_cell(st->buf, 1, 40);
+	ASSERT(c->bg.type == VT_COLOR_INDEXED && c->bg.index == 1,
+	    "EL did not carry the background color");
+
+	/* a scroll must fill the newly exposed line with the current bg */
+	vt_parse_feed(p, "\033[42m\033[24;1H\n", strlen("\033[42m\033[24;1H\n"));
+	c = vt_buf_cell(st->buf, 23, 0);
+	ASSERT(c->bg.type == VT_COLOR_INDEXED && c->bg.index == 2,
+	    "scroll fill did not carry the background color");
+
+	vt_parse_free(p);
 	vt_state_free(st);
 	PASS();
 }
@@ -1011,6 +1058,66 @@ test_integrated_scroll_region(void)
 	PASS();
 }
 
+/* a LF/IND/RI issued while the cursor sits outside the scroll region must
+ * move the cursor within the physical screen without scrolling the region.
+ * only the bottom (or top) margin triggers a scroll.  regression for a bug
+ * where a below-region LF yanked the cursor up to scroll_bot-1 and scrolled,
+ * misplacing a protected status/input line. */
+static void
+test_index_outside_region(void)
+{
+	struct vt_state *st;
+	struct vt_parse *p;
+	struct vt_cell *c;
+
+	TEST("index outside scroll region does not scroll");
+	st = vt_state_new(5, 10, 0);
+	ASSERT(st != NULL, "state new failed");
+
+	p = vt_parse_new(vt_ops_default(), st);
+	ASSERT(p != NULL, "parse new failed");
+
+	/* markers 0..4 on each row */
+	vt_parse_feed(p, "\033[1;1H0\033[2;1H1\033[3;1H2\033[4;1H3\033[5;1H4",
+	    5 * 7);
+
+	/* region rows 2-3 (1-based); rows 1, 4, 5 are outside it */
+	vt_parse_feed(p, "\033[2;3r", 6);
+
+	/* cursor to row 4 (1-based) -- below the region, room to descend */
+	vt_parse_feed(p, "\033[4;1H", 6);
+	vt_parse_feed(p, "\n", 1);
+	ASSERT(st->cursor_row == 4, "LF below region should move cursor down");
+
+	/* region and the outside rows must be untouched */
+	c = vt_buf_cell(st->buf, 1, 0);
+	ASSERT(c->codepoint == '1', "region row 1 must not scroll");
+	c = vt_buf_cell(st->buf, 2, 0);
+	ASSERT(c->codepoint == '2', "region row 2 must not scroll");
+	c = vt_buf_cell(st->buf, 3, 0);
+	ASSERT(c->codepoint == '3', "row 3 must not scroll");
+	c = vt_buf_cell(st->buf, 4, 0);
+	ASSERT(c->codepoint == '4', "row 4 must not scroll");
+
+	/* another LF at the physical bottom stays put, still no scroll */
+	vt_parse_feed(p, "\n", 1);
+	ASSERT(st->cursor_row == 4, "LF at physical bottom stays put");
+	c = vt_buf_cell(st->buf, 2, 0);
+	ASSERT(c->codepoint == '2', "region must still not scroll");
+
+	/* RI above the region moves up without scrolling */
+	vt_parse_feed(p, "\033[3;4r", 6);	/* region rows 3-4 (1-based) */
+	vt_parse_feed(p, "\033[2;1H", 6);	/* row 2 -- above the region */
+	vt_parse_feed(p, "\033M", 2);		/* RI */
+	ASSERT(st->cursor_row == 0, "RI above region should move cursor up");
+	c = vt_buf_cell(st->buf, 2, 0);
+	ASSERT(c->codepoint == '2', "RI above region must not scroll");
+
+	vt_parse_free(p);
+	vt_state_free(st);
+	PASS();
+}
+
 static void
 test_integrated_altscreen(void)
 {
@@ -1411,6 +1518,7 @@ main(void)
 	test_state_altscreen();
 	test_state_altscreen_scrollback();
 	test_state_altscreen_scrollback_off();
+	test_state_bce();
 	test_state_cursor_save_restore();
 	test_state_tabs();
 
@@ -1439,6 +1547,7 @@ main(void)
 	test_integrated_erase();
 	test_integrated_sgr();
 	test_integrated_scroll_region();
+	test_index_outside_region();
 	test_integrated_altscreen();
 	test_integrated_cursor_shape();
 	test_integrated_tbc();
