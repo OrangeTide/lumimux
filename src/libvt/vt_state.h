@@ -120,6 +120,17 @@ void vt_state_cursor_clamp(struct vt_state *st);
 void vt_state_index(struct vt_state *st);
 void vt_state_reverse_index(struct vt_state *st);
 
+/* Account for a kitty graphics command's effect on the cursor: if data/len
+ * is a display command (a=T or a=p) that does not set C=1, move the cursor
+ * down by rows-1 and right by cols, matching kitty's rule of leaving it just
+ * past the image's bottom-right cell.  The image size in cells comes from
+ * the explicit r=/c=, else the image pixel size (v=/s=) divided by the cell
+ * pixel size.  Does nothing when the row count cannot be determined (for
+ * example v= absent and the terminal reports no cell height).  data/len is
+ * the APC payload beginning with 'G'. */
+void vt_kgfx_account(struct vt_state *st, const char *data, size_t len,
+    int cell_pw, int cell_ph);
+
 /* set the fd for DSR/DA reply writes (-1 to disable) */
 void vt_state_set_reply_fd(struct vt_state *st, int fd);
 

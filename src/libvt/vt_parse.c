@@ -24,7 +24,8 @@ enum {
 };
 
 #define VT_MAX_PARAMS	16
-#define VT_OSC_MAX	4096
+#define VT_OSC_INIT	256			/* small: most OSCs are titles */
+#define VT_OSC_MAX	(256 * 1024)		/* grows for large OSC 52 */
 #define VT_DCS_INIT	4096
 #define VT_DCS_MAX	(16 * 1024 * 1024)	/* 16 MB cap */
 
@@ -40,9 +41,10 @@ struct vt_parse {
 	int		has_digit;	/* saw a digit in current param */
 	int		intermed;	/* intermediate byte (0 or char) */
 
-	/* OSC string accumulation */
-	char		osc_buf[VT_OSC_MAX];
-	int		osc_len;
+	/* OSC string accumulation (grows on demand, like the DCS buffer) */
+	char		*osc_buf;
+	size_t		osc_len;
+	size_t		osc_cap;
 	vt_parse_osc_cb	osc_cb;
 	void		*osc_ctx;
 
@@ -76,6 +78,7 @@ void
 vt_parse_free(struct vt_parse *p)
 {
 	free(p->dcs_buf);
+	free(p->osc_buf);
 	free(p);
 }
 
@@ -104,6 +107,8 @@ vt_parse_reset(struct vt_parse *p)
 	void *dcs_ctx = p->dcs_ctx;
 	vt_parse_osc_cb osc_cb = p->osc_cb;
 	void *osc_ctx = p->osc_ctx;
+	char *osc_buf = p->osc_buf;
+	size_t osc_cap = p->osc_cap;
 
 	memset(p, 0, sizeof(*p));
 	p->ops = ops;
@@ -114,6 +119,8 @@ vt_parse_reset(struct vt_parse *p)
 	p->dcs_ctx = dcs_ctx;
 	p->osc_cb = osc_cb;
 	p->osc_ctx = osc_ctx;
+	p->osc_buf = osc_buf;
+	p->osc_cap = osc_cap;
 	p->state = ST_GROUND;
 }
 
@@ -170,17 +177,43 @@ emit_esc(struct vt_parse *p, int final)
 		p->ops->esc(p->ctx, p->intermed, final);
 }
 
+/* Append one OSC string byte, growing the buffer up to VT_OSC_MAX. One slot
+ * is always kept free so emit_osc() can NUL-terminate in place. */
+static void
+osc_append(struct vt_parse *p, unsigned char c)
+{
+	if (p->osc_len + 1 >= VT_OSC_MAX)	/* leave room for the NUL */
+		return;
+	if (p->osc_len + 1 >= p->osc_cap) {
+		size_t newcap = p->osc_cap ? p->osc_cap * 2 : VT_OSC_INIT;
+		char *newbuf;
+
+		if (newcap > VT_OSC_MAX)
+			newcap = VT_OSC_MAX;
+		newbuf = realloc(p->osc_buf, newcap);
+		if (!newbuf)
+			return;
+		p->osc_buf = newbuf;
+		p->osc_cap = newcap;
+	}
+	p->osc_buf[p->osc_len++] = (char)c;
+}
+
 static void
 emit_osc(struct vt_parse *p)
 {
-	/* trim trailing bytes of a truncated UTF-8 sequence */
-	p->osc_buf[p->osc_len] = '\0';
-	p->osc_len = (int)utf8_trunc(p->osc_buf, (size_t)p->osc_len + 1);
+	const char *data = p->osc_buf ? p->osc_buf : "";
+
+	if (p->osc_buf) {
+		/* trim trailing bytes of a truncated UTF-8 sequence */
+		p->osc_buf[p->osc_len] = '\0';
+		p->osc_len = utf8_trunc(p->osc_buf, p->osc_len + 1);
+	}
 
 	if (p->ops->osc)
-		p->ops->osc(p->ctx, p->osc_buf, (size_t)p->osc_len);
+		p->ops->osc(p->ctx, data, p->osc_len);
 	if (p->osc_cb)
-		p->osc_cb(p->osc_ctx, p->osc_buf, (size_t)p->osc_len);
+		p->osc_cb(p->osc_ctx, data, p->osc_len);
 }
 
 static void
@@ -425,8 +458,7 @@ process_byte(struct vt_parse *p, unsigned char c)
 			emit_osc(p);
 			p->state = ST_GROUND;
 		} else {
-			if (p->osc_len < VT_OSC_MAX - 1)
-				p->osc_buf[p->osc_len++] = (char)c;
+			osc_append(p, c);
 		}
 		break;
 	}

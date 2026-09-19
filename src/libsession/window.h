@@ -15,7 +15,7 @@ struct vt_parse;
 /* create a window: fork a shell in a new PTY, set up VT state.
  * rows/cols set the initial terminal size.
  * returns NULL on failure. */
-struct window *window_new(const char *shell, int rows, int cols);
+struct window *window_new(char *const argv[], int rows, int cols);
 void window_free(struct window *w);
 
 /* accessors */
@@ -36,7 +36,8 @@ void window_set_title(struct window *w, const char *title);
 void window_feed(struct window *w, const char *data, size_t len);
 
 /* resize PTY + VT state */
-int window_resize(struct window *w, int rows, int cols);
+int window_resize(struct window *w, int rows, int cols, int cell_pw,
+    int cell_ph);
 
 /* dump screen state for replay */
 void window_dump(struct window *w, vt_dump_fn emit, void *ctx);

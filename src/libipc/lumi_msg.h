@@ -10,6 +10,8 @@
 struct ipc_size {
 	uint16_t	rows;
 	uint16_t	cols;
+	uint16_t	cell_pw;	/* cell width in pixels, 0 if unknown */
+	uint16_t	cell_ph;	/* cell height in pixels, 0 if unknown */
 };
 
 int ipc_size_encode(const struct ipc_size *msg, uint8_t *buf, int len);
@@ -22,6 +24,8 @@ struct ipc_attach {
 	uint32_t	client_id;
 	const char	*name;
 	uint16_t	 name_len;
+	uint16_t	cell_pw;	/* cell width in pixels, 0 if unknown */
+	uint16_t	cell_ph;	/* cell height in pixels, 0 if unknown */
 };
 
 int ipc_attach_encode(const struct ipc_attach *msg, uint8_t *buf, int len);

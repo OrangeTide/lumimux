@@ -340,6 +340,39 @@ test_quoted_value_with_hash(void)
 	free(path);
 }
 
+static void
+test_environment_section(void)
+{
+	struct cfg *c;
+	char *path;
+
+	/* The [environment] feature keys off exact env var names, so the
+	 * parser must preserve the case of both section and name. */
+	path = write_tmp(
+	    "[environment]\n"
+	    "DISPLAY = :0\n"
+	    "EDITOR = vi\n"
+	);
+	CHECK(path != NULL, "tmpfile created");
+	if (!path)
+		return;
+
+	c = cfg_new();
+	CHECK(cfg_load(c, path) == 0, "load succeeds");
+	CHECK(cfg_get(c, "environment.DISPLAY") != NULL &&
+	    strcmp(cfg_get(c, "environment.DISPLAY"), ":0") == 0,
+	    "environment.DISPLAY = :0 (case preserved)");
+	CHECK(cfg_get(c, "environment.EDITOR") != NULL &&
+	    strcmp(cfg_get(c, "environment.EDITOR"), "vi") == 0,
+	    "environment.EDITOR = vi");
+	CHECK(cfg_get(c, "environment.display") == NULL,
+	    "lookup is case-sensitive");
+
+	cfg_free(c);
+	unlink(path);
+	free(path);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -358,6 +391,7 @@ main(int argc, char **argv)
 	test_merge_files();
 	test_each();
 	test_quoted_value_with_hash();
+	test_environment_section();
 
 	printf("test_cfg: %d tests, %d failures\n",
 	    test_count, fail_count);

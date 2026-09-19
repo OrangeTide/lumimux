@@ -59,21 +59,21 @@ jobs:
         id: package
         run: |
           VER="${{ steps.version.outputs.tag }}"
-          PREFIX="lumi-${VER}-linux-${{ matrix.arch }}"
-          STAGE="${{ runner.temp }}/${PREFIX}"
-          mkdir -p "${STAGE}/bin"
-          cp "$LUMI_BIN" "${STAGE}/bin/"
-          for cmd in attach mserver new list version kill detach \
-                     new-window reload send-input send-keys splash; do
-            ln -sf lumi "${STAGE}/bin/lumi-${cmd}"
-          done
-          tar -C "${{ runner.temp }}" -czf "${PREFIX}.tar.gz" "${PREFIX}"
-          echo "tarball=${PREFIX}.tar.gz" >> "$GITHUB_OUTPUT"
+          NAME="lumi-${VER}-linux-${{ matrix.arch }}"
+          # Stage via `make install` so the binary, its lumi-* symlinks, and
+          # the man page match a normal install. An empty PREFIX keeps the
+          # archive flat and relocatable (bin/ and share/ at the top).
+          make install PREFIX= DESTDIR="${{ runner.temp }}/${NAME}" \
+            CC=musl-gcc LDFLAGS=-static TARGET_TRIPLET=x86_64-linux-musl \
+            RELEASE=1 RELEASE_MARCH=${{ matrix.march }}
+          tar -C "${{ runner.temp }}" -czf "${NAME}.tar.gz" "${NAME}"
+          echo "tarball=${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
 
       - name: Build .deb
         id: deb
         run: |
-          sh packaging/debian/build-deb.sh "$LUMI_BIN"
+          VERSION="${{ steps.version.outputs.tag }}" \
+            sh packaging/debian/build-deb.sh "$LUMI_BIN"
           echo "deb=$(ls lumimux_*.deb)" >> "$GITHUB_OUTPUT"
 
       - name: Upload bare binary

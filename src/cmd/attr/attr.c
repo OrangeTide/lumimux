@@ -14,6 +14,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 static void
@@ -66,6 +68,23 @@ connect_focused(const char *session)
 	fd = ipc_connect(path);
 	if (fd < 0) {
 		fprintf(stderr, "lumi-attr: cannot connect to server\n");
+		return -1;
+	}
+
+	/* bound each reply so a stuck server cannot hang the tool */
+	{
+		struct timeval tv = { 5, 0 };
+
+		setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	}
+
+	/* every mserver client must attach first; observe the size so this
+	 * transient client never resizes the window. WRITE is needed to set
+	 * or delete, and is granted when no other client holds the keyboard. */
+	if (ipc_client_attach(fd, IPC_ATTACH_F_SIZE_OBSERVE, "attr",
+	    NULL) < 0) {
+		fprintf(stderr, "lumi-attr: attach handshake failed\n");
+		ipc_close(fd);
 		return -1;
 	}
 	return fd;

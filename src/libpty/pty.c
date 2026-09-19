@@ -20,12 +20,16 @@
 #endif
 
 int
-pty_open(int *child_pid, const char *shell)
+pty_open(int *child_pid, char *const argv[], int rows, int cols)
 {
+	struct winsize ws = {
+		.ws_row = (unsigned short)rows,
+		.ws_col = (unsigned short)cols,
+	};
 	int master;
 	pid_t pid;
 
-	pid = forkpty(&master, NULL, NULL, NULL);
+	pid = forkpty(&master, NULL, NULL, &ws);
 	if (pid < 0) {
 		log_err("forkpty: %m");
 		return -1;
@@ -44,12 +48,15 @@ pty_open(int *child_pid, const char *shell)
 		/* set TERM so child shell uses the right terminfo entry */
 		setenv("TERM", "xterm-256color", 1);
 
-		if (!shell)
-			shell = getenv("SHELL");
-		if (!shell)
-			shell = "/bin/sh";
+		if (argv && argv[0]) {
+			execvp(argv[0], argv);
+		} else {
+			const char *shell = getenv("SHELL");
 
-		execlp(shell, shell, (char *)NULL);
+			if (!shell)
+				shell = "/bin/sh";
+			execlp(shell, shell, (char *)NULL);
+		}
 		_exit(127);
 	}
 
@@ -68,11 +75,13 @@ pty_open(int *child_pid, const char *shell)
 }
 
 int
-pty_resize(int master_fd, int rows, int cols)
+pty_resize(int master_fd, int rows, int cols, int xpixel, int ypixel)
 {
 	struct winsize ws = {
 		.ws_row = (unsigned short)rows,
 		.ws_col = (unsigned short)cols,
+		.ws_xpixel = (unsigned short)xpixel,
+		.ws_ypixel = (unsigned short)ypixel,
 	};
 
 	if (ioctl(master_fd, TIOCSWINSZ, &ws) < 0) {

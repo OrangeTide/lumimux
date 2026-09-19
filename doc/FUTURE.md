@@ -632,6 +632,44 @@ with the rest of the `test_sessdir` suite.
 
 ---
 
+## macOS First-Window Startup Hang (DONE)
+
+**Status:** Fixed (commit c95b658). Needs a confirming run on macOS; the
+change builds clean and the full test suite passes on Linux, which exercises
+the unchanged poll() path.
+
+**Symptom:** On macOS the first window hangs at startup in both screen and
+turbo modes. Nothing paints and the shell appears to ignore input, though
+Ctrl-A commands still work. Creating a second window unwedges the first,
+after which both behave normally.
+
+**Cause:** The mserver arms no timers, so its event loop blocks in `poll()`
+with an indefinite timeout waiting on the shell's PTY master. macOS `poll()`
+does not report readiness on a pty device, so the loop never wakes for the
+shell's output. Ctrl-A works because it is handled entirely in the attach
+client, whose loop arms timers and so wakes regardless. Creating a second
+window sends a refresh over the first window's mserver socket; that socket
+event wakes `poll()`, and the now level-triggered pty read finally runs, so
+the window comes alive. A secondary race compounded it: `pty_open()` passed
+`NULL` for the winsize to `forkpty()` and resized after the fork, so the
+child could exec before its size arrived.
+
+**Fix:** Use `select()` in place of `poll()` on Apple only (Linux and the
+BSDs keep `poll()`, which handles ptys); `select()` reports pty masters
+correctly. The shim maps `POLLIN`/`POLLOUT` through `fd_set`s and treats a
+descriptor closed behind the loop's back as `POLLNVAL`, preserving the
+loop's self-healing. It lives in the shared platform layer, so every
+poll-on-pty path is covered, not just the mserver. Separately, `pty_open()`
+now passes a real winsize to `forkpty()` so the slave is born at the right
+size. Changes in `src/libiox/iox_plat.c`, `src/libpty/pty.c`, `pty.h`, and
+`src/libsession/window.c`.
+
+**Verification:** Pending on macOS. On Linux the build is clean under
+`-Wall -Wextra -Wconversion`, the Apple branch was syntax-checked standalone,
+and `test_iox` plus the full `make run-tests` suite pass.
+
+---
+
 ## Layout Persistence Hardening (SCOPED)
 
 **Status:** Not started. The blank-screen and lost-title bugs it came from
@@ -679,6 +717,55 @@ name so an old file is ignored rather than misread as the new format.
 same window order and have the same weakness, though an unplaceable turbo
 window is skipped rather than turned into an empty pane. Worth converting
 in the same pass.
+
+---
+
+## Kitty Graphics Protocol (SCOPED)
+
+**Status:** Partially implemented. Anchoring, client and server cursor
+accounting, cell-pixel plumbing, and screen-mode window-switch replay have
+shipped. Image-number resolution, animation, and turbo-mode clipping remain
+design only. See `doc/kitty-graphics.md` (section "As implemented") for what
+the code does today.
+
+Extends the existing SIXEL/DCS pass-through (11B) to carry the kitty
+graphics protocol through lumi. Because lumi is a screen-buffer
+multiplexer, images cannot be parsed into cells; they are tracked as a
+host-drawn overlay with per-window bookkeeping that hides placements on
+switch out and replays them on switch in.
+
+Feasibility by mode:
+
+- Minimal / single fullscreen pane: works today via the existing
+  pass-through.
+- Screen mode: feasible and is the target. One full-screen window at a
+  time, so the window rect equals the host rect and no clipping is needed.
+- Turbo mode: dead end for overlapping windows. The protocol has no clip
+  or occlusion primitive, so replay is meaningful only for the top window.
+
+The design adds a per-window placement table, a record path in
+`dcs_passthru()`, switch hooks in `micro_select_window()`, and
+image-number resolution from host replies (mirroring the OSC color-query
+round trip). Replay defaults to re-transmitting image bytes on each switch
+(portable, no host assumptions); a lazy variant that trusts host
+persistence is deferred behind a latency measurement.
+
+As shipped, the record path and re-transmit replay use a minimal per-window
+store (raw APC bytes plus the anchor cell), not the general placement table;
+image-number resolution and the lazy variant are unbuilt. Testing found that
+kitty ties an image to its anchor cell, so the ED (`\e[2J`) that
+`render_cells_full` emits erases all on-screen images. Replay therefore
+re-emits the store after every full render, not once per switch.
+
+Confirmed by testing: the prompt originally painted on top of the image
+because lumi never advanced its own cell-grid cursor past it. Cursor
+accounting was the first fix, on both the client and server vt_state, with
+the cursor left on the image's last row (advance `rows - 1`) to match kitty.
+
+Known limit: classic placements anchor at a cursor cell and drift if the
+window scrolls. The robust fix is kitty's unicode-placeholder mode, which
+needs a `vt_cell` extension (per-cell placeholder codepoint, combining
+diacritics, and foreground-encoded image id) not present today.
 
 ---
 
@@ -1128,7 +1215,7 @@ session while I was away" after the fact.
 | `src/libkeys/keys.[ch]` | `KEYS_ACTION_SHARE_MENU` |
 | `src/libtaskbar/taskbar.c` | Share indicator, `[RO]` marker, non-suppressible when foreign clients are attached |
 | `src/libcfg` consumers | `share.mode`, `share.resize`, `share.display`, `share.indicator` |
-| `doc/lumi.1`, `doc/DEV.md` | Document the subcommand, flags, config, ACL file, and protocol |
+| `doc/lumi.1.in`, `doc/DEV.md` | Document the subcommand, flags, config, ACL file, and protocol |
 | `tests/` | Multi-client mserver test, token handoff test, roster round-trip, ACL match and reload, pending-client leak test |
 
 ### Step-by-Step Implementation Plan
@@ -2192,6 +2279,309 @@ than trusting a first-pass draft.
      - lumi-net-proxy
      - client netchan attach
 ```
+
+## Bundled Utilities: file browser, editor, calculator
+
+Three interactive utilities that run standalone and gain a few extra
+bindings when launched inside a lumi session. They are ordinary
+subcommands (`src/cmd/<name>/`), run as children in a window with their own
+PTY and input loop. They are not overlay "apps" like `app_calc`: those live
+inside the attach client's event loop and suit tiny widgets, while these are
+full-screen programs that own their input. Running them as subcommands also
+gives standalone use for free.
+
+### Session enhancement mechanism
+
+Detection is trivial: `mserver` already exports `LUMI_SESSION` into every
+child environment (`mserver.c:1409`), so `getenv("LUMI_SESSION")` answers
+"am I inside lumi?" with no IPC. The enhancement *actions* reuse verbs that
+already exist: `new-window`, `send-keys`, `send-input`, and `selection.c`
+for the shared clipboard. Each tool runs identically everywhere; when in a
+session it lights up a small set of extra bindings that call those existing
+paths. One shared helper module wraps "in session? fire IPC action" so the
+three tools do not each reinvent it. No new protocol, one binary per tool,
+a few `if (in_session)` bindings rather than a forked code path.
+
+### Shared pieces
+
+- `libtext`: text buffer with line index and undo (gap buffer or piece
+  table). Used by the editor and by `lumi basic`'s line-numbered program
+  store. Build it with the editor. Note `libtxl` is the terminal-output
+  translation engine, not a text buffer; there is no existing buffer lib.
+- `libtui` additions: a scrollable text viewport and a single-line input
+  field, added to `libtui` proper so the tools and future overlay apps
+  share them.
+
+### 1. File browser (`lumi files`) -- navigator, not manager
+
+Two-pane list plus preview over the existing `libtui` list/box widgets.
+Navigate the tree, preview text and directories, open dispatches to the
+editor or a pager. In a session, offer "open in new window" and "open in
+split" via `new-window`.
+
+Scope discipline: this stays a navigator. Mutating operations (copy, move,
+delete, rename, bulk select, archive, chmod) are deferred and, when added,
+come one at a time behind an explicit confirm. Built first because it is the
+smallest tool and exercises the `libtui` + `tkbd` + `LUMI_SESSION` IPC spine
+the other two reuse.
+
+### 2. Editor (`lumi edit`) -- modeless first, keymap table for vi later
+
+A joe/nano-style modeless editor on top of `libtext`. The input layer is a
+keymap table (key + context -> command enum) from day one, so a modal vi
+keymap can be added later as a separate layer without touching the buffer or
+the command set. A full vi personality (modes, operators x motions x counts,
+registers, `:ex`) is explicitly out of scope for the first cut, and even
+when added it stops at motions plus a handful of operators, not vim
+completeness. In a session: "send region to the shell pane" via
+`send-input` to another window.
+
+### 3. Calculator (`lumi basic`) -- Tiny BASIC with vector/matrix values
+
+Named `lumi basic` to avoid colliding with the `app_calc` overlay, which
+keeps the "calc" name. A Pratt parser drives an immediate/expression mode; a
+line-numbered program store (`LET/PRINT/IF/GOTO/GOSUB/FOR/INPUT`) sits on
+top. `DEF FN` supported. ASCII-art graphing samples a function or a vector
+across terminal columns and plots into a `vt_cell` grid.
+
+Values: scalar, one string type, and first-class vector/matrix *literals*
+(`[1,2,3]`, `[[1,2],[3,4]]`) rather than general N-D arrays. Two guardrails
+keep it a calculator and not a language runtime:
+
+- Value semantics, no LHS indexing. `v(i)` reads an element; there is no
+  `v(i) = x`. Vectors and matrices are built from literals or builtins
+  (`zeros(n)`, `range(a,b)`). Immutable values avoid `DIM`, aliasing,
+  bounds bookkeeping, and `GOSUB`-scope interactions.
+- `+ - *` are elementwise with scalar broadcast. Real linear algebra lives
+  in named builtins (`dot()`, `matmul()`), never in an overloaded `*`.
+
+No file I/O, no `EVAL`. It stays a calculator you can script.
+
+### Build order
+
+```
+1: lumi files                        (proves the libtui + tkbd + IPC spine)
+2: libtext + lumi edit               (modeless, keymap-table input)
+3: lumi basic                        (Pratt -> immediate -> programs -> graph)
+later: vi keymap layer on the editor
+later: mutating ops in the browser, behind confirm
+```
+
+### Status
+
+- `lumi files` shipped standalone: navigation, a preview pane (text peek,
+  directory listing, binary note) with display-width-correct clipping, and
+  open in `$PAGER`/`$EDITOR` by suspending and resuming the TUI. In-session
+  open in a window now works too: inside `lumi`, `o` opens the selected file
+  in `$PAGER` and `O` in `$EDITOR`, each in a fresh window of the current
+  session. This landed once `new-window` and mserver learned to run a command
+  line: `new-window` forwards its trailing args, mserver's `+s:` getopt stops
+  option scanning at the first non-option and `window_new` execvp's the given
+  argv (default shell when none). Bracketed paste is enabled and swallowed:
+  the browser has no text field, so a stray paste is discarded rather than
+  read as a run of navigation keys. The browser enhancements shipped: `.`
+  toggles dot (hidden) files in the listing (reloading in place and keeping
+  the selection), Ctrl-U/Ctrl-D scroll the preview pane by half a screen
+  (reset when the selection moves, clamped to the built content), and three
+  mutating operations landed behind a prompt or confirm: `m` makes a
+  directory, `r` renames the selection (a text prompt pre-filled with the
+  current name), and `d` deletes it after a yes/no confirm (directories only
+  when empty). New names may not contain `/`, so an operation stays in the
+  current directory, and a reload follows each, keeping the affected entry
+  selected. The prompt and confirm helpers mirror the editor's. Verified live:
+  the toggle, half-page preview scroll and clamp, and mkdir/rename/delete each
+  reflected on disk.
+- `tui_out` (in libtui) holds the shared output buffer, SGR helpers, and the
+  display-width field writer used by `lumi files` and `lumi edit`, and by
+  `lumi basic` when it lands.
+- `libtext` shipped: line buffer with load/save (trailing-newline faithful),
+  insert/delete/split/join, a dirty flag, and a valgrind-clean test suite.
+- `lumi edit` shipped: open, a modeless keymap-table editor with scrolling
+  and tab-expanded rendering, UTF-8-aware editing, save (Ctrl-S, with a
+  save-as prompt), quit-if-modified confirm, and undo/redo (Ctrl-Z/Ctrl-Y,
+  with typing coalesced into one step). libtext carries the undo stacks.
+  Bracketed paste (DECSET 2004) is enabled: pasted text is inserted
+  literally, control bytes in the paste never fire commands, and CR, LF, and
+  CRLF all collapse to one newline. Selection and an internal clipboard
+  shipped too: Shift plus a movement key extends a reverse-video selection,
+  Ctrl-C copies (or copies the current line when nothing is selected), Ctrl-X
+  cuts, and Ctrl-V pastes, with editing or pasting over a selection replacing
+  it. Ctrl-C is now copy rather than a quit alias; Ctrl-Q remains quit.
+  Copy and cut also mirror the span to the system clipboard via OSC 52
+  (capped at 100 KB, best effort); the reverse direction is covered by
+  bracketed paste, so no OSC 52 read is needed. Inside a session the attach
+  client forwards a window's OSC 52 set-clipboard request out to the outer
+  terminal (in osc_passthru, next to the OSC 9/99/777 notification and OSC
+  10/11 color forwarding), so an in-session copy reaches the real system
+  clipboard; read requests are dropped. The VT parser's OSC buffer now grows
+  on demand (like its DCS buffer) up to a 256 KB cap, so it forwards
+  clipboards of roughly 190 KB rather than truncating at the old fixed 4 KB;
+  small OSCs such as titles still use a 256-byte buffer. Search and goto-line
+  shipped: Ctrl-F prompts for a string and jumps to the next match, searching
+  forward from the cursor and wrapping to the top (case-sensitive, byte-based
+  strstr per line); the prompt pre-fills the last query, so Enter repeats the
+  search. Ctrl-L prompts for a 1-based line number and jumps there, clamping
+  past the end to the last line. Both reuse the existing status-line prompt
+  (prompt_line now edits its buffer in place so a default can be pre-filled),
+  and both run from the main loop like save, where the key stream is available.
+  Verified live: find reports the match line, repeat wraps, goto and its
+  clamp land on the right line. A joe/nano-style help screen shipped too: F1
+  shows a full-screen list of the key bindings (drawn from a table kept next
+  to the keymap) and any key returns to editing, and the status bar shows an
+  "F1 for help" hint when the editor opens. Verified live: the hint appears,
+  F1 lists the bindings, and a keypress returns to the buffer. Not yet done:
+  the vi keymap layer.
+- `libbasic` and `lumi basic` shipped B1 through B4: a Pratt expression
+  engine (variables, builtins, comparisons), an immediate-mode REPL (PRINT,
+  LET, bare-expression calculator mode), line-numbered programs with
+  LIST/NEW/RUN and control flow (GOTO, GOSUB/RETURN, FOR/NEXT/STEP,
+  IF...THEN, INPUT, END), and first-class vector and matrix values
+  (elementwise ops with scalar broadcast, 1-based read-only indexing,
+  ZEROS/RANGE/DOT/MATMUL/LEN), user functions (DEF FN), and ASCII graphing
+  (PLOT of a function over a range, or of a vector). The calculator is
+  feature-complete for its scope. It reads cooked line input, so pasting a
+  multi-line program already works; leaked bracketed-paste markers (from a
+  full-screen app that left DECSET 2004 on) are stripped from each line.
+  Program management commands were added as REPL-frontend commands (so
+  libbasic stays free of file I/O): `NEW` (already present) clears the
+  program, `SAVE`/`LOAD` write and read it back reusing the round-trippable
+  `LIST` output and line storage, and `EDIT` dumps the program to a temp
+  file, opens it in `lumi edit` full-screen, and re-imports it on exit. The
+  `EDIT` route is the "hybrid" chosen over a faithful screen-workspace REPL:
+  it gives edit-any-line full-screen editing by reusing the editor, keeps
+  editing and execution separate (no live sync between an editable screen and
+  the program store, and no PRINT-output-placement problem), and leaves the
+  pipe-friendly line REPL intact for non-TTY use. Verified end-to-end: a
+  program edited in `lumi edit` (a line added) ran with the new line after
+  return.
+- `lumi send-input` shipped (option A). It injects raw bytes into a session's
+  focused window: bytes come from the arguments (joined with single spaces) or
+  from standard input, and go out as one bracketed INPUT_BEGIN/INPUT/INPUT_END
+  run, so the mserver flushes them to the PTY as a single write that cannot
+  interleave with another writer. The client work is small and reuses the
+  existing spine: connect to the focused window's socket like `lumi attr`
+  (`sessdir_state_focus` + `sessdir_server_path` + `ipc_connect`), do the
+  ATTACH handshake, then send the run. Two details matter. It attaches with
+  `IPC_ATTACH_F_SIZE_OBSERVE` so the transient client never resizes the
+  window (`resize_to_fit` skips observers). And after sending it does
+  `shutdown(SHUT_WR)` and drains the server's replay before closing: closing
+  outright makes the server's replay write to us fail, and it then drops the
+  client before flushing the input run to the PTY. Option A means it does not
+  steal the keyboard: `role_for` grants WRITE only when no other client holds
+  it, so an injection while a human is attached in single-writer mode is
+  refused with a clear "read-only" message; a detached or multi-writer session
+  proceeds. Verified end-to-end (a shell ran the injected command; valgrind
+  clean) and the denial path (a human attached blocks it).
+- `lumi send-keys` shipped. It translates key names (`Enter`, `Tab`,
+  `Escape`, `Space`, `BSpace`, arrows, `Home`/`End`, `PPage`/`NPage`,
+  `IC`/`DC`, `F1`-`F12`), modified keys (`C-a` -> a control byte, `M-x` ->
+  Esc-prefixed), and literal text into bytes, then sends them through the
+  same `lu_send_input()` core with the same `-s`/`-w`/`-o` targeting; `-l`
+  forces every argument literal. Unrecognized arguments are sent verbatim,
+  as tmux does. Verified byte-for-byte (arrows, `C-a`/`C-x`/`M-a`) and
+  functionally (text + `Enter` runs a command); valgrind clean.
+- `ipc_client_attach()` (in `ipc_msg.c`) now holds the client-side ATTACH
+  handshake -- send ATTACH, read past anything queued ahead of the reply,
+  return the granted role -- and both `send-input` and `lumi attr` use it.
+  This fixed `lumi attr`, which never attached and so had every request
+  refused by the mserver (first message must be ATTACH); it now attaches with
+  `IPC_ATTACH_F_SIZE_OBSERVE` before its attribute txn. Its synchronous
+  `recv_expect` also learned to skip the screen replay and other messages the
+  server queues right after ATTACH, rather than mistaking the first replay
+  frame for its reply.
+- Window-by-index targeting shipped for `send-input` and `send-keys`: `-i N`
+  sends to the window numbered N, the stable per-window number the status/tab
+  bar shows and the prefix-plus-digit selects (0-based). The number is not the
+  arbitrary `sessdir_list_servers` order; it comes from the session state's
+  slot map via a new `lu_window_pid()` (in `send_input.c`, declared in
+  `multicall.h`) that reads `sessdir_state_nums()` (slot index = number, 0 =
+  empty) and returns the server pid, or 0 when the number is out of range or
+  empty. Each command resolves `-i` to that pid before calling the unchanged
+  `lu_send_input()`, so `-w`/`-i`/`-o` are alternatives with `-i` overriding.
+  Verified live on a detached three-window session: `-i 0/1/2` each landed its
+  marker in the matching window, `-i 9` errored, and (with a human attached)
+  the resolved window was correctly refused as read-only under the Option-A
+  single-writer rule.
+- Deferred still: an opt-in `--steal`/token flag to take the keyboard when a
+  human holds it (attach with `IPC_ATTACH_F_TOKEN`, which `role_reassign`
+  returns on our disconnect).
+- Send-to-pane shipped in both tools. The shared piece is `lu_send_input()`
+  (in `send_input.c`, declared in `multicall.h`): it resolves a target window
+  (a server pid, the focused window, or a non-focused "other" window honoring
+  `$LUMI_SEND_TARGET`), then runs the same attach + bracketed-run + drain path
+  as the command, returning a result code instead of printing so a TUI caller
+  can turn it into a status line. `lumi send-input` gained `-w pid` and `-o`
+  over it. In `lumi edit`, Ctrl-G sends the selection (or the current line)
+  to another pane with a trailing carriage return so it runs there. In `lumi
+  basic`, `SEND <expr>` evaluates the expression (by capturing a `PRINT` into
+  an `open_memstream` buffer, so libbasic stays a pure interpreter) and sends
+  the value. Both target `-o` (the pane beside the tool) and both are
+  in-session only. Verified end-to-end: `-w` delivery, `basic SEND 6*7`
+  landing `42` in another window, and edit's Ctrl-G sending the current line;
+  valgrind clean.
+- `lumi basic` moved off BASIC line numbers to a QBasic-style model (chosen
+  as "Model B" over a faithful inline retro workspace, which was rejected as
+  large effort for mostly-aesthetic payoff since `EDIT` already gives
+  full-screen editing). The program store is now a positional list of source
+  lines in file order, not a sparse array keyed by line number. Three parts:
+  (1) The REPL is nearly unchanged. A line that starts with a number now
+  edits *that file line* (1-based) rather than defining a sparse line number:
+  `1 PRINT X` sets the first line, a bare number deletes that line, and typing
+  past the end appends. Immediate statements still run as before.
+  (2) Jumps are label-only. `GOTO`/`GOSUB` take a label, never a line number,
+  to avoid confusing the jump target with a file line. A label is `name:` at
+  the start of a line, alone or in front of a statement (`loop: PRINT X`),
+  matched case-insensitively. Numeric `GOTO 100` is gone. `IF ... THEN` still
+  runs any statement (including `GOTO`/`GOSUB label`), and additionally treats
+  a lone token that names a defined label as a jump (`IF x THEN loop`), the
+  replacement for the old `IF x THEN <line>` shorthand. This full-statement
+  plus label-shorthand form was kept deliberately over a stricter label-only
+  `THEN`; it can be tightened later if it proves troublesome.
+  (3) `LIST` shows a line-number gutter for the human (so you know which `N`
+  to edit), but `SAVE` and `EDIT` write raw source through a new
+  `basic_program_dump()`, and `LOAD` reads it back through
+  `basic_program_append()`, so the on-disk and editor forms carry no gutter
+  and round-trip exactly (blank lines and indentation preserved). libbasic
+  stays a pure interpreter: the two new functions are the only additions to
+  its file-facing surface, and file I/O still lives in the frontend. Old saved
+  programs that used sparse line numbers as jump targets do not carry over;
+  this is the intended break, since line numbers are gone. Shipped and
+  verified end-to-end: label countdowns and the `IF ... THEN <label>`
+  shorthand, nested `GOSUB` unwinding inside a negative-STEP `FOR` loop,
+  file-line replace and delete, and a SAVE (raw source) / LOAD / RUN
+  round-trip. The libbasic test suite and the frontend SAVE/LOAD path are
+  valgrind clean. Also driven interactively in a live session: `lumi basic`
+  run in a window of a detached `lumi new -s t` session, the whole stack
+  rendered through GNU screen's PTY, where entering a labelled program by
+  file-line number, `LIST` showing the gutter with the label preserved, and
+  `RUN` looping through `IF N > 0 THEN count` all worked as at the pipe.
+- `lumi basic` `RUN` now validates the program before running it. A pre-run
+  pass reports a duplicate label or a jump (`GOTO`/`GOSUB`, or the
+  `IF ... THEN <label>` shorthand) to an undefined label, naming the file line
+  and the label as written, and aborts before any statement executes. This
+  closes the sharp edge the non-strict `IF ... THEN` left: a mistyped jump
+  target is now a clear up-front error rather than a mid-run failure or, worse,
+  a stray statement (a typo that happened to match a keyword such as `QUIT`).
+  The check only flags unambiguous jumps: explicit `GOTO`/`GOSUB` targets, and
+  a lone token after `THEN` that is not a statement keyword; `THEN END`,
+  `THEN PRINT ...`, and the like are left alone. Verified: undefined `GOTO`
+  aborts before line 1 runs, duplicate labels and mistyped `THEN` targets are
+  rejected, and a valid program with `THEN END` still runs; valgrind clean.
+- `lumi basic` `EDIT` gained a filename and save-and-run. `EDIT <file>` uses
+  that file as a persistent backing store instead of a throwaway temp: an
+  existing non-empty file is edited as it is (reopening a saved program), and a
+  missing or empty one is first seeded with the current in-memory program (so
+  `EDIT new.bas` starts a fresh file from what you have). `EDIT` with no name
+  keeps the temp-file behavior. Either way, on return the program is reloaded
+  and then run, so the edit/run cycle is one step (the QBasic F5 gesture); an
+  empty program is a quiet no-op and a run error prints as `?message`. The
+  filename parsing that SAVE/LOAD/EDIT share moved into one `extract_filename`
+  helper. All frontend commands, so libbasic stays a pure interpreter.
+  Verified: SAVE (quoted) / LOAD round-trip and the bare-word guards still
+  hold, the no-TTY `EDIT` reports cleanly, and the SAVE/LOAD/EDIT path is
+  valgrind clean.
+
+---
 
 [1]: https://github.com/OrangeTide/the-mechanical-researcher/tree/main/netchan-v2
 [2]: https://monocypher.org

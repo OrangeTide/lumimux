@@ -364,6 +364,86 @@ vt_state_reverse_index(struct vt_state *st)
 }
 
 void
+vt_kgfx_account(struct vt_state *st, const char *data, size_t len,
+    int cell_pw, int cell_ph)
+{
+	const char *p, *end;
+	int action = 0, cmove = 0;
+	int rows = 0, cols = 0, vpx = 0, spx = 0;
+	int nrows, ncols;
+
+	/* data is the APC payload: "G" + comma-separated key=value control,
+	 * then an optional ";" and image payload.  Parse only the keys that
+	 * bear on the cursor: a= (action), C= (cursor policy), r=/c= (display
+	 * rows/cols), v=/s= (image pixel height/width). */
+	if (len < 1 || data[0] != 'G')
+		return;
+
+	p = data + 1;
+	end = p;
+	while (end < data + len && *end != ';')
+		end++;
+
+	while (p < end) {
+		int	 key = *p++;
+		int	 vch;
+		long	 val = 0;
+		int	 sign = 1;
+
+		if (p < end && *p == '=')
+			p++;
+		vch = (p < end && *p != ',') ? (unsigned char)*p : 0;
+		if (p < end && *p == '-') {
+			sign = -1;
+			p++;
+		}
+		while (p < end && *p >= '0' && *p <= '9')
+			val = val * 10 + (*p++ - '0');
+		val *= sign;
+
+		switch (key) {
+		case 'a': action = vch;      break;	/* T or p = display */
+		case 'C': cmove = (int)val;  break;	/* 1 = keep cursor put */
+		case 'r': rows = (int)val;   break;	/* display rows */
+		case 'c': cols = (int)val;   break;	/* display cols */
+		case 'v': vpx = (int)val;    break;	/* image pixel height */
+		case 's': spx = (int)val;    break;	/* image pixel width */
+		}
+
+		while (p < end && *p != ',')
+			p++;
+		if (p < end && *p == ',')
+			p++;
+	}
+
+	if (action != 'T' && action != 'p')	/* not a display command */
+		return;
+	if (cmove)				/* client keeps the cursor put */
+		return;
+
+	/* cells the image spans (explicit r=/c=, else ceil(px / cell)) */
+	if (rows > 0)
+		nrows = rows;
+	else if (vpx > 0 && cell_ph > 0)
+		nrows = (vpx + cell_ph - 1) / cell_ph;
+	else
+		return;				/* cannot size the image */
+	if (cols > 0)
+		ncols = cols;
+	else if (spx > 0 && cell_pw > 0)
+		ncols = (spx + cell_pw - 1) / cell_pw;
+	else
+		ncols = 0;			/* leave the column where it is */
+
+	/* kitty (C=0) moves the cursor down by rows-1 and right by cols, so it
+	 * ends just past the bottom-right cell, on the last row of the image. */
+	while (nrows-- > 1)
+		vt_state_index(st);
+	st->cursor_col += ncols;
+	vt_state_cursor_clamp(st);
+}
+
+void
 vt_state_putchar(struct vt_state *st, uint32_t cp, int width)
 {
 	struct vt_cell *c;

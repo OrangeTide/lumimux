@@ -28,6 +28,7 @@
 #include "sessdir_state.h"
 #include "vt_buf.h"
 #include "rune_width.h"
+#include "cfg.h"
 #include "log.h"
 
 #include <errno.h>
@@ -125,6 +126,7 @@ struct mclient {
 	uint8_t		flags;
 	uint32_t	client_id;	/* same on every window of one client */
 	uint16_t	rows, cols;	/* the size this client asked for */
+	uint16_t	cell_pw, cell_ph;	/* this client's cell pixel size */
 	char		name[64];	/* display only, never a decision */
 	time_t		last_deny;	/* rate limit for refusal messages */
 
@@ -489,7 +491,7 @@ static void
 resize_to_fit(void)
 {
 	struct mclient *mc;
-	int rows = 0, cols = 0;
+	int rows = 0, cols = 0, cell_pw = 0, cell_ph = 0;
 
 	for (mc = mclient_first(); mc; mc = mclient_next(mc)) {
 		if (mc->flags & IPC_ATTACH_F_SIZE_OBSERVE)
@@ -500,9 +502,15 @@ resize_to_fit(void)
 			rows = mc->rows;
 		if (cols == 0 || mc->cols < cols)
 			cols = mc->cols;
+		/* cell pixel size is intrinsic to a terminal, so any active
+		 * client's value serves; take the first non-zero one. */
+		if (cell_pw == 0 && mc->cell_pw > 0) {
+			cell_pw = mc->cell_pw;
+			cell_ph = mc->cell_ph;
+		}
 	}
 	if (rows > 0 && cols > 0)
-		window_resize(win, rows, cols);
+		window_resize(win, rows, cols, cell_pw, cell_ph);
 }
 
 /* messages that change the window rather than observe it */
@@ -1010,6 +1018,8 @@ on_client_read(struct iox_loop *lp, int fd, unsigned events, void *arg)
 			    (int)len) >= 0 && sz.rows > 0 && sz.cols > 0) {
 				mc->rows = sz.rows;
 				mc->cols = sz.cols;
+				mc->cell_pw = sz.cell_pw;
+				mc->cell_ph = sz.cell_ph;
 				resize_to_fit();
 			}
 		}
@@ -1143,6 +1153,8 @@ on_new_client(struct iox_loop *lp, int fd, unsigned events, void *arg)
 			mc->client_id = at.client_id;
 			mc->rows = at.rows;
 			mc->cols = at.cols;
+			mc->cell_pw = at.cell_pw;
+			mc->cell_ph = at.cell_ph;
 			if (at.name && at.name_len > 0)
 				snprintf(mc->name, sizeof(mc->name), "%.*s",
 				    (int)at.name_len, at.name);
@@ -1290,7 +1302,9 @@ do_cleanup(void)
 
 /* ---- server ---- */
 
-static const char *shell;
+/* NULL-terminated command (program + args) for the window, or NULL to run
+ * the user's login shell. */
+static char **cmd_argv;
 
 /* (re)build this server's on-disk presence: the session directory, this
  * server's directory, its listening socket, its descriptor files, and its
@@ -1349,7 +1363,7 @@ register_server(void)
 		sessdir_write_file(session_name, getpid(),
 		    "pty", pty_path);
 	sessdir_write_file(session_name, getpid(), "title",
-	    shell ? shell : "shell");
+	    cmd_argv ? cmd_argv[0] : "shell");
 
 	/* register in session state */
 	st = sessdir_state_open(session_name);
@@ -1393,6 +1407,53 @@ on_sighup(struct iox_loop *lp, int signo, void *arg)
 	log_info("re-registered session directory after SIGHUP");
 }
 
+/* Apply [environment] defaults from lumi.conf to our own environment. Each
+ * key is exported only if it is not already set, so the caller's environment
+ * always wins. These are inherited by the shell that window_new forks, giving
+ * spawned programs a reasonable default for things like DISPLAY. */
+static int
+apply_env_default(const char *key, const char *value, void *arg)
+{
+	static const char prefix[] = "environment.";
+	size_t plen = sizeof(prefix) - 1;
+
+	(void)arg;
+
+	if (strncmp(key, prefix, plen) != 0)
+		return 0;
+	if (key[plen] == '\0')
+		return 0;
+
+	/* overwrite = 0: keep an existing value if one is already set */
+	setenv(key + plen, value, 0);
+	return 0;
+}
+
+static void
+load_env_defaults(void)
+{
+	struct cfg *cfg;
+	const char *xdg, *home;
+	char cfgpath[PATH_MAX];
+
+	xdg = getenv("XDG_CONFIG_HOME");
+	home = getenv("HOME");
+	if (xdg && xdg[0])
+		snprintf(cfgpath, sizeof(cfgpath), "%s/lumi/lumi.conf", xdg);
+	else if (home && home[0])
+		snprintf(cfgpath, sizeof(cfgpath),
+		    "%s/.config/lumi/lumi.conf", home);
+	else
+		return;
+
+	cfg = cfg_new();
+	if (!cfg)
+		return;
+	if (cfg_load(cfg, cfgpath) == 0)
+		cfg_each(cfg, apply_env_default, NULL);
+	cfg_free(cfg);
+}
+
 static int
 server(void)
 {
@@ -1408,8 +1469,12 @@ server(void)
 	 * must be set before window_new forks the shell */
 	setenv("LUMI_SESSION", session_name, 1);
 
-	/* create the window (forks the shell) */
-	win = window_new(shell, 24, 80);
+	/* apply [environment] defaults before window_new forks the shell,
+	 * so the shell and its children inherit them */
+	load_env_defaults();
+
+	/* create the window (forks the shell or the given command) */
+	win = window_new(cmd_argv, 24, 80);
 	if (!win) {
 		log_err("failed to create window");
 		return ERR;
@@ -1452,7 +1517,8 @@ server(void)
 static void
 usage(void)
 {
-	fprintf(stderr, "usage: lumi-mserver -s <name> [shell]\n");
+	fprintf(stderr,
+	    "usage: lumi-mserver -s <name> [command [args...]]\n");
 	fprintf(stderr, "  -s name  session name (required)\n");
 	exit(1);
 }
@@ -1463,7 +1529,7 @@ process_opts(int argc, char **argv)
 {
 	int opt;
 
-	while ((opt = getopt(argc, argv, "s:")) != -1) {
+	while ((opt = getopt(argc, argv, "+s:")) != -1) {
 		switch (opt) {
 		case 's':
 			session_name = optarg;
@@ -1478,7 +1544,7 @@ process_opts(int argc, char **argv)
 		return;
 	}
 	if (optind < argc)
-		shell = argv[optind];
+		cmd_argv = &argv[optind];	/* argv is NUL-terminated */
 }
 
 int

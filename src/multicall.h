@@ -5,9 +5,15 @@
 #ifndef MULTICALL_H
 #define MULTICALL_H
 
+#include <stddef.h>		/* size_t */
+#include <sys/types.h>		/* pid_t */
+
 int cmd_attach_main(int argc, char **argv);
 int cmd_attr_main(int argc, char **argv);
+int cmd_basic_main(int argc, char **argv);
 int cmd_detach_main(int argc, char **argv);
+int cmd_edit_main(int argc, char **argv);
+int cmd_files_main(int argc, char **argv);
 int cmd_kill_main(int argc, char **argv);
 int cmd_list_main(int argc, char **argv);
 int cmd_mserver_main(int argc, char **argv);
@@ -20,6 +26,27 @@ int cmd_proxy_main(int argc, char **argv);
 int cmd_reload_main(int argc, char **argv);
 int cmd_send_input_main(int argc, char **argv);
 int cmd_send_keys_main(int argc, char **argv);
+
+/* Result of lu_send_input(). */
+enum lu_send_result {
+	LU_SEND_OK = 0,
+	LU_SEND_NO_SESSION,	/* session directory not found */
+	LU_SEND_NO_TARGET,	/* no suitable window to send to */
+	LU_SEND_READONLY,	/* another client holds the keyboard */
+	LU_SEND_ERROR,		/* connect, handshake, or send failure */
+};
+
+/* Inject len bytes into a session window as one atomic input run. target > 0
+ * selects that server pid, 0 the focused window, and -1 a non-focused
+ * ("other") window, honoring $LUMI_SEND_TARGET when it names one. Shared by
+ * lumi-send-input and the in-session send bindings of lumi edit and basic. */
+enum lu_send_result lu_send_input(const char *session, pid_t target,
+    const char *data, size_t len);
+
+/* Resolve a 0-based window number (as shown in the tab bar) to its server pid,
+ * or 0 when the number is out of range or names an empty slot. */
+pid_t lu_window_pid(const char *session, int index);
+
 int cmd_share_main(int argc, char **argv);
 int cmd_splash_main(int argc, char **argv);
 int cmd_version_main(int argc, char **argv);

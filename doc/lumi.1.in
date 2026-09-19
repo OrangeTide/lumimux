@@ -1,7 +1,7 @@
 .\" lumi.1 : manual page for lumiMUX
 .\" Copyright (c) 2026 Jon Mayo
 .\" Licensed under MIT-0 OR PUBLIC DOMAIN
-.TH LUMI 1 "2026-05-09" "lumiMUX" "User Commands"
+.TH LUMI 1 "2026-09-16" "lumiMUX @VERSION@" "User Commands"
 .SH NAME
 lumi \- terminal multiplexer
 .SH SYNOPSIS
@@ -537,14 +537,17 @@ Create a new window in an existing session.
 .PP
 .B lumi new\-window
 .RB [ "\-s name" ]
-.RI [ shell ]
+.RI [ command " [" args ...]]
 .TP
 .BI \-s " name"
 Session name (default:
 .BR 0 ).
 .TP
-.I shell
-Shell command to run in the new window.
+.IR command " [" args ...]
+Program and arguments to run in the new window, executed directly (not
+through a shell). With no command the window runs the user's login shell.
+Option parsing stops at the command, so its own options are passed through
+unchanged.
 .SS lumi attr
 Get, set, delete, or list per-session attributes.
 .PP
@@ -592,6 +595,284 @@ Chosen at random if omitted.
 .I name
 Text displayed on the splash screen (default:
 .BR lumiMUX ).
+.SS lumi files
+Browse the filesystem in a full-screen terminal UI.
+.PP
+.B lumi files
+.RI [ path ]
+.PP
+Starts in
+.I path
+or the current directory. The listing shows directories before files, with
+a
+.B ..
+entry to move to the parent. Directory contents and a peek at text files
+appear in a preview pane on terminals at least 64 columns wide.
+.TP
+.I path
+Directory to open (default: the current directory).
+.PP
+Keys:
+.RB [ j / k ]
+or the arrow keys move the selection,
+.RB [ g / G ]
+jump to the first or last entry,
+.RB [ Enter ]
+or
+.RB [ l ]
+enters a directory or views a file in
+.BR $PAGER ,
+.RB [ e ]
+edits the selected file in
+.BR $EDITOR ,
+.RB [ o ]
+and
+.RB [ O ]
+open it in a new window of the current session (running
+.BR $PAGER " or " $EDITOR )
+when run inside
+.BR lumi ,
+.RB [ Backspace ]
+or
+.RB [ h ]
+returns to the parent, and
+.RB [ q ]
+or
+.B Esc
+quits.
+.PP
+.RB [ Ctrl\-U ]
+and
+.RB [ Ctrl\-D ]
+scroll the preview pane by half a screen, and
+.RB [ . ]
+toggles whether dot (hidden) files are listed.
+.PP
+Three operations change the filesystem.
+.RB [ m ]
+prompts for a name and creates a directory,
+.RB [ r ]
+renames the selection (the prompt is pre-filled with the current name), and
+.RB [ d ]
+deletes the selection after a yes/no confirmation. A directory is removed
+only when empty. New names may not contain
+.BR / ,
+so an operation stays within the current directory.
+.SS lumi edit
+Edit a text file in a full-screen terminal UI.
+.PP
+.B lumi edit
+.RI [ file ]
+.PP
+Opens
+.I file
+for editing, or an empty buffer when no path is given. A path that does not
+exist opens as a new empty buffer saved to that name. The editor is
+modeless: printable characters are inserted at the cursor.
+.TP
+.I file
+File to edit (default: an unnamed empty buffer).
+.PP
+Keys: the arrow keys move the cursor,
+.RB [ Home / End ]
+go to the start or end of the line,
+.RB [ PgUp / PgDn ]
+scroll by a screen,
+.RB [ Enter ]
+splits the line,
+.RB [ Backspace ]
+and
+.RB [ Delete ]
+remove the character before or after the cursor and join lines at the ends,
+.RB [ Ctrl-Z ]
+and
+.RB [ Ctrl-Y ]
+undo and redo,
+.RB [ Ctrl-S ]
+saves (prompting for a name when the buffer has none), and
+.RB [ Ctrl-Q ]
+quits, prompting first when the buffer has unsaved changes.
+.PP
+Selection and clipboard: holding
+.B Shift
+with a movement key extends a selection, which is shown in reverse video.
+.RB [ Ctrl-C ]
+copies the selection to an internal clipboard, or the current line when
+there is no selection.
+.RB [ Ctrl-X ]
+cuts the selection, and
+.RB [ Ctrl-V ]
+pastes the clipboard at the cursor, replacing the selection when one is
+active.
+.PP
+Copying or cutting also mirrors the text to the terminal's system clipboard
+with an OSC 52 escape, so it can be pasted into other applications.
+Terminals without OSC 52 support ignore it. The reverse direction is served
+by bracketed paste: text pasted from another application through the terminal
+is inserted literally.
+.PP
+Bracketed paste is supported: text pasted into the terminal is inserted
+literally at the cursor, so control characters and newlines in the paste
+do not trigger editor commands.
+.PP
+.RB [ Ctrl\-F ]
+prompts for a string and moves the cursor to the next match, searching
+forward from the cursor and wrapping to the top. The search is
+case-sensitive, and pressing
+.B Enter
+on the pre-filled prompt repeats the last search.
+.RB [ Ctrl\-L ]
+prompts for a 1-based line number and jumps to it, clamping to the last
+line.
+.RB [ F1 ]
+shows a full-screen list of the key bindings; any key returns to editing.
+The status bar shows an
+.RB [ F1 ]
+hint when the editor opens.
+.PP
+When run inside a
+.B lumi
+session,
+.RB [ Ctrl\-G ]
+sends the selection, or the current line when nothing is selected, to
+another window of the session as typed input, followed by a carriage
+return so it runs there. See
+.B lumi send\-input
+for how the target window is chosen.
+.SS lumi basic
+A BASIC-style calculator that reads statements from standard input.
+.PP
+.B lumi basic
+.PP
+Each line is one statement. A bare expression prints its value, so the tool
+works as a calculator. Expressions use the usual operators with
+.B ^
+for exponentiation, comparisons that yield
+.B 1
+or
+.BR 0 ,
+and functions
+.BR SIN ", " COS ", " TAN ", " ATN ", " SQR ", " EXP ", " LOG ", " ABS ", "
+.BR INT ", and " SGN .
+Variable names are case-insensitive and an unset variable reads as zero.
+.PP
+Values may also be vectors, written
+.BR [1, " " 2, " " 3] ,
+or matrices, written
+.BR [[1, " " 2], " " [3, " " 4]] .
+The operators
+.BR + " " \- " and " *
+work elementwise, with a scalar broadcast over every element, and a stored
+vector or matrix is indexed
+.RB ( 1 -based) as
+.IR v ( i )
+or
+.IR m ( i , " " j ).
+Functions
+.BR ZEROS ", " RANGE ", " DOT ", " MATMUL ", and " LEN
+build and combine them. Vectors and matrices are values, not variables to
+assign into: there is no
+.IR v ( i ) " = " x .
+.PP
+Statements:
+.TP
+.BI PRINT " item" ...
+Print string literals and expression values, separated by
+.B ,
+(a space between) or
+.B ;
+(nothing between).
+.TP
+.BR LET " " \fIname\fR " = " \fIexpr\fR
+Assign a variable. The
+.B LET
+keyword is optional.
+.TP
+.BR DEF " " \fIname\fR ( \fIparam\fR ) " = " \fIexpr\fR
+Define a function of one parameter, called as
+.IR name ( arg ).
+By convention names begin with
+.BR FN .
+.TP
+.BR PLOT " " \fIexpr\fR " FROM " \fIa\fR " TO " \fIb\fR
+Draw an ASCII graph of
+.I expr
+as a function of
+.I X
+sampled across the range. With a vector argument,
+.BI PLOT " v"
+plots its elements instead.
+.TP
+.BI REM " text"
+A comment.
+.TP
+.B QUIT
+Leave the REPL.
+.BR EXIT " and " BYE
+do the same.
+.PP
+A line that begins with a number edits that
+.I file
+line of the stored program (1\-based) instead of being run: the numbered
+text replaces that line, a number past the end appends a line, and a bare
+number deletes the line. The program has no BASIC line numbers.
+.B LIST
+shows the program with a line\-number gutter (so you know which number to
+edit),
+.B NEW
+clears it, and
+.B RUN
+executes it from the first line. A running program adds control flow:
+.BR GOTO " " \fIlabel\fR ,
+.BR GOSUB " " \fIlabel\fR " and " RETURN ,
+.BR FOR " " \fIv\fR " = " \fIa\fR " TO " \fIb\fR " [STEP " \fIs\fR "] ... " NEXT ,
+.BR IF " " \fIcond\fR " THEN " \fIstmt-or-label\fR ,
+.BR INPUT " " \fIvar\fR ,
+and
+.BR END " (or " STOP ).
+Jump targets are labels, not line numbers. A label is an identifier
+followed by a colon at the start of a line
+.RB ( "loop:" ),
+alone or in front of a statement
+.RB ( "loop: PRINT X" ),
+and is matched without regard to case.
+.B RUN
+checks the program first and reports a duplicate label or a jump to an
+undefined label, naming the file line, before running anything.
+.PP
+The program is managed from the prompt.
+.BR SAVE " " \fIfile\fR
+writes it out and
+.BR LOAD " " \fIfile\fR
+reads a program back, replacing the current one. These are prompt commands,
+not language statements, so the interpreter itself does no file I/O.
+.BR EDIT " [" \fIfile\fR ]
+opens the program in
+.B lumi edit
+for full-screen editing, reads it back on exit, and then runs it
+(save-and-run). With no
+.IR file ,
+the program goes through a temporary file that is removed afterward. With a
+.IR file ,
+that file is a persistent backing store: an existing non-empty file is edited
+as it is, and a missing or empty one is first filled with the current program,
+so
+.B EDIT
+.I file
+both starts new files and reopens saved ones.
+.B EDIT
+needs a terminal.
+.PP
+When run inside a
+.B lumi
+session,
+.BR SEND " " \fIexpr\fR
+evaluates
+.I expr
+and sends its value to another window of the session, followed by a
+carriage return. See
+.B lumi send\-input
+for how the target window is chosen.
 .SS lumi version
 Print version information.
 .PP
@@ -605,17 +886,115 @@ Reload server configuration.
 .PP
 Not yet implemented.
 .SS lumi send\-keys
-Send keystrokes to a session.
+Send keystrokes to a session window, translating key names to their byte
+sequences.
 .PP
 .B lumi send\-keys
+.RB [ \-s
+.IR session ]
+.RB [ \-w
+.I pid
+|
+.BI \-i " index"
+|
+.BR \-o ]
+.RB [ \-l ]
+.I key ...
 .PP
-Not yet implemented.
+Each argument is a key name, a modified key, or literal text, and the
+translated bytes are sent as one atomic run to the target window, chosen
+the same way as
+.BR "lumi send\-input" .
+Recognized key names (case-insensitive) are
+.BR Enter ", " Return ", " Tab ", " Escape ", " Space ", " BSpace ", "
+.BR Up ", " Down ", " Left ", " Right ", " Home ", " End ", " PPage ", "
+.BR NPage ", " IC ", " DC ", and " F1 " through " F12 .
+A key may be prefixed with
+.B C\-
+for Ctrl (on a single character) or
+.B M\-
+for Alt. Anything not recognized, and any argument under
+.BR \-l ,
+is sent verbatim. Arguments carry no implicit separator, so use
+.B Space
+or a quoted string for spaces, as in
+.RB \(dq "send\-keys \(dqecho hi\(dq Enter" \(dq.
+.TP
+.BI \-s " session"
+Session to target. Defaults to
+.B $LUMI_SESSION
+or
+.BR 0 .
+.TP
+.BI \-w " pid"
+Target the window with this micro-server process id.
+.TP
+.BI \-i " index"
+Target the window with this number, the stable per-window number shown in
+the status/tab bar and selected by the prefix plus a digit. Numbers are
+0-based, and an out-of-range or empty number is an error.
+.TP
+.B \-o
+Target a window other than the focused one (see
+.BR "lumi send\-input" ).
+.TP
+.B \-l
+Send every argument literally, without key-name translation.
 .SS lumi send\-input
-Send raw input to a pane.
+Inject raw bytes into a session window, as if they were typed.
 .PP
 .B lumi send\-input
+.RB [ \-s
+.IR session ]
+.RB [ \-w
+.I pid
+|
+.BI \-i " index"
+|
+.BR \-o ]
+.RI [ bytes ...]
 .PP
-Not yet implemented.
+The bytes come from the arguments, joined with single spaces, or from
+standard input when no argument is given. They are sent verbatim: no
+newline is appended, so include a carriage return (for example from
+.BR printf (1)
+into standard input) to submit a line to a shell. The input is delivered
+as one atomic run, so it cannot interleave with another client's typing.
+.TP
+.BI \-s " session"
+Session to target. Defaults to
+.B $LUMI_SESSION
+or
+.BR 0 .
+.TP
+.BI \-w " pid"
+Target the window whose micro-server has this process id.
+.TP
+.BI \-i " index"
+Target the window with this number, the stable per-window number shown in
+the status/tab bar and selected by the prefix plus a digit. Numbers are
+0-based, and an out-of-range or empty number is an error.
+.TP
+.B \-o
+Target a window other than the focused one, preferring
+.B $LUMI_SEND_TARGET
+when it names a live window. This is what
+.BR "lumi edit" 's
+.RB [ Ctrl\-G ]
+and
+.BR "lumi basic" 's
+.B SEND
+use, so a tool in the focused window sends to the pane beside it.
+.PP
+Without
+.BR \-w ,
+.BR \-i ,
+or
+.BR \-o ,
+the bytes go to the session's focused window. The command needs the write
+role, so if another client currently holds the keyboard (single-writer
+mode), it reports the window as read-only and sends nothing. When the
+target is detached, or in multi-writer mode, the injection proceeds.
 .SH INTERNAL COMMANDS
 .SS lumi\-mserver
 Single-PTY micro-server process.
@@ -815,7 +1194,7 @@ p, Ctrl\-P	Previous window
 Ctrl\-A	Last window (most recently used)
 0\-9	Select window by number
 ,	Swap number with next lower window
-.	Swap number with next higher window
+\&.	Swap number with next higher window
 d, D	Detach from session
 w, "	Window list
 s	Toggle taskbar
@@ -837,7 +1216,7 @@ U	Session picker
 ]	Paste from internal clipboard
 y	Sync internal clipboard to system
 :	Open the command input line
-l, Ctrl\-L	Redisplay (resync and repaint the screen)
+l, Ctrl\-L	Redisplay (resync and repaint)
 .TE
 .PP
 The
@@ -1038,6 +1417,28 @@ expansions.
 .TP
 .B ui.theme
 Name of the theme to use for turbo mode window decorations.
+.SS Environment defaults
+Keys in an
+.B [environment]
+section set environment variables for the shell started in a window and
+for every program run inside it.
+A variable is exported only if it is not already set in the environment
+that started the session, so an inherited value always wins.
+This is useful for giving programs a reasonable default, for example a
+.B DISPLAY
+value for a session that may be started without one:
+.PP
+.RS 4
+.nf
+[environment]
+DISPLAY = :0
+EDITOR = vi
+.fi
+.RE
+.PP
+The defaults are applied when the session server starts, before the first
+shell is forked.
+They do not affect an already-running session.
 .SS Bindings
 Key bindings are declared in a
 .B [bind]
@@ -1315,6 +1716,16 @@ Notification escape sequences emitted by child applications
 to the outer terminal so pop-ups reach the user, regardless of which
 window is in the foreground.
 .TP
+.B System clipboard (OSC 52)
+A child application's OSC 52 set-clipboard request is forwarded to the
+outer terminal, so copying inside a window (for example with
+.BR "lumi edit" )
+reaches the system clipboard. Read requests
+.RB ( "OSC 52 ... ;?" )
+are not forwarded, since their reply has no window to route back to.
+The OSC parser grows on demand to carry the payload, up to a 256 KB cap,
+which covers a clipboard of roughly 190 KB.
+.TP
 .B Cursor shape
 DECSCUSR (CSI Ps SP q) cursor shape changes are forwarded.
 .SH SECURITY
@@ -1427,6 +1838,13 @@ as the default session name when
 .B \-s
 is not given.
 .TP
+.B LUMI_SEND_TARGET
+Process id of a window to prefer when
+.B lumi send\-input \-o
+(and the
+.BR "lumi edit" / basic
+send bindings) pick a window other than the focused one.
+.TP
 .B LUMI_LIBEXEC_PATH
 Override the search path for
 .BI lumi- command
@@ -1435,6 +1853,35 @@ executables.
 .B LUMI_DEBUG
 Set to a file path to enable debug tracing.
 Diagnostic output is appended to the specified file.
+.TP
+.B PAGER
+Program used by
+.B lumi files
+to view a file (default:
+.BR less ).
+.TP
+.B EDITOR
+Program used by
+.B lumi files
+to edit a file (default:
+.BR vi ).
+.SH FILES
+.TP
+.I @PREFIX@/bin/lumi
+The multi-call binary.
+.TP
+.I @PREFIX@/bin/lumi\-*
+The per-command executables
+.RB ( lumi-attach ", " lumi-new ", " ...),
+found on
+.B PATH
+or through
+.BR LUMI_LIBEXEC_PATH .
+.TP
+.I ~/.config/lumi/lumi.conf
+Per-user configuration
+.RB ( XDG_CONFIG_HOME
+is honored).
 .SH SEE ALSO
 .BR screen (1),
 .BR tmux (1),

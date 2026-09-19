@@ -60,6 +60,29 @@ struct tkbd_seq {
 int tkbd_parse(struct tkbd_seq *seq, const char *buf, size_t sz);
 
 /*
+ * Sentinel for tkbd_seq.ch meaning "no character": distinct from 0, which is
+ * a valid NUL codepoint. Preset seq.ch to this before tkbd_parse() so a
+ * sequence that carries no character reads back as absent rather than NUL.
+ */
+#define TKBD_CH_NONE 0x7FFFFFFFU
+
+/* Callback invoked by tkbd_drain() for each decoded sequence. */
+typedef void (*tkbd_dispatch_fn)(void *ctx, const struct tkbd_seq *seq);
+
+/*
+ * Decode every complete sequence at the front of buf and hand each to cb.
+ * A lone trailing ESC is held (left unconsumed) rather than dispatched as
+ * the ESC key, because the next read may carry the rest of a control or
+ * mouse sequence split on the ESC byte; pass force_esc nonzero to dispatch
+ * it (used once a timeout confirms no continuation is coming).
+ *
+ * Returns the number of bytes consumed. The caller keeps buf[consumed..sz)
+ * for the next read.
+ */
+size_t tkbd_drain(const char *buf, size_t sz, int force_esc,
+    tkbd_dispatch_fn cb, void *ctx);
+
+/*
  * Write a key description ("Ctrl+C", "Shift+Alt+PgUp", "Z", etc.) to the buffer
  * pointed to by buf. No more than sz bytes are written.
  *

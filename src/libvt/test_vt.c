@@ -887,6 +887,88 @@ test_osc_cb_notify(void)
 	PASS();
 }
 
+/* Large-OSC capture: records only length and boundary bytes so it can
+ * observe payloads far larger than the small fixed callback buffer above. */
+static size_t osc_big_len;
+static char osc_big_first, osc_big_last;
+
+static void
+test_osc_big_cb(void *ctx, const char *data, size_t len)
+{
+	(void)ctx;
+	osc_big_len = len;
+	osc_big_first = len ? data[0] : 0;
+	osc_big_last = len ? data[len - 1] : 0;
+}
+
+static void
+test_osc_large(void)
+{
+	struct vt_parse *p;
+	char *seq;
+	size_t body = 60000;		/* base64 body, well past the old 4 KB */
+	size_t i, off;
+
+	TEST("OSC 52 larger than the old 4 KB cap forwards in full");
+	p = vt_parse_new(&test_ops, NULL);
+	ASSERT(p != NULL, "parse new failed");
+	vt_parse_set_osc_cb(p, test_osc_big_cb, NULL);
+
+	/* build ESC ] 52;c;<body> BEL */
+	seq = malloc(6 + 5 + body + 1);
+	ASSERT(seq != NULL, "alloc failed");
+	off = 0;
+	memcpy(seq + off, "\033]52;c;", 7);
+	off += 7;
+	for (i = 0; i < body; i++)
+		seq[off++] = (char)('A' + (i % 26));
+	seq[off++] = '\007';
+
+	osc_big_len = 0;
+	vt_parse_feed(p, seq, off);
+	/* payload is "52;c;" (5) + body, with the leading ESC ] and the BEL
+	 * consumed as framing */
+	ASSERT(osc_big_len == 5 + body, "large OSC payload truncated");
+	ASSERT(osc_big_first == '5', "payload should start at the number");
+	ASSERT(osc_big_last == (char)('A' + ((body - 1) % 26)),
+	    "payload tail wrong");
+
+	free(seq);
+	vt_parse_free(p);
+	PASS();
+}
+
+static void
+test_osc_capped(void)
+{
+	struct vt_parse *p;
+	char *seq;
+	size_t body = 400000;		/* deliberately past VT_OSC_MAX */
+	size_t off;
+
+	TEST("an oversized OSC is capped, not overrun");
+	p = vt_parse_new(&test_ops, NULL);
+	ASSERT(p != NULL, "parse new failed");
+	vt_parse_set_osc_cb(p, test_osc_big_cb, NULL);
+
+	seq = malloc(2 + body + 1);
+	ASSERT(seq != NULL, "alloc failed");
+	seq[0] = '\033';
+	seq[1] = ']';
+	memset(seq + 2, 'Z', body);
+	seq[2 + body] = '\007';
+	off = 2 + body + 1;
+
+	osc_big_len = 0;
+	vt_parse_feed(p, seq, off);
+	ASSERT(osc_big_len > 4096, "cap should be well above the old limit");
+	ASSERT(osc_big_len < body, "oversized OSC must be capped");
+
+	free(seq);
+	vt_parse_free(p);
+	PASS();
+}
+
 static void
 test_dcs_normal_after(void)
 {
@@ -1541,6 +1623,8 @@ main(void)
 	test_dcs_empty();
 	test_dcs_normal_after();
 	test_osc_cb_notify();
+	test_osc_large();
+	test_osc_capped();
 
 	/* integrated */
 	test_integrated_cursor_movement();

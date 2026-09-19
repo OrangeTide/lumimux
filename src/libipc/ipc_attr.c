@@ -30,21 +30,27 @@ send_txn_msg(int fd, uint32_t type, uint32_t txn_id)
 	return ipc_msg_send(fd, type, buf, (uint32_t)n);
 }
 
-/* wait for a response and check it matches the expected type.
- * returns 0 on expected type, -1 on error or unexpected type. */
+/* wait for the expected reply, skipping unrelated messages the server may
+ * have queued to us after ATTACH (its screen replay, PTY flags, role
+ * changes). returns 0 on the expected type, -1 on error, an error reply, or
+ * if too many other messages arrive first. */
 static int
 recv_expect(int fd, uint32_t expect, void *buf, size_t bufsz,
     uint32_t *out_len)
 {
 	uint32_t type;
+	int guard;
 
-	if (ipc_msg_recv(fd, &type, buf, bufsz, out_len) != 0)
-		return ERR;
-	if (type == IPC_MSG_ERROR)
-		return ERR;
-	if (type != expect)
-		return ERR;
-	return OK;
+	for (guard = 0; guard < 100000; guard++) {
+		if (ipc_msg_recv(fd, &type, buf, bufsz, out_len) != 0)
+			return ERR;
+		if (type == IPC_MSG_ERROR)
+			return ERR;
+		if (type == expect)
+			return OK;
+		/* something else (replay, flags): keep waiting for our reply */
+	}
+	return ERR;
 }
 
 int

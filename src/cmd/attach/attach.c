@@ -459,11 +459,21 @@ static int
 mconn_ipc_send_size(struct mconn *mc, uint32_t type, int rows, int cols)
 {
 	struct ipc_size sz;
-	uint8_t buf[16];
+	uint8_t buf[24];
+	struct winsize ws;
 	int n;
 
 	sz.rows = (uint16_t)rows;
 	sz.cols = (uint16_t)cols;
+	sz.cell_pw = 0;
+	sz.cell_ph = 0;
+	/* include the outer terminal's cell pixel size so the server can set
+	 * the pty pixel dimensions and do graphics cursor accounting */
+	if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0 &&
+	    ws.ws_row > 0 && ws.ws_col > 0) {
+		sz.cell_pw = (uint16_t)(ws.ws_xpixel / ws.ws_col);
+		sz.cell_ph = (uint16_t)(ws.ws_ypixel / ws.ws_row);
+	}
 	n = ipc_size_encode(&sz, buf, sizeof(buf));
 	if (n < 0)
 		return -1;
@@ -580,6 +590,17 @@ struct win_layout {
 	int		valid;		/* nonzero if populated */
 };
 
+/* A kitty graphics image: the raw APC bytes to emit, and the screen cell to
+ * emit them at.  Kept per window so images can be redrawn when switching
+ * back to a window, since the outer terminal's image layer is cleared on
+ * switch-out. */
+#define KGFX_MAX 32
+struct kgfx_img {
+	char	*raw;		/* full "\e <intro> ... \e\\" bytes */
+	size_t	 len;
+	int	 row, col;	/* screen cell of the image top-left */
+};
+
 struct client_window {
 	uint32_t	id;
 	struct vt_state	*vt;
@@ -592,6 +613,8 @@ struct client_window {
 	struct win_layout layout;	/* current mode's placement */
 	struct win_layout prev_layout;	/* saved from previous mode */
 	char		title_override[128];	/* :title override, "" = none */
+	struct kgfx_img	gfx[KGFX_MAX];	/* recorded images, for switch replay */
+	int		gfx_n;
 };
 
 static struct client_window cwins[CLIENT_WIN_MAX];
@@ -723,14 +746,100 @@ cwin_focused(void)
 	return NULL;
 }
 
+/* cell pixel size of the outer terminal; each out param is 0 when it cannot
+ * be determined (winsize carries no pixel dimensions). */
+static void
+outer_cell_px(int *pw, int *ph)
+{
+	struct winsize ws;
+
+	*pw = 0;
+	*ph = 0;
+	if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) != 0)
+		return;
+	if (ws.ws_row == 0 || ws.ws_col == 0)
+		return;
+	*pw = ws.ws_xpixel / ws.ws_col;
+	*ph = ws.ws_ypixel / ws.ws_row;
+}
+
+/* Graphics images recorded during a parse, to be emitted at render time.
+ * Writing an image to the outer terminal mid-parse (as this callback used
+ * to) lands it at whatever position the previous render left the outer
+ * cursor, because rendering is deferred.  Recording the image with its cell
+ * position and emitting it after the renderer has drawn and positioned the
+ * cells anchors it to the content. */
+/* Per-frame emit queue.  Entries reference raw bytes owned by a window's
+ * persistent store (client_window.gfx), so the queue never frees them; it
+ * only records what to draw after the cells have been rendered. */
+#define PENDING_GFX_MAX 64
+static struct kgfx_img pending_gfx[PENDING_GFX_MAX];
+static int pending_gfx_n;
+
+/* window whose images are currently drawn on the outer terminal, so a switch
+ * can clear them and redraw the incoming window's */
+static uint32_t gfx_shown_win;
+
+static void
+pending_gfx_push(const struct kgfx_img *g)
+{
+	if (pending_gfx_n >= PENDING_GFX_MAX)
+		return;
+	pending_gfx[pending_gfx_n++] = *g;	/* shares g->raw, does not own it */
+}
+
+/* Append an image to a window's persistent store, evicting the oldest when
+ * full, and queue it for emission this frame.  The store owns the bytes. */
+static void
+win_gfx_add(struct client_window *cw, int row, int col, int introducer,
+    const char *data, size_t len)
+{
+	struct kgfx_img *g;
+	char *raw;
+
+	raw = malloc(len + 4);
+	if (!raw)
+		return;
+	raw[0] = '\033';
+	raw[1] = (char)introducer;
+	memcpy(raw + 2, data, len);
+	raw[len + 2] = '\033';
+	raw[len + 3] = '\\';
+
+	if (cw->gfx_n >= KGFX_MAX) {
+		free(cw->gfx[0].raw);
+		memmove(cw->gfx, cw->gfx + 1,
+		    (KGFX_MAX - 1) * sizeof(cw->gfx[0]));
+		cw->gfx_n = KGFX_MAX - 1;
+	}
+	g = &cw->gfx[cw->gfx_n++];
+	g->raw = raw;
+	g->len = len + 4;
+	g->row = row;
+	g->col = col;
+	pending_gfx_push(g);
+}
+
+static void
+win_gfx_free(struct client_window *cw)
+{
+	int i;
+
+	for (i = 0; i < cw->gfx_n; i++)
+		free(cw->gfx[i].raw);
+	cw->gfx_n = 0;
+}
+
 /* DCS passthrough: forward SIXEL and other DCS sequences to the outer
- * terminal when the source pane is fullscreen (single pane, no splits). */
+ * terminal when the source pane is fullscreen (single pane, no splits).
+ * Kitty graphics are recorded instead of written, so pending_gfx_flush()
+ * can emit them at render time anchored to their cell. */
 static void
 dcs_passthru(void *ctx, int introducer, const char *data, size_t len)
 {
+	uint32_t id = (uint32_t)(uintptr_t)ctx;
+	struct client_window *cw = cwin_find(id);
 	char intro[2];
-
-	(void)ctx;
 
 	/* only pass through when a single pane is visible */
 	if (!tilemgr || tile_pane_count(tilemgr) != 1)
@@ -738,7 +847,22 @@ dcs_passthru(void *ctx, int introducer, const char *data, size_t len)
 	if (!watching)
 		return;
 
-	/* write raw DCS to stdout: ESC <introducer> <data> ESC \ */
+	/* kitty graphics from the visible window: record for render-time
+	 * emission at the current cell, then advance the cursor past the
+	 * image so the following output flows below it. */
+	if (introducer == '_' && len >= 1 && data[0] == 'G' &&
+	    cw && watched_id == id) {
+		int cpw, cph;
+
+		outer_cell_px(&cpw, &cph);
+		win_gfx_add(cw, cw->vt->cursor_row, cw->vt->cursor_col,
+		    introducer, data, len);
+		vt_kgfx_account(cw->vt, data, len, cpw, cph);
+		need_render = 1;
+		return;
+	}
+
+	/* other DCS/APC (SIXEL, etc.): forward verbatim as before */
 	intro[0] = '\033';
 	intro[1] = (char)introducer;
 	tio_write(STDOUT_FILENO, intro, 2);
@@ -785,6 +909,19 @@ osc_passthru(void *ctx, const char *data, size_t len)
 		 * actual color spec) has nothing to route back */
 		if (len - i - 1 != 1 || data[i + 1] != '?')
 			return;
+	} else if (num == 52) {
+		/* OSC 52 set-clipboard, "52;<sel>;<b64>": forward a window's
+		 * copy to the outer terminal's system clipboard. A read
+		 * request ("52;<sel>;?") would make the terminal reply to our
+		 * stdin, which we do not route back, so drop it. */
+		const char *semi2 = memchr(data + i + 1, ';', len - i - 1);
+		size_t dlen;
+
+		if (!semi2)
+			return;			/* malformed: no data field */
+		dlen = (size_t)(data + len - (semi2 + 1));
+		if (dlen == 1 && semi2[1] == '?')
+			return;			/* read request */
 	} else if (num != 9 && num != 99 && num != 777) {
 		return;
 	}
@@ -858,13 +995,14 @@ cwin_add_sized(uint32_t id, int rows, int cols)
 		vt_state_free(cw->vt);
 		return NULL;
 	}
-	vt_parse_set_dcs_cb(cw->parser, dcs_passthru, NULL);
+	vt_parse_set_dcs_cb(cw->parser, dcs_passthru, (void *)(uintptr_t)id);
 	vt_parse_set_osc_cb(cw->parser, osc_passthru, (void *)(uintptr_t)id);
 	cw->pred = predict_new();
 	cw->keep_open = -1;	/* inherit global default */
 	cw->dead = 0;
 	cw->scroll_lock = 0;
 	cw->input_lock = 0;
+	cw->gfx_n = 0;		/* no recorded images yet (reused slot) */
 	cwin_count++;
 	return cw;
 }
@@ -892,6 +1030,14 @@ cwin_remove(uint32_t id)
 			predict_free(cwins[i].pred);
 			vt_parse_free(cwins[i].parser);
 			vt_state_free(cwins[i].vt);
+			/* clear this window's images from the outer terminal if
+			 * they are the ones currently shown, then release them */
+			if (cwins[i].gfx_n > 0 && gfx_shown_win == id) {
+				tio_write(STDOUT_FILENO,
+				    "\033_Ga=d,d=a\033\\", 12);
+				gfx_shown_win = 0;
+			}
+			win_gfx_free(&cwins[i]);
 			cwins[i] = cwins[--cwin_count];
 			return;
 		}
@@ -911,6 +1057,7 @@ cwin_free_all(void)
 		predict_free(cwins[i].pred);
 		vt_parse_free(cwins[i].parser);
 		vt_state_free(cwins[i].vt);
+		win_gfx_free(&cwins[i]);
 	}
 	cwin_count = 0;
 }
@@ -1275,6 +1422,28 @@ turbo_repaint(void)
 
 /* ---- tiled mode helpers ---- */
 
+/* emit graphics images recorded during parsing, after the cells have been
+ * drawn and the cursor positioned.  Each image is written at its recorded
+ * cell; the writes move the outer cursor, so tracking is invalidated and the
+ * cursor is put back where the rendered content expects it (crow/ccol). */
+static void
+pending_gfx_flush(int crow, int ccol)
+{
+	int i;
+
+	if (pending_gfx_n == 0)
+		return;
+	for (i = 0; i < pending_gfx_n; i++) {
+		render_move_cursor(renderer, STDOUT_FILENO,
+		    pending_gfx[i].row, pending_gfx[i].col);
+		tio_write(STDOUT_FILENO, pending_gfx[i].raw,
+		    pending_gfx[i].len);
+	}
+	pending_gfx_n = 0;	/* raw is owned by each window's store */
+	render_invalidate_cursor(renderer);
+	render_move_cursor(renderer, STDOUT_FILENO, crow, ccol);
+}
+
 static void
 tiled_render(void)
 {
@@ -1292,12 +1461,45 @@ tiled_render(void)
 		    tile_screen(tilemgr), tile_rows(tilemgr),
 		    tile_cols(tilemgr), crow, ccol, cvis);
 		tile_need_full = 0;
+
+		/* A full redraw emits ED, which the outer terminal treats as
+		 * deleting every image (each is anchored to a now-cleared
+		 * cell).  Redraw the whole visible window's image store. */
+		{
+			struct client_window *cw = cwin_find(watched_id);
+			int i;
+
+			pending_gfx_n = 0;	/* store re-emit supersedes queue */
+			if (cw)
+				for (i = 0; i < cw->gfx_n; i++)
+					pending_gfx_push(&cw->gfx[i]);
+			gfx_shown_win = watched_id;
+		}
 	} else {
+		/* Diff redraw keeps images in place.  If the visible window
+		 * changed without a full redraw (no ED ran), clear the old
+		 * window's images and queue the new window's; otherwise the
+		 * queue already holds any images drawn this frame. */
+		if (watched_id != gfx_shown_win) {
+			struct client_window *cw = cwin_find(watched_id);
+			int i;
+
+			tio_write(STDOUT_FILENO, "\033_Ga=d,d=a\033\\", 12);
+			render_invalidate_cursor(renderer);
+			pending_gfx_n = 0;
+			if (cw)
+				for (i = 0; i < cw->gfx_n; i++)
+					pending_gfx_push(&cw->gfx[i]);
+			gfx_shown_win = watched_id;
+		}
+
 		render_cells_diff(renderer, STDOUT_FILENO,
 		    tile_screen(tilemgr), tile_rows(tilemgr),
 		    tile_cols(tilemgr), crow, ccol, cvis,
 		    tile_row_dirty(tilemgr));
 	}
+
+	pending_gfx_flush(crow, ccol);
 }
 
 static void
@@ -4466,6 +4668,15 @@ static char stdin_buf[4096];
 static int stdin_buflen;
 static int in_paste;
 
+/* A lone trailing ESC in the input buffer is ambiguous: it is either the
+ * ESC key, or the split start of an escape/mouse sequence whose remainder
+ * has not been read yet. Terminals that deliver mouse reports in chunks
+ * that fall on the ESC boundary (macOS Terminal.app) would otherwise have
+ * the report shredded into stray keystrokes. Hold the ESC this long for a
+ * continuation; if none arrives, treat it as the ESC key. */
+#define ESC_HOLD_MS 25
+static int esc_hold_timer_id = -1;
+
 /* end any in-progress bracketed paste without requiring a PASTE_END
  * marker from the outer terminal.  see sel_clear_on_focus_change(). */
 static void
@@ -4857,11 +5068,59 @@ sb_done:
 	}
 }
 
+static void on_esc_hold_timer(struct iox_loop *lp, void *arg);
+
+/* adapter so tkbd_drain() can reach dispatch_input(), which needs the loop */
+static void
+stdin_dispatch_cb(void *ctx, const struct tkbd_seq *seq)
+{
+	dispatch_input((struct iox_loop *)ctx, seq);
+}
+
+/* Parse and dispatch as many complete sequences as the buffer holds, then
+ * keep any trailing partial for the next read. force_esc, set only by the
+ * hold timer, dispatches a held lone ESC as the ESC key. */
+static void
+stdin_drain(struct iox_loop *loop, int force_esc)
+{
+	size_t consumed;
+
+	consumed = tkbd_drain(stdin_buf, (size_t)stdin_buflen, force_esc,
+	    stdin_dispatch_cb, loop);
+
+	/* save leftover bytes for next read */
+	if (consumed > 0 && consumed < (size_t)stdin_buflen)
+		memmove(stdin_buf, stdin_buf + consumed,
+		    (size_t)stdin_buflen - consumed);
+	stdin_buflen -= (int)consumed;
+
+	/* arm the hold timer while a lone ESC is buffered so a genuine ESC
+	 * key still fires promptly when no continuation arrives; cancel it
+	 * once the buffer holds anything else. */
+	if (stdin_buflen == 1 && stdin_buf[0] == '\033') {
+		if (esc_hold_timer_id < 0)
+			esc_hold_timer_id = iox_timer_add(loop, ESC_HOLD_MS,
+			    on_esc_hold_timer, NULL);
+	} else if (esc_hold_timer_id >= 0) {
+		iox_timer_remove(loop, esc_hold_timer_id);
+		esc_hold_timer_id = -1;
+	}
+}
+
+/* the held lone ESC got no continuation in time: it was the ESC key. */
+static void
+on_esc_hold_timer(struct iox_loop *lp, void *arg)
+{
+	(void)arg;
+	esc_hold_timer_id = -1;
+	if (stdin_buflen > 0)
+		stdin_drain(lp, 1);
+}
+
 static void
 on_stdin_read(struct iox_loop *loop, int fd, unsigned events, void *arg)
 {
 	ssize_t n;
-	int off = 0;
 
 	(void)events;
 	(void)arg;
@@ -4883,33 +5142,8 @@ on_stdin_read(struct iox_loop *loop, int fd, unsigned events, void *arg)
 		vt_parse_feed(stdin_osc_parser, stdin_buf + stdin_buflen - n,
 		    (size_t)n);
 
-	while (off < stdin_buflen) {
-		struct tkbd_seq seq;
-		int consumed;
-
-		memset(&seq, 0, sizeof(seq));
-		seq.ch = TKBD_CH_NONE;
-		consumed = tkbd_parse(&seq, stdin_buf + off,
-		    (size_t)(stdin_buflen - off));
-		if (consumed == TKBD_INCOMPLETE)
-			break;			/* wait for the rest */
-		if (consumed == 0) {
-			/* unrecognized byte (e.g. a stray terminal report):
-			 * skip it to resync rather than wedge all input,
-			 * which would swallow the prefix key permanently. */
-			off++;
-			continue;
-		}
-		dispatch_input(loop, &seq);
-		off += consumed;
-	}
+	stdin_drain(loop, 0);
 	sync_prefix_timer(loop);
-
-	/* save leftover bytes for next read */
-	if (off > 0 && off < stdin_buflen)
-		memmove(stdin_buf, stdin_buf + off,
-		    (size_t)(stdin_buflen - off));
-	stdin_buflen -= off;
 }
 
 /* ---- micro-server event handling ---- */
@@ -5933,7 +6167,7 @@ mconn_discover(struct iox_loop *lp)
 		{
 			struct ipc_attach at;
 			uint8_t abuf[128];
-			int an;
+			int an, cpw, cph;
 
 			at.rows = (uint16_t)content_rows;
 			at.cols = (uint16_t)content_cols;
@@ -5941,6 +6175,9 @@ mconn_discover(struct iox_loop *lp)
 			at.client_id = client_id;
 			at.name = client_name;
 			at.name_len = (uint16_t)strlen(client_name);
+			outer_cell_px(&cpw, &cph);
+			at.cell_pw = (uint16_t)cpw;
+			at.cell_ph = (uint16_t)cph;
 			an = ipc_attach_encode(&at, abuf, sizeof(abuf));
 			if (an < 0 ||
 			    ipc_msg_send(fd, IPC_MSG_ATTACH, abuf,

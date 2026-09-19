@@ -11,16 +11,16 @@
 set -e
 
 PKGNAME="lumimux"
-VERSION="0.1.0"
 ARCH="amd64"
-MAINTAINER="Jon Mayo <jon@example.com>"
+MAINTAINER="Jon Mayo <jon.mayo@gmail.com>"
 DESCRIPTION="Terminal multiplexer with GNU Screen keybindings"
-
-LUMI_CMDS="attach mserver new list version kill detach new-window \
-reload send-input send-keys splash"
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 TRIPLET="$(cc -dumpmachine 2>/dev/null || echo x86_64-linux-gnu)"
+
+# Package version tracks the C header so it matches the release, with an env
+# override for a caller that knows better (e.g. a CI tag).
+VERSION="${VERSION:-$(sed -n 's/.*LUMI_VERSION "\([^"]*\)".*/\1/p' "$REPO/src/version.h")}"
 
 # Find binary
 if [ -n "$1" ]; then
@@ -47,12 +47,30 @@ esac
 PKGDIR="$(mktemp -d)"
 trap 'rm -rf "$PKGDIR"' EXIT
 
-# Install tree
-mkdir -p "$PKGDIR/usr/bin"
-install -m 755 "$BINARY" "$PKGDIR/usr/bin/lumi"
-for cmd in $LUMI_CMDS; do
-	ln -sf lumi "$PKGDIR/usr/bin/lumi-$cmd"
-done
+# Stage the install tree via the makefile so the binary, its lumi-* symlinks,
+# and the manual page match a normal install. Derive the build configuration
+# from the binary's _out/<triplet>[/release]/ path so the install target
+# resolves to the same output the binary came from.
+case "$BINARY" in
+*_out/*/bin/lumi)
+	sub="${BINARY##*_out/}"
+	sub="${sub%/bin/lumi}"
+	MK_TRIPLET="${sub%%/*}"
+	case "$sub" in */release) MK_RELEASE="RELEASE=1" ;; *) MK_RELEASE="" ;; esac
+	case "$MK_TRIPLET" in
+	*musl*) MK_TC="CC=musl-gcc LDFLAGS=-static" ;;
+	*) MK_TC="" ;;
+	esac
+	;;
+*)
+	printf 'error: %s is not under _out/<triplet>/; cannot derive build config\n' \
+		"$BINARY" >&2
+	exit 1
+	;;
+esac
+
+make -C "$REPO" install PREFIX=/usr DESTDIR="$PKGDIR" \
+	TARGET_TRIPLET="$MK_TRIPLET" $MK_RELEASE $MK_TC
 
 # Control file
 mkdir -p "$PKGDIR/DEBIAN"

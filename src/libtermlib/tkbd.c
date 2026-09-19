@@ -857,6 +857,41 @@ int tkbd_parse(struct tkbd_seq *seq, const char *buf, size_t sz)
 	return 0;
 }
 
+size_t tkbd_drain(const char *buf, size_t sz, int force_esc,
+                  tkbd_dispatch_fn cb, void *ctx)
+{
+	size_t off = 0;
+
+	while (off < sz) {
+		struct tkbd_seq seq;
+		int consumed;
+
+		// Hold a lone trailing ESC for a possible continuation rather
+		// than dispatching it as the ESC key: the next read may carry
+		// the rest of a control or mouse sequence split on the ESC.
+		// A one-byte-later split (ESC '[') is already caught as
+		// TKBD_INCOMPLETE; only the lone ESC is ambiguous here.
+		if (!force_esc && sz - off == 1 && buf[off] == '\033')
+			break;
+
+		memset(&seq, 0, sizeof(seq));
+		seq.ch = TKBD_CH_NONE;
+		consumed = tkbd_parse(&seq, buf + off, sz - off);
+		if (consumed == TKBD_INCOMPLETE)
+			break;			// wait for the rest
+		if (consumed == 0) {
+			// unrecognized byte: skip it to resync rather than
+			// wedge, matching tkbd_parse()'s 0-return contract.
+			off++;
+			continue;
+		}
+		cb(ctx, &seq);
+		off += (size_t)consumed;
+	}
+
+	return off;
+}
+
 
 /*
  * tkbd_desc() internal constants

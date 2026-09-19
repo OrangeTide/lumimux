@@ -159,4 +159,13 @@ int ipc_msg_send_size(int fd, uint32_t type, int rows, int cols);
 int ipc_msg_recv(int fd, uint32_t *out_type, void *buf, size_t bufsz,
     uint32_t *out_len);
 
+/* perform the ATTACH handshake on a connected socket: send IPC_MSG_ATTACH
+ * with the given IPC_ATTACH_F_* flags and client name, read past anything
+ * queued ahead of the reply, and store the granted role (IPC_ROLE_*) in
+ * *out_role when non-NULL. returns 0 on success, -1 on error. Every mserver
+ * client must attach before any other message, so use this before sending
+ * input, attributes, and the like. */
+int ipc_client_attach(int fd, uint8_t flags, const char *name,
+    uint8_t *out_role);
+
 #endif /* IPC_MSG_H */

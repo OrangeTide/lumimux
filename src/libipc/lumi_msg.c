@@ -18,6 +18,17 @@ ipc_size_encode(const struct ipc_size *msg, uint8_t *buf, int len)
 	pos = ms_write_tag_u16(buf, pos, len, 2, msg->cols);
 	if (pos < 0)
 		return -1;
+	/* tags 8/9: kept clear of ipc_attach (tags 1-5) and ipc_attach_reply
+	 * (tags 1-4), which are cross-decoded as ipc_size and share tags 1/2
+	 * for rows/cols, and clear of tag 7 which the forward-compat test uses
+	 * as an unknown field.  a colliding tag with a different wire type
+	 * would break those decodes. */
+	pos = ms_write_tag_u16(buf, pos, len, 8, msg->cell_pw);
+	if (pos < 0)
+		return -1;
+	pos = ms_write_tag_u16(buf, pos, len, 9, msg->cell_ph);
+	if (pos < 0)
+		return -1;
 
 	buf[0] = (uint8_t)((pos - 2) & 0xff);
 	buf[1] = (uint8_t)(((pos - 2) >> 8) & 0xff);
@@ -45,6 +56,12 @@ ipc_size_decode(struct ipc_size *msg, const uint8_t *buf, int len)
 			break;
 		case 2:
 			pos = ms_read_u16(buf, pos, end, &msg->cols);
+			break;
+		case 8:
+			pos = ms_read_u16(buf, pos, end, &msg->cell_pw);
+			break;
+		case 9:
+			pos = ms_read_u16(buf, pos, end, &msg->cell_ph);
 			break;
 		default:
 			pos = ms_skip(buf, pos, end, tag & 7);
@@ -75,6 +92,14 @@ ipc_attach_encode(const struct ipc_attach *msg, uint8_t *buf, int len)
 		return -1;
 	pos = ms_write_tag_bytes(buf, pos, len, 5,
 	    (const void *)msg->name, msg->name_len);
+	if (pos < 0)
+		return -1;
+	/* tags 8/9 match ipc_size, so a size decode of an attach message
+	 * picks up the cell pixel size the same way it picks up rows/cols */
+	pos = ms_write_tag_u16(buf, pos, len, 8, msg->cell_pw);
+	if (pos < 0)
+		return -1;
+	pos = ms_write_tag_u16(buf, pos, len, 9, msg->cell_ph);
 	if (pos < 0)
 		return -1;
 
@@ -119,6 +144,12 @@ ipc_attach_decode(struct ipc_attach *msg, const uint8_t *buf, int len)
 				    &_tmp, 65535, &msg->name_len);
 				msg->name = (const char *)_tmp;
 			}
+			break;
+		case 8:
+			pos = ms_read_u16(buf, pos, end, &msg->cell_pw);
+			break;
+		case 9:
+			pos = ms_read_u16(buf, pos, end, &msg->cell_ph);
 			break;
 		default:
 			pos = ms_skip(buf, pos, end, tag & 7);

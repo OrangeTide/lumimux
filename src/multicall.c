@@ -28,7 +28,10 @@ static const struct {
 } commands[] = {
 	{ "attach",	cmd_attach_main },
 	{ "attr",	cmd_attr_main },
+	{ "basic",	cmd_basic_main },
 	{ "detach",	cmd_detach_main },
+	{ "edit",	cmd_edit_main },
+	{ "files",	cmd_files_main },
 	{ "kill",	cmd_kill_main },
 	{ "list",	cmd_list_main },
 	{ "mserver",	cmd_mserver_main },
@@ -60,6 +63,9 @@ usage(void)
 	    "  attr                  Get/set mserver attributes\n"
 	    "  detach                Detach a client from its session\n"
 	    "  list                  List active sessions\n"
+	    "  files                 Browse the filesystem (TUI)\n"
+	    "  edit                  Edit a text file (TUI)\n"
+	    "  basic                 BASIC-style calculator REPL\n"
 	    "  kill                  Terminate a session\n"
 	    "  new-window            Create a window in a session\n"
 	    "  reload                Reload server configuration\n"

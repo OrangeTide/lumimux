@@ -163,3 +163,41 @@ ipc_msg_recv(int fd, uint32_t *out_type, void *buf, size_t bufsz,
 		return 0;
 	}
 }
+
+int
+ipc_client_attach(int fd, uint8_t flags, const char *name, uint8_t *out_role)
+{
+	struct ipc_attach at;
+	struct ipc_attach_reply rep;
+	uint8_t abuf[128], rbuf[512];
+	uint32_t rtype = 0, rlen;
+	int an, skipped;
+
+	memset(&at, 0, sizeof(at));
+	at.rows = 24;			/* observed size; does not constrain */
+	at.cols = 80;
+	at.flags = flags;
+	at.client_id = (uint32_t)getpid();
+	at.name = name ? name : "";
+	at.name_len = (uint16_t)strlen(at.name);
+
+	an = ipc_attach_encode(&at, abuf, sizeof(abuf));
+	if (an < 0 || ipc_msg_send(fd, IPC_MSG_ATTACH, abuf, (uint32_t)an) < 0)
+		return -1;
+
+	/* the reply comes first, but a server may have a role change or the
+	 * like queued to us by the time it answers; read past it */
+	for (skipped = 0; skipped <= 16; skipped++) {
+		if (ipc_msg_recv(fd, &rtype, rbuf, sizeof(rbuf), &rlen) != 0)
+			return -1;
+		if (rtype == IPC_MSG_ATTACH_REPLY)
+			break;
+	}
+	if (rtype != IPC_MSG_ATTACH_REPLY)
+		return -1;
+	if (ipc_attach_reply_decode(&rep, rbuf, (int)rlen) < 0)
+		return -1;
+	if (out_role)
+		*out_role = rep.role;
+	return 0;
+}

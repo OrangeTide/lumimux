@@ -8,8 +8,6 @@
 #include <stdio.h>
 #include <string.h>
 
-#define TKBD_CH_NONE	0x7FFFFFFFU
-
 static int test_count, fail_count;
 
 #define TEST(name) do { test_count++; printf("  %s ... ", (name)); } while (0)
@@ -181,6 +179,37 @@ sim_read_batch(const char *bytes, int len)
 	/* deferred menu show -- mirrors main loop prefix timeout */
 	if (keys_get_state(keybinds) == KEYS_STATE_PREFIX)
 		sim_menu_show();
+}
+
+/* ---- split-read buffering via the real tkbd_drain() ---- */
+
+static char drain_buf[4096];
+static int drain_len;
+
+static void
+drain_dispatch_cb(void *ctx, const struct tkbd_seq *seq)
+{
+	(void)ctx;
+	sim_dispatch_input(seq);
+}
+
+/* Persistent-buffer variant of sim_read_batch that drives the same
+ * tkbd_drain() primitive on_stdin_read() uses, so a sequence split across
+ * reads is reassembled rather than reparsed from scratch each call. */
+static void
+sim_read_drain(const char *bytes, int len)
+{
+	size_t consumed;
+
+	memcpy(drain_buf + drain_len, bytes, (size_t)len);
+	drain_len += len;
+
+	consumed = tkbd_drain(drain_buf, (size_t)drain_len, 0,
+	    drain_dispatch_cb, NULL);
+	if (consumed > 0 && consumed < (size_t)drain_len)
+		memmove(drain_buf, drain_buf + consumed,
+		    (size_t)drain_len - consumed);
+	drain_len -= (int)consumed;
 }
 
 /* ---- tests ---- */
@@ -495,6 +524,24 @@ test_sgr_mouse_still_parses(void)
 }
 
 static void
+test_split_mouse_at_esc_not_shredded(void)
+{
+	TEST("SGR mouse split at ESC across reads is one event, not shredded");
+	reset_state();
+	drain_len = 0;
+	/* the ESC arrives alone; the report's tail follows in the next read.
+	 * it must reassemble into a single mouse event, not a stray ESC key
+	 * plus a forwarded "[<0;5;5M" run (macOS Terminal.app chunks input
+	 * this way). */
+	sim_read_drain("\x1b", 1);
+	sim_read_drain("[<0;5;5M", 8);
+	ASSERT(forward_count == 0, "split mouse report not forwarded as keys");
+	ASSERT(action_count == 0, "no key action from split mouse report");
+	ASSERT(drain_len == 0, "no leftover after the full report");
+	PASS();
+}
+
+static void
 test_incomplete_csi_waits(void)
 {
 	struct tkbd_seq seq;
@@ -556,6 +603,7 @@ main(void)
 	test_report_then_mouse_not_merged();
 	test_report_then_prefix_survives();
 	test_sgr_mouse_still_parses();
+	test_split_mouse_at_esc_not_shredded();
 	test_incomplete_csi_waits();
 	test_lone_esc_is_esc_key();
 

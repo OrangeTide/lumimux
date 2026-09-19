@@ -17,25 +17,38 @@ struct window {
 	uint32_t id;
 	int master_fd;
 	int child_pid;
+	int cell_pw, cell_ph;	/* cell pixel size, for graphics cursor accounting */
 	struct vt_state *vt;
 	struct vt_parse *parser;
 	char *title;
 };
 
+/* Kitty graphics cursor accounting on the server's own vt_state.  The
+ * program talks to this state (it answers DSR and drives detached
+ * rendering), so it must advance past an image the same way the client's
+ * render does.  The footprint needs the cell pixel height, which the client
+ * plumbs in through window_resize(). */
+static void
+window_dcs_account(void *ctx, int introducer, const char *data, size_t len)
+{
+	struct window *w = ctx;
+
+	if (introducer == '_' && len >= 1 && data[0] == 'G')
+		vt_kgfx_account(w->vt, data, len, w->cell_pw, w->cell_ph);
+}
+
 struct window *
-window_new(const char *shell, int rows, int cols)
+window_new(char *const argv[], int rows, int cols)
 {
 	struct window *w;
 
 	w = xcalloc(1, sizeof(*w));
 
-	w->master_fd = pty_open(&w->child_pid, shell);
+	w->master_fd = pty_open(&w->child_pid, argv, rows, cols);
 	if (w->master_fd < 0) {
 		free(w);
 		return NULL;
 	}
-
-	pty_resize(w->master_fd, rows, cols);
 
 	w->vt = vt_state_new(rows, cols, 0);
 	if (!w->vt) {
@@ -52,6 +65,7 @@ window_new(const char *shell, int rows, int cols)
 		free(w);
 		return NULL;
 	}
+	vt_parse_set_dcs_cb(w->parser, window_dcs_account, w);
 
 	return w;
 }
@@ -124,9 +138,15 @@ window_feed(struct window *w, const char *data, size_t len)
 }
 
 int
-window_resize(struct window *w, int rows, int cols)
+window_resize(struct window *w, int rows, int cols, int cell_pw, int cell_ph)
 {
-	pty_resize(w->master_fd, rows, cols);
+	/* set the pty's pixel size too, so programs that query it (image
+	 * viewers, plotting backends) compute cell counts against the real
+	 * outer terminal.  store the cell height for graphics cursor
+	 * accounting in window_dcs_account(). */
+	w->cell_pw = cell_pw;
+	w->cell_ph = cell_ph;
+	pty_resize(w->master_fd, rows, cols, cell_pw * cols, cell_ph * rows);
 	return vt_state_resize(w->vt, rows, cols);
 }
 
