@@ -401,6 +401,54 @@ test_render_cells_diff(void)
 }
 
 static void
+test_render_cells_cursor(void)
+{
+	struct render *r;
+	struct capture cap;
+	struct vt_cell cells[6]; /* 2 rows x 3 cols */
+	char buf[8192];
+	size_t len;
+	int i;
+
+	/* the cursor must land at the requested position, not wherever the
+	 * last cell was drawn */
+	TEST("render_cells parks cursor at requested position");
+	r = render_new(2, 3, NULL);
+	ASSERT(r != NULL, "render new failed");
+
+	for (i = 0; i < 6; i++)
+		vt_cell_clear(&cells[i]);
+	cells[0].codepoint = 'A';
+	cells[0].width = 1;
+
+	/* full render with cursor at row 1, col 2 (1-based ESC[2;3H) */
+	capture_open(&cap);
+	render_cells_full(r, cap.wfd, cells, 2, 3, 1, 2, 1);
+	len = capture_read(&cap, buf, sizeof(buf));
+	ASSERT(len > 0, "no output");
+	ASSERT(strstr(buf, "\033[2;3H") != NULL,
+	    "full render did not park cursor at ESC[2;3H");
+
+	/* a pure cursor motion (no cell change) still repositions */
+	capture_open(&cap);
+	render_cells_diff(r, cap.wfd, cells, 2, 3, 0, 1, 1, NULL);
+	len = capture_read(&cap, buf, sizeof(buf));
+	ASSERT(len > 0, "no output on pure cursor move");
+	ASSERT(strstr(buf, "\033[1;2H") != NULL,
+	    "diff did not reposition cursor to ESC[1;2H");
+
+	/* hiding the cursor emits civis */
+	capture_open(&cap);
+	render_cells_diff(r, cap.wfd, cells, 2, 3, 0, 1, 0, NULL);
+	len = capture_read(&cap, buf, sizeof(buf));
+	ASSERT(strstr(buf, "\033[?25l") != NULL,
+	    "diff did not hide cursor with ESC[?25l");
+
+	render_free(r);
+	PASS();
+}
+
+static void
 test_render_move_cursor(void)
 {
 	struct render *r;
@@ -451,6 +499,7 @@ main(void)
 	test_render_resize();
 	test_render_cells_full();
 	test_render_cells_diff();
+	test_render_cells_cursor();
 	test_render_move_cursor();
 
 	printf("\n%d tests, %d failures\n", test_count, fail_count);

@@ -6,6 +6,7 @@
 
 #include "basic.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -241,8 +242,9 @@ try_edit(struct basic *b, const char *line)
 		tmpdir = getenv("TMPDIR");
 		if (!tmpdir || !*tmpdir)
 			tmpdir = "/tmp";
-		snprintf(tmp, sizeof(tmp), "%s/lumi-basicXXXXXX", tmpdir);
-		fd = mkstemp(tmp);
+		/* The .bas suffix lets lumi edit pick the BASIC highlighter. */
+		snprintf(tmp, sizeof(tmp), "%s/lumi-basicXXXXXX.bas", tmpdir);
+		fd = mkstemps(tmp, 4);
 		if (fd < 0) {
 			printf("?cannot create a temporary file\n");
 			fflush(stdout);
@@ -340,9 +342,11 @@ static void
 usage(void)
 {
 	fprintf(stderr,
-	    "usage: %s\n"
+	    "usage: %s [file]\n"
 	    "\n"
 	    "A BASIC-style calculator. Reads statements from standard input.\n"
+	    "With a file argument, loads it as the program and runs it, then\n"
+	    "drops to the REPL.\n"
 	    "\n"
 	    "  <expr>            print the value of an expression\n"
 	    "  PRINT a, \"txt\"; b  print values and text\n"
@@ -379,6 +383,24 @@ cmd_basic_main(int argc, char **argv)
 	if (!b) {
 		fprintf(stderr, "%s: out of memory\n", progname);
 		return 1;
+	}
+
+	/* A file argument is loaded as the program and run before the prompt,
+	 * then control drops to the REPL. This is the "run" target of lumi
+	 * edit's Build menu for a .bas file: F5 launches "lumi basic <file>"
+	 * in a pane, which runs the program and leaves a REPL to inspect it. */
+	if (argc > 1 && argv[1][0] != '-') {
+		FILE *f = fopen(argv[1], "r");
+
+		if (!f) {
+			fprintf(stderr, "%s: %s: %s\n", progname, argv[1],
+			    strerror(errno));
+			basic_free(b);
+			return 1;
+		}
+		load_program_file(b, f);
+		fclose(f);
+		edit_autorun(b);	/* the RUN half of EDIT's save-and-run */
 	}
 
 	interactive = isatty(STDIN_FILENO);

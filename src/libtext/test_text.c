@@ -320,6 +320,62 @@ test_undo_split_join(void)
 }
 
 static void
+test_undo_group_multi(void)
+{
+	struct text *t = text_new();
+
+	TEST("an undo group reverses several primitives as one step");
+	text_insert(t, 0, 0, "abc", 3);
+	text_split(t, 0, 1);			/* a | bc */
+	text_split(t, 1, 1);			/* a | b | c */
+	text_undo_boundary(t);
+	ASSERT(text_lines(t) == 3, "setup should have 3 lines");
+
+	text_undo_group_begin(t);
+	text_delete(t, 0, 0, 1);		/* drop "a" */
+	text_join(t, 0);			/* pull "b" up: b | c */
+	text_undo_group_end(t);
+	ASSERT(text_lines(t) == 2 && line_is(t, 0, "b"),
+	    "group delete failed");
+
+	ASSERT(text_undo(t, NULL, NULL) == 0, "undo failed");
+	ASSERT(text_lines(t) == 3 && line_is(t, 0, "a") &&
+	    line_is(t, 1, "b") && line_is(t, 2, "c"),
+	    "one undo should restore the whole group");
+
+	ASSERT(text_redo(t, NULL, NULL) == 0, "redo failed");
+	ASSERT(text_lines(t) == 2 && line_is(t, 0, "b") &&
+	    line_is(t, 1, "c"),
+	    "one redo should replay the whole group");
+	text_free(t);
+	PASS();
+}
+
+static void
+test_undo_group_nested(void)
+{
+	struct text *t = text_new();
+
+	TEST("nested undo groups collapse into one step");
+	text_insert(t, 0, 0, "xy", 2);
+	text_undo_boundary(t);
+
+	text_undo_group_begin(t);
+	text_undo_group_begin(t);
+	text_delete(t, 0, 0, 1);		/* drop "x" */
+	text_undo_group_end(t);
+	text_delete(t, 0, 0, 1);		/* drop "y" */
+	text_undo_group_end(t);
+	ASSERT(line_is(t, 0, ""), "nested group should delete both");
+
+	ASSERT(text_undo(t, NULL, NULL) == 0, "undo failed");
+	ASSERT(line_is(t, 0, "xy"),
+	    "one undo should restore the nested group");
+	text_free(t);
+	PASS();
+}
+
+static void
 test_redo_cleared_by_edit(void)
 {
 	struct text *t = text_new();
@@ -351,6 +407,8 @@ main(void)
 	test_undo_coalesces_typing();
 	test_undo_boundary_splits_runs();
 	test_undo_split_join();
+	test_undo_group_multi();
+	test_undo_group_nested();
 	test_redo_cleared_by_edit();
 
 	printf("test_text: %d tests, %d failures\n", test_count, fail_count);

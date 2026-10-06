@@ -18,11 +18,6 @@ enum splash_scene {
  * name is rendered as a pipe-art logo in the bottom-right corner. */
 struct vt_buf *splash_create(enum splash_scene scene, const char *name);
 
-/* Display the splash, cropped to term_rows x term_cols.
- * The logo (bottom-right) is always visible; overflow scenery is
- * trimmed from the top-left.  Hides the cursor. */
-int splash_show(struct vt_buf *buf, int fd, int term_rows, int term_cols);
-
 /* Free a splash canvas. */
 void splash_free(struct vt_buf *buf);
 

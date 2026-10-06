@@ -408,7 +408,10 @@ process_byte(struct vt_parse *p, unsigned char c)
 
 	case ST_CSI_PARAM:
 		if (c >= '0' && c <= '9') {
-			p->cur_param = p->cur_param * 10 + (c - '0');
+			/* clamp so a long digit run cannot overflow int (UB);
+			 * 65535 is far past any real row/col/SGR value */
+			if (p->cur_param < 65535)
+				p->cur_param = p->cur_param * 10 + (c - '0');
 			p->has_digit = 1;
 		} else if (c == ';') {
 			csi_finish_param(p);

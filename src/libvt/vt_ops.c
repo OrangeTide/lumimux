@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 
 
 /* ---- helpers ---- */
@@ -27,8 +28,18 @@ param_or(const int *params, int nparam, int idx, int def)
 static void
 vt_reply(struct vt_state *st, const char *data, size_t len)
 {
-	if (st->reply_fd >= 0)
-		write(st->reply_fd, data, len);
+	if (st->reply_fd < 0)
+		return;
+	while (len > 0) {
+		ssize_t n = write(st->reply_fd, data, len);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		data += n;
+		len -= (size_t)n;
+	}
 }
 
 /* line drawing character map (DEC special graphics, 0x5F-0x7E) */

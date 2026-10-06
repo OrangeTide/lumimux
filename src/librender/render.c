@@ -23,6 +23,7 @@ struct render {
 	/* tracked output cursor position */
 	int		cur_row;
 	int		cur_col;
+	int		cur_vis;	/* -1 unknown, else last emitted */
 
 	/* tracked SGR state on the real terminal */
 	uint16_t	cur_attrs;
@@ -125,9 +126,21 @@ emit_cap(struct render *r, int fd, int cap, const char *fallback)
 	return emit_cstr(fd, fallback);
 }
 
-/* cursor visibility is managed by the attach event loop, not the
- * renderer.  these are no-ops so render functions don't emit stray
- * civis/cnorm sequences that conflict with the event loop policy. */
+/* The state-based render_full()/render_diff() path leaves cursor
+ * visibility to the attach event loop and never emits civis/cnorm.  The
+ * flat-cell render_cells_*() path (used by the TUI backend) instead owns
+ * visibility, driven by the cursor_vis argument, via emit_cursor_vis(). */
+
+static int
+emit_cursor_vis(struct render *r, int fd, int vis)
+{
+	if (vis == r->cur_vis)
+		return 0;
+	r->cur_vis = vis;
+	if (vis)
+		return emit_cap(r, fd, TXL_CNORM, "\033[?25h");
+	return emit_cap(r, fd, TXL_CIVIS, "\033[?25l");
+}
 
 static int
 emit_clear_screen(struct render *r, int fd)
@@ -435,6 +448,7 @@ render_new(int rows, int cols, struct txl *txl)
 	r->shadow = xmalloc((size_t)(rows * cols) * sizeof(r->shadow[0]));
 	shadow_clear(r);
 	r->has_bce = txl ? txl_has_bce(txl) : 1;
+	r->cur_vis = -1;
 	return r;
 }
 
@@ -650,6 +664,13 @@ render_cells_full(struct render *r, int fd, const struct vt_cell *cells,
 	r->cur_fg.type = VT_COLOR_DEFAULT;
 	r->cur_bg.type = VT_COLOR_DEFAULT;
 
+	/* park the cursor at the app's requested position, not wherever the
+	 * last cell was drawn */
+	emit_cup(r, fd, cursor_row, cursor_col);
+	r->cur_row = cursor_row;
+	r->cur_col = cursor_col;
+	emit_cursor_vis(r, fd, cursor_vis);
+
 	emit_cstr(fd, SYNC_END);
 	return tio_flush(fd);
 }
@@ -801,13 +822,27 @@ render_cells_diff(struct render *r, int fd, const struct vt_cell *cells,
 		}
 	}
 
-	if (!opened)
-		return 0;
+	/* the cursor may need to move or change visibility even when no cell
+	 * changed (a pure cursor motion), so handle it before the early out */
+	if (!opened) {
+		if (r->cur_row == cursor_row && r->cur_col == cursor_col &&
+		    cursor_vis == r->cur_vis)
+			return 0;
+		emit_cstr(fd, SYNC_BEGIN);
+	} else {
+		emit_reset_sgr(r, fd);
+		r->cur_attrs = 0;
+		r->cur_fg.type = VT_COLOR_DEFAULT;
+		r->cur_bg.type = VT_COLOR_DEFAULT;
+	}
 
-	emit_reset_sgr(r, fd);
-	r->cur_attrs = 0;
-	r->cur_fg.type = VT_COLOR_DEFAULT;
-	r->cur_bg.type = VT_COLOR_DEFAULT;
+	if (r->cur_row != cursor_row || r->cur_col != cursor_col) {
+		emit_cup(r, fd, cursor_row, cursor_col);
+		r->cur_row = cursor_row;
+		r->cur_col = cursor_col;
+	}
+	emit_cursor_vis(r, fd, cursor_vis);
+
 	emit_cstr(fd, SYNC_END);
 	return tio_flush(fd);
 }
@@ -831,4 +866,5 @@ render_invalidate_cursor(struct render *r)
 {
 	r->cur_row = -1;
 	r->cur_col = -1;
+	r->cur_vis = -1;
 }

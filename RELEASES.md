@@ -1,5 +1,96 @@
 # lumiMUX Release Notes
 
+## v26.10.0 -- 2026-10-05
+
+This release turns `lumi edit` from a splash-era placeholder into a usable
+editor, and adds two libraries that stand behind it: a data-driven syntax
+highlighter and a drawing-surface abstraction that the full-screen tools now
+render through. The VT engine also picked up a round of hardening.
+
+### lumi edit grows up
+
+`lumi edit` now frames the file in DOS EDIT-style chrome: a menu bar with
+working drop-down menus, draggable scrollbars, a status area, and modal
+dialogs. The menus and the cursor are both mouse-driven, menu and dialog
+items carry underlined mnemonic keys, and a Yes/No/Cancel dialog guards
+unsaved changes on quit. An About dialog and a help screen replace the old
+status-line hints, and the help text and menus adapt to the active editing
+mode.
+
+### A vi personality
+
+Edit now has a toggleable vi keybinding mode that covers far more than
+cursor movement. Visual mode selects charwise and linewise, text objects
+(`iw`/`aw`, brackets, quotes) compose with operators, and the motion set
+includes `f`/`F`/`t`/`T` with `;`/`,`, paragraph and sentence motions, `%`
+match-pair, `H`/`M`/`L`, `|`, go-to-column, and forward and backward search
+with `n`, `N`, `*`, and `#`. Operators cover `d`, `c`, `>`, `<`, `D`, `C`,
+`s`, `S`, `~`, `J`, `r`, and Replace mode. Marks, named registers `"a`-`"z`,
+and `.` repeat of the last change are all present, along with `ZZ`, `ZQ`,
+and `:qa`/`:wqa`/`:cq`.
+
+### ex command line
+
+The ex command line understands line ranges and `:d`, `:y`, `:>`, `:<`, a
+`:s` substitute over a range, and the `:g`/`:v` global commands.
+
+### Multiple buffers
+
+Edit holds more than one file at a time. `:e`, `:enew`, `:ls`, `:bn`/`:bp`,
+`:b N`, and `:bd` manage the buffer list, a buffer-navigation menu and
+hotkeys drive it, and `:r` reads a file in below the cursor.
+
+### Hex view and editor
+
+A hex dump view sits alongside the text view, sharing the same request
+framework rather than running a second input path. It started read-only and
+grew overwrite editing, byte insert and delete, a configurable dump width,
+byte and text search, a data inspector, and byte copy and paste.
+
+### Syntax highlighting
+
+A new `libsyntax` library provides a data-driven, joe/JSF-style highlighting
+state machine. It ships tables for Rust, Go, Lua, Python, JavaScript, HTML,
+BASIC, Forth, NASM, GAS, and Pascal, and edit highlights a file by type.
+Highlight colors are configurable and derive from the active TUI theme.
+
+### Build integration
+
+Edit can run SciTE-style compile, make, and run commands, stream their
+output into the viewer as it arrives, and jump to diagnostics across files.
+Build-command paths are made absolute so a build launched from one pane runs
+correctly. On the server side, `send-input` can now inject into a pane
+without first taking the keyboard.
+
+### A drawing surface
+
+A new `libdraw` library introduces a drawing-surface abstraction with a
+terminal backend and an input event queue. `edit`, `files`, and `splash`
+render and read input through it instead of each owning terminal setup.
+libdraw owns the terminal signals, adds a `draw_wait` entry point, and
+handles `SIGTSTP` suspend and resume, which let the tools drop their own
+signal code.
+
+### VT engine hardening
+
+The VT engine picked up three robustness fixes. Reply writes (DSR/DA
+responses) now drain the whole buffer and retry on `EINTR` instead of a
+single unchecked `write`. CSI parameter accumulation is clamped so a long
+digit run cannot overflow a signed int. And the cursor can no longer be left
+past the right edge by a glyph wider than the whole terminal. A new
+randomized torture test drives the parser and terminal state with a seeded
+stream of random and crafted input, checking structural invariants after
+every step, and is meant to run under the sanitizers and the coverage build.
+
+### Other changes
+
+- `basic` runs a BASIC program file given as an argument.
+- The renderer parks the cursor at the requested position in its flat-cell
+  path.
+- `libtext` groups multiple edit primitives into a single undo step.
+
+---
+
 ## v26.08.2 -- 2026-08-03
 
 ### Attaching takes the session over again

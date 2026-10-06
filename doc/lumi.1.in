@@ -1,7 +1,7 @@
 .\" lumi.1 : manual page for lumiMUX
 .\" Copyright (c) 2026 Jon Mayo
 .\" Licensed under MIT-0 OR PUBLIC DOMAIN
-.TH LUMI 1 "2026-09-16" "lumiMUX @VERSION@" "User Commands"
+.TH LUMI 1 "2026-10-05" "lumiMUX @VERSION@" "User Commands"
 .SH NAME
 lumi \- terminal multiplexer
 .SH SYNOPSIS
@@ -94,8 +94,6 @@ Attach to an existing session.
 .PP
 By default an attach takes the session over: any client already attached is
 told to detach, and this client gets the keyboard.
-Attaching to a session usually means wanting to work in it rather than
-wanting to watch someone else work in it.
 .PP
 Several clients may be attached to one session at the same time instead.
 .B \-x
@@ -126,25 +124,21 @@ it, and the window is neither resized nor killed by this client.
 Scrollback, copy mode, the window list, and the menus all work as usual,
 since they are local to this client.
 This implies
-.BR \-x :
-a client that came to watch does not displace the client it came to watch.
+.BR \-x .
 .IP
-A read-only client does not take part in deciding the window size.
-A window has one size and its clients may have several, so the smallest
-would otherwise win and a viewer with a small terminal would shrink the
-window of the person working in it.
-Such a viewer shows the part that fits and marks the taskbar with
+A read-only client does not take part in deciding the window size: the
+window is sized for the clients that can type, and a viewer with a smaller
+terminal shows the part that fits and marks the taskbar with
 .BR clip .
 .B share.resize
 changes this.
 .IP
 A read-only client also follows the client holding the keyboard: the window
 it focuses and the layout it arranges.
-That is usually the point of watching.
 .B \-F
 turns the following off.
 A client that is read-only only because someone else got there first keeps
-its own view either way, since it did not ask to watch.
+its own view either way.
 .TP
 .B \-x
 Share the session instead of taking it over.
@@ -303,8 +297,6 @@ attach shares it again rather than taking it over.
 turns that off, and
 .B "lumi share \-L"
 closes the session to further clients.
-Setting single-writer and then detaching everyone is how a session that was
-shared by accident is made private again from another terminal.
 .SS lumi share
 Show the clients attached to a session, and move the keyboard between them.
 .PP
@@ -404,10 +396,10 @@ content.
 Close the session to further clients.
 An attach is refused while this is set.
 Clients already attached are unaffected.
-This keeps someone from joining by accident.
-It is not a defense against a client that ignores it, which is what the
+This guards against joining by accident, not against a client that ignores
+it; for that, use the
 .B lumi net-proxy
-path and its key-based access control are for.
+path and its key-based access control.
 .TP
 .B \-U
 Open the session to further clients again.
@@ -425,20 +417,12 @@ A session in this mode is also never taken over: a plain
 .B "lumi attach"
 joins it as though
 .B \-x
-had been given, since displacing the other clients would defeat the
-setting.
+had been given.
 Takes effect for the next client that attaches, including a client that
 reattaches; it does not retroactively change the role of a client already
 attached, which stays as it was until it reattaches or is given the
 keyboard with
 .BR \-g .
-Stored in
-.IR session\fR/\fBcontrol ,
-mode 0600, owner-only, distinct from
-.I session\fR/\fBcontrol.lock
-(the keyboard token) and
-.I session\fR/\fBcontrol.msg
-(the request/approval mailbox).
 .TP
 .BI \-D " display"
 Set the session's write-role layout coupling:
@@ -459,8 +443,6 @@ under
 .BR "lumi attach" ).
 Takes effect for the next client that attaches, same timing as
 .BR \-M .
-Stored alongside the mode in
-.IR session\fR/\fBcontrol .
 .TP
 .BI \-u " user"
 Start the cross-user broker
@@ -473,12 +455,9 @@ If
 does not already exist it is created (mode 0600, owner-only) seeded with
 .RI "\(dq owner write\(dq, \(dq user:" user " view\(dq" ,
 and \(dq* deny\(dq; an existing file is left untouched.
-The broker listens on a Unix socket outside the session directory
-(mode 0666, in a sticky world-traversable directory), since a single uid
-cannot be expressed in socket permissions alone: every connection is
-authenticated by the kernel-reported peer uid against
-.IR session\fR/\fBaccess ,
-not by the socket's own mode.
+The broker listens on a Unix socket outside the session directory, and
+authenticates every connection by the kernel-reported peer uid against
+.IR session\fR/\fBaccess .
 See
 .B "Cross-user access"
 below.
@@ -491,8 +470,8 @@ access, seeded the same way as
 with a
 .RI subject " group:" group
 line.
-The broker's socket is group-owned and mode 0660, so the kernel itself
-refuses a non-member before the connection ever reaches lumi's own checks.
+The broker's socket is group-owned and mode 0660, so the kernel refuses a
+non-member before the connection reaches lumi's own checks.
 .TP
 .B \-B
 Stop the cross-user broker for this session.
@@ -668,10 +647,64 @@ Opens
 .I file
 for editing, or an empty buffer when no path is given. A path that does not
 exist opens as a new empty buffer saved to that name. The editor is
-modeless: printable characters are inserted at the cursor.
+modeless by default: printable characters are inserted at the cursor.
+Press
+.RB [ F2 ]
+for vi keybindings (described below).
 .TP
 .I file
 File to edit (default: an unnamed empty buffer).
+.PP
+The screen is framed like the DOS
+.B EDIT
+program: a menu bar across the top, a window border with the file name
+centered on it, scroll bars down the right edge and along the bottom, and a
+status line showing key hints and the cursor
+.IR Line : Col .
+Press
+.RB [ F10 ]
+or
+.RB [ Alt\- letter ]
+to open a pull-down menu (File, Edit, Search, Build, View, Options, or Help);
+the
+.I letter
+is the underlined mnemonic in each menu title.
+The
+arrow keys move between menus and items,
+.B Enter
+runs the highlighted item, and
+.B Esc
+closes the menu. Inside an open menu, typing an item's underlined mnemonic
+letter runs that item directly without arrowing to it. Each item maps to work described below, and the File menu
+also offers New, Open, and Save As. New, Open, and Exit put up a
+Yes/No/Cancel dialog to save first when the buffer has unsaved changes.
+The shortcut shown to the right of an item follows the active personality:
+the modeless
+.RB [ Ctrl\- letter ]
+chords by default, and the equivalent vi keys (for example
+.RB [ :w ]
+for Save and
+.RB [ :q ]
+for Exit) while vi keys are on.
+.PP
+The mouse is enabled by default: click the menu bar to open a menu, click an
+item to run it, click a line to place the cursor, drag to select, and use the
+wheel to scroll.
+.B Options
+\(->
+.B Mouse
+turns mouse reporting off, which restores the terminal's own selection;
+.B View
+\(->
+.B "Color Scheme"
+switches between the blue DOS palette and a monochrome fallback. Toggle
+items (Color Scheme, Syntax Highlight, Vi Keys, Mouse) show a bullet in the
+menu when they are enabled.
+.B Help
+\(->
+.B About
+shows a modal box with the program name and version, dismissed by any key or
+a click.
 .PP
 Keys: the arrow keys move the cursor,
 .RB [ Home / End ]
@@ -706,14 +739,11 @@ pastes the clipboard at the cursor, replacing the selection when one is
 active.
 .PP
 Copying or cutting also mirrors the text to the terminal's system clipboard
-with an OSC 52 escape, so it can be pasted into other applications.
-Terminals without OSC 52 support ignore it. The reverse direction is served
-by bracketed paste: text pasted from another application through the terminal
-is inserted literally.
-.PP
-Bracketed paste is supported: text pasted into the terminal is inserted
-literally at the cursor, so control characters and newlines in the paste
-do not trigger editor commands.
+with an OSC 52 escape, so it can be pasted into other applications;
+terminals without OSC 52 support ignore it.
+In reverse, bracketed paste inserts text pasted into the terminal literally
+at the cursor, so control characters and newlines in it do not trigger
+editor commands.
 .PP
 .RB [ Ctrl\-F ]
 prompts for a string and moves the cursor to the next match, searching
@@ -726,9 +756,453 @@ prompts for a 1-based line number and jumps to it, clamping to the last
 line.
 .RB [ F1 ]
 shows a full-screen list of the key bindings; any key returns to editing.
-The status bar shows an
+The list follows the active personality, showing the modeless bindings by
+default and the vi bindings while vi keys are on. The status bar shows an
 .RB [ F1 ]
 hint when the editor opens.
+.PP
+.RB [ F2 ]
+toggles a vi keybinding personality on top of the modeless editor. When it
+is on the editor is modal, and the status bar shows the current mode. In
+NORMAL mode the cursor rests on a character (shown as a block) and keys are
+commands; in INSERT mode (shown as a bar) typing inserts text and
+.B Esc
+returns to NORMAL.
+.RB [ F2 ]
+in NORMAL mode returns to the modeless editor. Motions:
+.RB [ h ]\ [ j ]\ [ k ]\ [ l ],
+.RB [ 0 ]\ [ ^ ]\ [ $ ],
+.RB [ w ]\ [ b ]\ [ e ]
+(and
+.RB [ W ]\ [ B ]\ [ E ]),
+.RB [ gg ]
+and
+.RB [ G ],
+with a numeric count (for example
+.RB [ 3j ],
+or
+.RB [ 5G ]
+and
+.RB [ 5gg ]
+to go to a line). A run of
+.RB [ j ]/[ k ]
+keeps aiming at the same display column across shorter lines, and
+.RB [ $ ]
+makes them stick to the end of each line.
+.RB [ f ]\ [ F ]\ [ t ]\ [ T ]
+search within the line for the next typed character (forward, backward,
+and up to it), and
+.RB [ ; ]
+and
+.RB [ , ]
+repeat that search in the same or the opposite direction.
+.RB [ { ]
+and
+.RB [ } ]
+move by paragraphs (blank-line separated), and
+.RB [ ( ]
+and
+.RB [ ) ]
+move by sentences (ended by
+.BR . ,
+.BR ! ,
+or
+.B ?
+followed by whitespace).
+.RB [ % ]
+jumps between a bracket
+.RB ( () ,
+.BR [] ,
+or
+.BR {} )
+and its match, counting nesting; when the cursor is not on a bracket it
+uses the first one further along the line. With a count,
+.RB [ N% ]
+instead jumps to
+.I N
+percent of the way through the file. An operator with an exclusive
+motion that ends at the start of a later line drops that trailing line,
+so
+.RB [ d} ]
+from the start of a paragraph deletes whole lines.
+.RB [ H ]\ [ M ]\ [ L ]
+move to the first, middle, and last line of the visible window (with a
+count,
+.RB [ H ]
+and
+.RB [ L ]
+count in from the top or bottom).
+.RB [ | ]
+moves to a display column on the current line (column 1 without a count,
+or the count-th column), accounting for tab stops and wide characters.
+Entering insert:
+.RB [ i ]\ [ a ]\ [ A ]\ [ I ]\ [ o ]\ [ O ].
+Editing:
+.RB [ x ]
+deletes characters,
+.RB [ p ]
+and
+.RB [ P ]
+put the register after or before the cursor, and the operators
+.RB [ d ]\ [ c ]\ [ y ]
+apply to a following motion or a doubled key
+.RB ( dd ,\ cc ,\ yy ).
+.RB [ D ]
+and
+.RB [ C ]
+delete or change to the end of the line,
+.RB [ s ]
+substitutes the character under the cursor and
+.RB [ S ]
+the whole line,
+.RB [ ~ ]
+toggles the case of the character (advancing past it), and
+.RB [ J ]
+joins the next line onto this one with a single space. A count applies
+to each.
+.RB [ r ]
+followed by a character replaces the character under the cursor (a
+count replaces that many, and
+.B r
+then Enter breaks the line), while
+.RB [ R ]
+enters Replace mode, where typing overwrites existing characters until
+.BR Esc .
+The operators
+.RB [ > ]
+and
+.RB [ < ]
+shift lines by one indent level (a tab), over a following motion or a
+doubled key
+.RB ( >> ,\ << );
+a count multiplies the number of lines.
+An operator may instead take a text object: an
+.RB [ i ]
+(inner) or
+.RB [ a ]
+(a, including surroundings) followed by
+.B w
+or
+.B W
+for a word,
+a bracket
+.RB ( "( ) b { } B [ ] < >" ),
+or a quote
+.RB ( \(dq
+.B '
+.BR ` ).
+For example
+.B diw
+deletes the word under the cursor,
+.B ci(
+changes inside the enclosing parentheses, and
+.B ya\(dq
+yanks a double-quoted string with its quotes. The same
+.RB [ i ]/[ a ]
+objects select in visual mode
+.RB ( viw ,\ va( ).
+.RB [ m ]
+followed by a letter
+.RB ( a\(en z )
+sets a mark at the cursor;
+.RB [ ` ]
+then that letter jumps back to the exact spot and
+.RB [ ' ]
+to the first non-blank of the mark's line. Either jump also works as a
+motion for an operator
+.RB ( d`a ,\ y'b ).
+Marks hold absolute positions and do not shift as the buffer is edited.
+.RB [ \(dq ]
+followed by a letter selects a named register
+.RB ( a\(en z )
+for the next delete, yank, or put, so
+.B "\(dqayy"
+yanks a line into register a and
+.B "\(dqap"
+puts it back. An uppercase name
+.RB ( A\(en Z )
+appends to the register instead of replacing it. A delete or yank always
+copies to the unnamed register too, which is what a plain
+.RB [ p ]
+uses.
+.RB [ . ]
+repeats the last change, whether an edit, an operator, or an insert
+command with the text that was typed. It leaves marks, motions, yanks,
+and undo alone.
+.RB [ u ]
+undoes and
+.RB [ Ctrl-R ]
+redoes a whole command at once.
+.RB [ Ctrl-D ]/[ Ctrl-U ]
+and
+.RB [ Ctrl-F ]/[ Ctrl-B ]
+scroll.
+Visual mode:
+.RB [ v ]
+starts a charwise selection and
+.RB [ V ]
+a linewise one, both anchored at the cursor and extended by any motion. In
+visual mode
+.RB [ d ]
+(or
+.RB [ x ])
+deletes the selection,
+.RB [ y ]
+yanks it,
+.RB [ c ]
+(or
+.RB [ s ])
+changes it, and
+.RB [ p ]
+replaces it with the register, each returning to NORMAL;
+.RB [ o ]
+jumps to the other end of the selection, and
+.RB [ v ]/[ V ]
+or
+.B Esc
+leaves visual mode. The status bar shows
+.B -- VISUAL --
+or
+.BR "-- VISUAL LINE --" .
+.RB [ ZZ ]
+writes the buffer if it changed and quits;
+.RB [ ZQ ]
+quits without writing. A
+.RB [ : ]
+command line runs
+.BR w ,
+.BR q ,
+.BR wq ,
+.BR x
+(write and quit),
+.BR q! ,
+.BR qa ,
+.BR qa! ,
+.BR wqa ,
+.BR cq
+(quit with a nonzero exit status), and
+.BR :\fIN\fR
+(go to a line).
+A command may take a leading line range built from addresses
+.RB ( N ,
+.BR . ,
+.BR $ ,
+a mark
+.BR '\fIx\fR ,
+and
+.BI +/- N
+offsets),
+.B %
+for the whole file, or two addresses separated by a comma. Range commands
+are
+.B d
+(delete),
+.B y
+(yank),
+.B >
+and
+.B <
+(shift), and
+.BI s/ pat / rep /[ g ]
+(substitute
+.I pat
+with
+.I rep
+on each line, the first match or, with
+.BR g ,
+all).
+.BI g/ pat / cmd
+runs
+.I cmd
+.RB ( d
+or
+.BR s )
+on each matching line;
+.B v
+(or
+.BR g! )
+acts on the non-matching lines. Patterns are plain substrings, not regular
+expressions.
+Several files can be open at once:
+.BI e\  path
+opens a file in a new buffer (or switches to it when already open),
+.B e
+with no argument reloads the current file,
+.B enew
+starts an empty buffer,
+.B ls
+lists the buffers,
+.B bn
+and
+.B bp
+step to the next and previous,
+.BI b\  N
+switches to buffer
+.IR N ,
+and
+.B bd
+closes the current one
+.RB ( bd!
+to discard changes), and
+.BI r\  path
+reads a file in below the current line. The
+.RB [ F8 ]
+and
+.RB [ Shift+F8 ]
+keys step to the next and previous open file (also
+.B File
+\(->
+.BR "Next Buffer" / "Prev Buffer" ), and
+.B File
+\(->
+.B Buffer List
+summarizes them. The top border shows a
+.RB [ cur/total ]
+indicator while more than one file is open.
+.RB [ / ]
+searches forward and
+.RB [ ? ]
+backward;
+.RB [ n ]
+repeats the last search in its own direction and
+.RB [ N ]
+in the opposite one.
+.RB [ * ]
+and
+.RB [ # ]
+search forward and backward for the word under the cursor (as a plain
+substring, so they also match inside longer words).
+.PP
+Files whose extension names a known language (for example
+.BR c ,
+.BR h ,
+or
+.BR sh )
+are syntax highlighted: comments, strings, numbers, keywords, types, and
+preprocessor or shell variables are colored. The vi command
+.B :syntax
+takes
+.BR off ,
+.BR on ,
+or a language name to disable, re-enable, or force highlighting for the
+buffer.
+.PP
+The
+.B View
+menu's
+.B Hex Dump
+item toggles a hexadecimal view of the current buffer: an offset column, 16
+bytes in hex, and an ASCII gutter with nonprintable bytes shown as a dot. It is
+the same buffer as the text view, including any unsaved edits, so switching
+back and forth keeps the cursor on the same byte. Arrow keys and
+.RB [ PgUp ] / [ PgDn ]
+move the cursor byte,
+.B g
+prompts for an offset (hexadecimal), and
+.BR q " or " Esc
+returns to the text view.
+.RB [ Tab ]
+switches between the hex and ascii columns.
+.RB [ Ins ]
+toggles between overwrite and insert editing; the status line shows
+.B OVR
+or
+.BR INS .
+In the hex column two hex digits edit a byte, and in the ascii column any
+printable character does. Overwrite replaces the byte under the cursor. Insert
+adds a new byte at the cursor, and a
+.B 0a
+byte typed in the hex column inserts an implied newline, splitting the line.
+.RB [ Del ]
+removes the byte under the cursor and
+.RB [ Backspace ]
+the byte before it; deleting an implied interior newline joins the two lines.
+The single trailing newline of the file is not a deletable byte. Edits go
+through the normal undo and dirty tracking, and
+.B File
+\(->
+.B Save
+writes the bytes back.
+.PP
+In the hex column,
+.B /
+prompts for text to find and
+.B \e
+for a hex-byte pattern (byte pairs, for example
+.BR "0a 0d" );
+the search wraps around the buffer and moves the cursor to the match.
+.B n
+and
+.B N
+repeat it forward and backward. The pattern may span an implied newline.
+.B w
+cycles the dump width between 8, 16, and 32 bytes per row; the wider rows
+need a correspondingly wide terminal.
+.B i
+toggles a data-inspector line above the status bar that decodes the bytes at
+the cursor: the first byte as unsigned and signed 8-bit and as a character,
+then the 16- and 32-bit values in little-endian and big-endian order.
+.B v
+starts a byte selection at the cursor (press it again to clear it); moving the
+cursor extends the selection.
+.B y
+copies the selected bytes, or the single byte under the cursor, to the
+clipboard (also mirrored to the system clipboard), and
+.B p
+inserts the clipboard bytes at the cursor. A pasted newline splits the line.
+Because the hex and text views edit the same buffer through the same commands,
+.B Ctrl+S
+saves and
+.B Ctrl+Q
+quits from the hex view exactly as from the text view, including the prompt to
+save a modified buffer before exiting.
+.PP
+The
+.B Build
+menu runs a shell command chosen by the file's extension:
+.RB [ F5 ]
+runs the program (compile and run),
+.RB [ F6 ]
+compiles it, and
+.RB [ F7 ]
+runs
+.B make
+in the file's directory. The buffer is saved first unless configured
+otherwise, and the command runs in the file's directory by default.
+.RB [ F6 ]
+and
+.RB [ F7 ]
+run captured: their output streams into a scrollable viewer as it is
+produced, so the editor never freezes on a slow build. The view follows the
+newest line until you scroll up with the arrow keys, and
+.B q
+cancels a running build. Any
+.RI path : line
+or
+.RI path : line : col
+diagnostics are collected into one list shared by all buffers. On return the
+cursor jumps to the first diagnostic;
+.RB [ F4 ]
+and
+.RB [ Shift+F4 ]
+move to the next and previous one (also
+.B Build
+\(->
+.BR "Next Error" / "Prev Error" ). A diagnostic in another file opens that
+file in a new buffer, so navigation spans every file the build named.
+.RB [ F5 ]
+is interactive: inside a
+.B lumi
+session it is sent to another pane (the same target as
+.RB [ Ctrl\-G ]),
+otherwise the editor suspends, runs it, and waits for a key. The commands are
+set per extension in
+.I lumi.conf
+(see the
+.B [build]
+configuration section), and built-in defaults cover
+.BR make ,
+compiling C, and running a shell or BASIC file when the config is silent.
 .PP
 When run inside a
 .B lumi
@@ -743,6 +1217,25 @@ for how the target window is chosen.
 A BASIC-style calculator that reads statements from standard input.
 .PP
 .B lumi basic
+.RI [ file ]
+.PP
+With a
+.I file
+argument, the program in
+.I file
+is loaded and run before the prompt, then control drops to the REPL. This is
+the
+.B run
+target of
+.BR "lumi edit" 's
+Build menu for a
+.B .bas
+file:
+.RB [ F5 ]
+launches
+.B lumi basic
+.I file
+in a pane, which runs the program and leaves a REPL to inspect it.
 .PP
 Each line is one statement. A bare expression prints its value, so the tool
 works as a calculator. Expressions use the usual operators with
@@ -852,7 +1345,12 @@ opens the program in
 for full-screen editing, reads it back on exit, and then runs it
 (save-and-run). With no
 .IR file ,
-the program goes through a temporary file that is removed afterward. With a
+the program goes through a temporary file that is removed afterward; it is
+named with a
+.B .bas
+suffix so
+.B lumi edit
+highlights it as BASIC. With a
 .IR file ,
 that file is a persistent backing store: an existing non-empty file is edited
 as it is, and a missing or empty one is first filled with the current program,
@@ -991,10 +1489,10 @@ Without
 .BR \-i ,
 or
 .BR \-o ,
-the bytes go to the session's focused window. The command needs the write
-role, so if another client currently holds the keyboard (single-writer
-mode), it reports the window as read-only and sends nothing. When the
-target is detached, or in multi-writer mode, the injection proceeds.
+the bytes go to the session's focused window. The input is injected even when
+another client holds the keyboard, so a send reaches a pane in single-writer
+mode without taking the keyboard from it. This is trusted because the command
+runs as the session owner, whose sockets no other user can reach.
 .SH INTERNAL COMMANDS
 .SS lumi\-mserver
 Single-PTY micro-server process.
@@ -1044,10 +1542,9 @@ in the session directory, readable only by the owner.
 A client both encrypts with and authenticates against this key, so an
 attacker who cannot read the session directory cannot connect.
 Both files are removed when the proxy exits.
-This is part of the networked-connections work and is not yet launched
-automatically by
-.BR "lumi attach" .
-Connect to it with
+It is not launched automatically by
+.BR "lumi attach" ;
+connect to it with
 .BR "lumi attach \-n" .
 .PP
 .B lumi net-proxy
@@ -1226,8 +1723,6 @@ Unlike
 .BR "lumi attach" ,
 it joins that session rather than taking it over: the clients already
 there stay, and this one gets the keyboard only if nobody holds it.
-Moving between sessions is looking in on them, and a key that moves this
-client is not a request to end someone else's.
 Ask for the keyboard from the share menu, or take the session over by
 attaching to it in the usual way.
 .PP
@@ -1319,8 +1814,8 @@ when the application exits, so
 .B Ctrl\-A [
 can review it.
 Trailing blank lines are trimmed.
-Default: off, because applications that toggle the alternate screen often
-(for example during startup) can leave confusing partial history.
+Default: off; applications that toggle the alternate screen often can leave
+confusing partial history.
 .TP
 .B keys.prefix
 Change the prefix key.
@@ -1359,17 +1854,15 @@ with a presence marker, by default
 the number of clients holding the keyboard and the number watching.
 It is drawn independently of
 .B taskbar.format
-as well, so a session cannot be watched without the people in it seeing
-that it is.
+as well.
 .B share.indicator
 changes how it reads; nothing turns it off.
 The marker is drawn in a distinct color whenever at least one attached
 client is not the session owner's own uid (a client relayed through
 .B "lumi proxy \-L"
 or
-.BR "lumi net\-proxy \-L" ),
-so a cross-user session cannot look the same as a private one at a
-glance; this coloring cannot be turned off either.
+.BR "lumi net\-proxy \-L" ).
+This coloring cannot be turned off either.
 In
 .B minimal
 mode, which has no taskbar, the terminal title carries
@@ -1424,9 +1917,9 @@ section set environment variables for the shell started in a window and
 for every program run inside it.
 A variable is exported only if it is not already set in the environment
 that started the session, so an inherited value always wins.
-This is useful for giving programs a reasonable default, for example a
+This gives programs a default, for example a
 .B DISPLAY
-value for a session that may be started without one:
+value for a session started without one:
 .PP
 .RS 4
 .nf
@@ -1439,6 +1932,82 @@ EDITOR = vi
 The defaults are applied when the session server starts, before the first
 shell is forked.
 They do not affect an already-running session.
+.SS Build commands
+The
+.B Build
+menu of
+.B lumi edit
+looks up its command per file extension in
+.RB [ build " \(dq" ext \(dq]
+subsections, falling back to a
+.B [build]
+default section and then to built-in defaults:
+.PP
+.RS 4
+.nf
+[build "c"]
+    compile = cc -Wall -c $(filename)
+    run     = ./$(filebase)
+[build]
+    make = make
+.fi
+.RE
+.PP
+Each verb key is
+.BR compile ,
+.BR make ,
+or
+.BR run .
+A
+.B dir
+key sets the working directory (default: the file's own directory), and a
+.B save
+key of
+.BR no ", " false ", or " 0
+skips saving the buffer before building.
+The command may use
+.BR $(file) " (the full path),"
+.BR $(filedir) ", " $(filebase) " (name without extension),"
+.BR $(filename) " (name with extension), and " $(fileext) .
+.SS Editor appearance
+The
+.B lumi edit
+chrome (the editing area, the window frame, and the menu and status bars) uses
+the DOS EDIT palette by default. An
+.B [edit]
+section can derive that palette from a named color theme instead:
+.PP
+.RS 4
+.nf
+[edit]
+    theme = turbo
+.fi
+.RE
+.PP
+The theme names are the same as the window themes used elsewhere, for example
+.BR turbo ", " thin ", " crimson ", or " acid .
+The editing area and frame take the theme's content and border colors; the
+bars invert the content colors. An unknown or missing name keeps the built-in
+default.
+.PP
+Syntax highlighting colors are set separately in an
+.B [edit.syntax]
+section. Each key names a highlight style and its value is a color:
+.BR default ", a palette index " 0 - 255 ", or " #rrggbb .
+.PP
+.RS 4
+.nf
+[edit.syntax]
+    comment  = 244
+    keyword  = 3
+    string   = #66cc66
+.fi
+.RE
+.PP
+The style keys are
+.BR text ", " comment ", " keyword ", " type ", " constant ", " string ,
+.BR operator ", " function ", and " preproc .
+An unset key keeps the built-in color, and a bad value is ignored.
 .SS Bindings
 Key bindings are declared in a
 .B [bind]
@@ -1684,8 +2253,7 @@ reports no mouse events; there
 .B lumi
 reads them from the
 .BR gpm (8)
-daemon instead, provided it was built with libgpm support. The build
-auto-detects the libgpm development headers and enables this when present.
+daemon instead, when built with libgpm support.
 .SH TERMINAL COMPATIBILITY
 .B lumi
 sets the host terminal's title to reflect the current window title.
@@ -1723,8 +2291,7 @@ outer terminal, so copying inside a window (for example with
 reaches the system clipboard. Read requests
 .RB ( "OSC 52 ... ;?" )
 are not forwarded, since their reply has no window to route back to.
-The OSC parser grows on demand to carry the payload, up to a 256 KB cap,
-which covers a clipboard of roughly 190 KB.
+The clipboard payload is capped at 256 KB.
 .TP
 .B Cursor shape
 DECSCUSR (CSI Ps SP q) cursor shape changes are forwarded.
@@ -1750,7 +2317,7 @@ is created with mode 0600 and the client pins server keys in
 .IR ~/.config/lumi/known_hosts .
 A direct-connect listener
 .RB ( "lumi net-proxy \-L" )
-additionally authenticates the user against
+also authenticates the user against
 .I ~/.config/lumi/authorized_keys
 and
 .IR ~/.config/lumi/passwd ,
@@ -1811,7 +2378,7 @@ or refuses it with
 .BR "lumi share \-d" .
 If no client could plausibly answer (no write-token holder and no locally
 attached owner client), or none does within a short timeout, the match is
-denied -- the same fail-closed default as a plain
+denied, the same fail-closed default as a plain
 .B deny
 rule.
 An approved connection is granted exactly the role the matching

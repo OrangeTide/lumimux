@@ -2572,7 +2572,10 @@ later: mutating ops in the browser, behind confirm
   existing non-empty file is edited as it is (reopening a saved program), and a
   missing or empty one is first seeded with the current in-memory program (so
   `EDIT new.bas` starts a fresh file from what you have). `EDIT` with no name
-  keeps the temp-file behavior. Either way, on return the program is reloaded
+  keeps the temp-file behavior; that temp file is now named with a `.bas`
+  suffix (via `mkstemps`) so `lumi edit` picks the BASIC highlighter for it,
+  the same coloring a named `.bas` file gets. Either way, on return the program
+  is reloaded
   and then run, so the edit/run cycle is one step (the QBasic F5 gesture); an
   empty program is a quiet no-op and a run error prints as `?message`. The
   filename parsing that SAVE/LOAD/EDIT share moved into one `extract_filename`
@@ -2580,6 +2583,1002 @@ later: mutating ops in the browser, behind confirm
   Verified: SAVE (quoted) / LOAD round-trip and the bare-word guards still
   hold, the no-TTY `EDIT` reports cleanly, and the SAVE/LOAD/EDIT path is
   valgrind clean.
+
+---
+
+## vi Keybindings in `lumi edit` (IN PROGRESS)
+
+**Goal:** grow the modeless `lumi edit` into a vi/nvi/elvis/vim-style modal
+editor, in increments. The buffer engine (`libtext`) and rendering are
+shared; the vi personality is layered on top and toggled at runtime.
+
+**Increment 1 (DONE).** A vi personality living in a delimited section of
+`src/cmd/edit/edit.c`.
+
+- `F2` toggles between the modeless editor and vi NORMAL mode; `Esc` leaves
+  INSERT for NORMAL. The status bar shows the mode and any pending
+  count/operator; the terminal cursor is a block in NORMAL and a bar in
+  INSERT.
+- Counts and the operator + motion grammar. Motions `h j k l`, `0 ^ $`,
+  `w b e` and `W B E`, `gg`, `G`, plus the arrow/Home/End/PgUp/PgDn keys and
+  `Ctrl-D/U`, `Ctrl-F/B` scrolling. Insert entries `i a A I o O`. Edits `x`,
+  `p`/`P` (charwise and linewise register), operators `d c y` over any motion
+  and doubled `dd cc yy` (with `cw`/`cW` acting like `ce`/`cE`, and `dw`/`yw`
+  stopping at end of line rather than joining).
+- `u` undo and `Ctrl-R` redo. An ex line `:` runs `w [file]`, `q`, `q!`,
+  `wq`/`x`, and `:N`; `/` searches and `n` repeats.
+
+**Undo grouping (DONE, `libtext`).** Added `text_undo_group_begin` /
+`text_undo_group_end` so a command built from several primitives (a linewise
+delete, a paste, a change) undoes and redoes as one step. Each recorded
+primitive carries a group id; undo/redo replay the whole run. This also fixed
+the modeless editor's multi-line cut and paste, which previously needed
+several undo presses. Tests `test_undo_group_multi` and
+`test_undo_group_nested` in `src/libtext/test_text.c`.
+
+**Files changed:** `src/cmd/edit/edit.c` (the vi section, mode wiring,
+status/cursor), `src/libtext/text.c` and `text.h` (undo groups),
+`src/libtext/test_text.c`, `doc/lumi.1.in`.
+
+**Increment 2 (DONE).** Line-local character search motions.
+
+- `f`/`F` move to the next/previous occurrence of a typed character on the
+  line; `t`/`T` stop just before/after it. `;` repeats the last such search
+  in the same direction and `,` in the opposite one. All take a count and
+  compose with operators (`dt)`, `df,`, `2dt,`). A pending search takes the
+  next key as its literal target (`vi_charsearch`), and the last search is
+  remembered (`vi_last_fT`, `vi_last_fT_ch`) for `;`/`,`.
+
+**Increment 3 (DONE).** Paragraph and sentence motions.
+
+- `{`/`}` move by paragraphs (empty-line separated). `(`/`)` move by
+  sentences, where a sentence ends at `.`, `!` or `?` followed by optional
+  closers (`)]"'`) and then whitespace or end of line, and a blank line is
+  also a boundary. All take a count and compose with operators (`d}`, `2d)`,
+  `c(`). The backward sentence walks forward from at most a paragraph earlier
+  and keeps the last start before the cursor, which handles crossing a blank
+  line. These are charwise-exclusive motions; the vim rule that promotes an
+  exclusive motion ending at column 0 to linewise is not yet implemented, so
+  `d}` can leave one blank line where vim leaves the paragraph gap.
+
+**Increment 4 (DONE).** The `%` match-pair motion.
+
+- From a bracket (`()`, `[]`, `{}`) `%` jumps to its match, counting nesting
+  and scanning across lines. When the cursor is not on a bracket it uses the
+  first one at or after the cursor on the line. It is an inclusive motion, so
+  `d%` covers through the match, and `d%` from before a bracket deletes from
+  the cursor through the match. The count prefix is ignored (vi's `N%`
+  go-to-percentage variant is deferred). Helpers `vi_bracket_info` and
+  `vi_match_pair` in `edit.c`.
+
+**Increment 5 (DONE).** The `H`, `M`, `L` window motions.
+
+- `H`, `M`, `L` move to the first, middle, and last line of the visible
+  window, landing on the first non-blank. A count makes `H` and `L` count in
+  from the top or bottom (`3H`, `2L`). They are linewise and compose with
+  operators (`dH`, `dL`). The window is read from `e->top` and the text
+  height (`rows - 1`), which `render` keeps current.
+
+**Increment 6 (DONE).** The `|` go-to-column motion.
+
+- `|` moves to a display column on the current line: column 1 without a
+  count, or the count-th column (`5|`). It maps a display column back to a
+  byte offset with `vi_col_to_byte`, the inverse of `disp_cols`, so tab stops
+  and wide characters are handled. It is a charwise exclusive motion and
+  composes with operators (`d5|`).
+
+**Increment 7 (DONE).** More quit commands.
+
+- Normal mode `ZZ` writes the buffer if it changed and quits; `ZQ` quits
+  without writing (a `Z`-prefix pending state like `g`). The ex line gained
+  the quit-all family `:qa`/`:qall`/`:quita`/`:quitall` and write-all
+  `:wqa`/`:wqall`/`:xa`/`:xall` (a trailing `!` forces past unsaved changes,
+  matching the single-buffer `:q`/`:wq` behavior), plus `:cq`/`:cquit` which
+  leaves with a nonzero exit status (a new `REQ_QUIT_ERR` sets the process
+  return code). A small `ex_match` helper keeps the name lists tidy.
+
+**Increment 8 (DONE).** Syntax highlighting, engine + C and shell.
+
+- New `src/libsyntax`: a joe/JSF-style state-machine highlighter distilled
+  from the compact-pascal playground. Each language is a C table of states
+  (`struct syn_state`) with rules (charclass match, next state, recolor,
+  identifier buffer) and a keyword list; the structs are public so a runtime
+  file loader can build the same tables in a later increment. `syn_line`
+  highlights one line, carrying tokenizer state across lines for multi-line
+  comments and strings. Languages: C (`syn_c.c`) and shell (`syn_sh.c`).
+  Tests in `test_syntax.c`.
+- `lumi edit` integration: language chosen by file extension; a per-line
+  start-state cache (`line_state`, `hl_valid`) that edits invalidate from the
+  changed line down and the renderer fills forward to the visible window;
+  `draw_line` emits an indexed-ANSI foreground per style run, composed with
+  the selection's reverse video. The vi command `:syntax off|on|<name>`
+  toggles or forces it. Valgrind clean.
+- Palette is a fixed indexed-ANSI set in `edit.c` (comment grey, keyword
+  yellow, type cyan, constant magenta, string green, preproc red); making it
+  themeable via `tui_theme` is a later option.
+
+**Increment 9 (DONE).** Lua and Python `libsyntax` tables.
+
+- `syn_lua.c`: keywords/builtins, numbers, single-line strings, `--` line
+  comments, and the `--[[ ]]` long comment and `[[ ]]` long string (level-0;
+  the `[==[` equals-level variants are not modeled). `syn_py.c`: keywords,
+  builtins and types, numbers, `#` comments, single-line strings, and
+  triple-quoted `"""`/`'''` strings that span lines. Both carry state across
+  lines for their multi-line constructs. Tests added to `test_syntax.c`.
+
+**Increment 10 (DONE).** Rust and Go `libsyntax` tables.
+
+- `syn_rust.c`: keywords, primitive and common std types, numbers, strings
+  (span lines), and `//` / `/* */` comments. Char literals are left uncolored
+  because `'x'` and the `'a` lifetime cannot be distinguished by a simple DFA;
+  block comments are treated as non-nesting. `syn_go.c`: keywords, predeclared
+  types, builtins, numbers, `"..."` strings, backtick raw strings (span
+  lines), rune literals, and C-style comments. Tests added.
+
+**Increment 11 (DONE).** BASIC and Forth `libsyntax` tables.
+
+- `syn_bas.c`: a generic classic/QBASIC dialect, case-insensitive. Keywords,
+  a few types and builtins, numbers, `"..."` strings (do not span lines), and
+  two comment forms: the `'` apostrophe comment to end of line, and `REM`
+  painted in the comment color (its trailing text stays code, since `REM` is
+  matched as an ordinary word). `syn_fth.c`: Forth is whitespace-delimited, so
+  a word runs until the next space and is then looked up. Handles `\` line
+  comments, `( ... )` comments (may span lines), numbers, and the core control
+  and stack words. String words (`."` `s"` `c"` `abort"`) are left as plain
+  words. Tests added.
+
+**Increment 12 (DONE).** JavaScript and HTML/XML `libsyntax` tables.
+
+- `syn_js.c`: a C-like table with double- and single-quoted strings, backtick
+  template literals (span lines, no `${...}` sub-highlighting), line and block
+  comments, numbers, and keywords, built-in constructors, and value literals.
+  Regex literals are not recognized, since telling `/re/` from division needs
+  expression context. `syn_html.c`: structural, with no keyword table. Element
+  names are painted as keywords, attribute names as types, quoted attribute
+  values as strings (a value keeps its color through any `>` it contains),
+  `<!-- -->` as comments, doctypes and `<?...?>` as preproc, and `&entity;`
+  references as constants. `<script>` and `<style>` bodies are left as plain
+  text. Tests added.
+
+  While writing the JS operator class, found that the shared operator class
+  string in the earlier tables begins `+-*`, which the class parser reads as
+  the (empty) range `+` to `*`, so `+` and `*` are not colored as operators.
+  The new JS table puts `-` last to avoid this; the older tables still carry
+  the latent quirk. See the deferred list.
+
+**Increment 13 (DONE).** NASM and GAS (AT&T) assembly `libsyntax` tables.
+
+- `syn_nasm.c`: case-insensitive. Handles `;` line comments, raw `'...'` and
+  `"..."` strings, `` `...` `` strings with escapes, NASM number forms, and
+  `%` preprocessor words (`%define`, `%macro`, `%1`). A keyword table paints
+  common mnemonics and directives as keywords and the general-purpose and SSE
+  registers as types. `syn_gas.c`: handles `#` and `//` line comments, block
+  comments, escaped strings, and the AT&T sigils, painting `.directives` as
+  preproc, `%registers` as types, and `$immediates` as constants. Its keyword
+  table lists common mnemonics with the frequently used size-suffixed forms
+  (`movl`, `movq`, and so on). Labels are left as plain text in both, since a
+  name is a label only by its trailing colon and the tables do not look ahead.
+  Tests added.
+
+**Increment 14 (DONE).** Pascal `libsyntax` table.
+
+- `syn_pas.c`: case-insensitive (Turbo/Delphi/Free Pascal). Handles all three
+  comment forms, with the block kinds spanning lines: `{ ... }`, `(* ... *)`,
+  and `//`. A brace that opens with `$` is a `{$...}` compiler directive,
+  painted as preproc rather than comment. Strings are `'single quoted'` (a
+  doubled `''` reads as two adjacent strings, keeping the run colored).
+  Numbers cover decimal, `$hex`, and `%binary`. A keyword table paints
+  reserved words, built-in types, and common standard procedures. This clears
+  the original target language list (c, lua, python, shell, nasm, gas, pascal,
+  rust, go, javascript, html). Tests added.
+
+**Increment 15 (DONE).** Assembly label recognition (NASM and GAS).
+
+- A `name:` label is now recolored as a function. This needed a small engine
+  primitive: a new `recolor_buf` rule flag that repaints the whole current
+  identifier buffer to the target state's style, since a label's length is not
+  fixed and the existing `recolor` count is. When the identifier state sees the
+  trailing `:`, it recolors the buffered name and enters a short LABEL state
+  that consumes the colon. In GAS the `.directive` state carries the same rule,
+  so `.L1:` local labels are caught and distinguished from directives by the
+  trailing colon. The flag is a new trailing field on `struct syn_rule`, so the
+  older tables (whose rule initializers omit it) are unaffected. Tests added.
+
+**Increment 16 (DONE).** JavaScript `/regex/` literal recognition.
+
+- A slash is a regex where an operand is expected and a division where one just
+  ended, so the JS idle state was split into two contexts: `JS_RE` (regex may
+  start: input start, and just after an operator, an opening bracket, or a
+  separator) and `JS_DIV` (a slash is division: just after an identifier,
+  number, string, or a closing bracket). Each token routes to the right
+  context on completion, and a slash resolves against whichever is current;
+  comments still work in both. A regex body handles `\` escapes and trailing
+  flags, and is colored as a string. Known limits (documented in the table): a
+  regex after a keyword that expects one (`return /re/`) reads as division,
+  since context is chosen by the previous token's shape and not its meaning; a
+  postfix `++`/`--` before a division reads as a regex; and a `/` inside a
+  regex `[character class]` is treated as the delimiter. Tests added.
+
+**Increment 17 (DONE).** JavaScript `${...}` template interpolation.
+
+- Inside a template literal, a `${ ... }` interpolation is now highlighted as
+  an expression: identifiers and keywords, numbers, quoted strings, and
+  operators, ending at the matching `}`. A dedicated set of interpolation
+  states drives this. A `}` inside a nested string is consumed by that string,
+  so `${ obj["}"] }` closes at the right brace. What is not tracked is brace
+  depth: an interpolation that itself contains a `{ }` object literal or a
+  nested template ends at the first `}`, because the engine has no counter or
+  stack. An escaped `\${...}` is left as plain string, and a `/` inside an
+  interpolation is always an operator. Tests added.
+
+**Increment 18 (DONE).** Operator character-class cleanup.
+
+- The operator classes in the c, rust, go, and bas tables began `+-*`, which
+  the class parser reads as the empty range `+` to `*`, so `+` and `*` were
+  classified as plain text rather than operators. Reordered each so the `-` is
+  last (a literal). This is engine-level correctness only: the editor palette
+  maps `SYN_OPERATOR` to the default foreground, the same as `SYN_TEXT`, so
+  there is no visible change. The sh, py, and lua tables were not affected
+  (they have no `-` in a range-forming position). A C regression test locks
+  `+`, `*`, and `-` as operators.
+
+**Increment 19 (DONE).** Rust, Forth, and BASIC table refinements.
+
+- Rust: char literals now colorize (`'x'`, `'\n'`, `' '` become constants)
+  while lifetimes (`'a`, `'static`) stay plain, using the exact test "a letter
+  after the quote followed by a non-quote is a lifetime." Raw strings `r"..."`
+  and `r#"..."#` are recognized (an inner `"` is kept). Block comments nest one
+  level. The counting cases stay bounded: `r##"..."##` and byte-raw `br"..."`
+  are not specially matched, and a third comment-nesting level closes one
+  delimiter early.
+- Forth: string words (`."`, `s"`, `c"`, `abort"`) now paint the introducer and
+  the `"..."` body as a string. Approximation: any `"` within a word triggers
+  it, which is where a `"` normally appears in Forth.
+- BASIC: `REM` runs to end of line, matched as a whole word by a prefix chain
+  (so `REMARK`/`REM1` stay identifiers). A trailing type sigil is folded into
+  the identifier, so `count%` reads as one token and the string builtins are
+  named with their sigils (`LEFT$`, `CHR$`, ...), coloring fully as functions.
+- No engine change: the char and Forth-string paints use the existing
+  `recolor_buf` rule flag, and REM uses `def_recolor`.
+
+**Increment 20 (DONE).** Mode-aware menu shortcuts and help screen.
+
+- The DOS-chrome pull-down menus and the `F1` help screen showed only the
+  modeless `Ctrl+` chords, which do not reach the editor while the vi
+  personality is active. Each menu item gained a second `vaccel` column
+  (`item_accel` picks it when not modeless), so a menu drawn in vi mode shows
+  the vi keys instead (`:w` for Save, `:q` for Exit, `u`/`Ctrl-R` for
+  undo/redo, `dd`/`yy`/`p` for cut/copy/paste, `/`/`n`/`G` for the Search
+  items). An empty `vaccel` reuses the modeless accel where the two agree
+  (`F1`, `F2`). The help screen gained a parallel `help_entries_vi` table and
+  `render_help` chooses it by mode. Verified live under `screen`: menus and
+  help switch with `F2`.
+- **Files changed:** `src/cmd/edit/edit.c`, `doc/lumi.1.in`.
+
+**Deferred to later increments (roadmap).**
+
+- Assembly: broaden the GAS mnemonic list beyond the common suffixed forms.
+  GAS numeric local labels (`1:` with `1f`/`1b` references) are not recognized,
+  since the digit begins a number rather than an identifier.
+- Rust: raw-string hash levels of 2 or more, and block-comment nesting beyond
+  one level (both need a counter the DFA does not have). Forth: restrict the
+  string span to the four canonical words rather than any in-word `"`.
+- Embedded JS/CSS highlighting inside HTML `<script>`/`<style>`.
+- A runtime loader that builds `struct syntax` from files (the "loader later"
+  half of the format decision).
+- Function-call and matched-bracket highlighting; theme-driven palette.
+- Backward search `?` and reverse repeat `N`; search offsets; `*`/`#`.
+- Text objects (`iw`, `aw`, `i(`, `i"`, ...).
+- The exclusive-to-linewise motion promotion (affects `d}`, `d{`).
+- The `N%` go-to-percentage variant of `%`.
+- The `.` repeat register, named registers (`"a`), and marks (`m`, backtick).
+- Visual mode: `v` charwise and `V` linewise are done (see roadmap V1).
+  Blockwise `Ctrl-V` (rectangular selection and block operators) remains.
+- `r`, `R` (replace), `~`, `J` (join), `>>`/`<<` (shift), `s`/`S`, `D`/`C`.
+- A richer ex line: ranges, `:s///`, `:g`, `:%`, `:e`, `:r`, settings.
+- Line-preserving column memory for `j`/`k`, and `count` with `G`/`gg` edge
+  cases.
+- Extract the vi section to its own file (DONE): it now lives in
+  `src/cmd/edit/vi.c` behind the shared `editor.h`. See roadmap item F2.
+
+## DOS EDIT-style Chrome in `lumi edit` (DONE)
+
+**Goal:** dress the modeless/vi editor in DOS EDIT / QBasic-style chrome, a
+menu bar, a framed window, scrollbars, and modal dialogs, all built on the
+`libdraw` surface. The work landed as a sequence of increments, each on top
+of the last.
+
+**Increment 1 (DONE).** The frame. The text area is wrapped in chrome: a menu
+bar on the top row, a window border whose top edge centers the file name, a
+vertical scrollbar down the right edge and a horizontal one along the bottom
+border, and a status line showing key hints and the cursor `Line:Col`. The
+text area is inset by all of this, so the drawing geometry moved behind
+`text_height` and `text_width`, threaded through `render`, the scroll and
+paging math, and the vi window-line motions; `draw_line` gained a base column
+so it paints into the framed region. Colors come from an editor-local palette
+with a DOS preset (blue text area, gray bars) on by default and a monochrome
+fallback.
+
+**Increment 2 (DONE).** Working drop-down menus. `F10` or `Alt+letter` opens a
+pull-down for File, Edit, Search, View, Options, or Help; the arrow keys move
+between menus and items, `Enter` runs the highlighted one, and `Esc` backs
+out. (The per-item letter shortcut started as the label's leading character
+and became an underlined mnemonic in increment 9.) The menus are a static
+table (`MENUS`, per-menu item arrays)
+so the bar titles, their columns, and the drop-down contents stay in one
+place. Each item maps to work the editor already does (save, undo, cut, copy,
+paste, find, go to line, help) plus new File operations (New, Open, Save As)
+and toggles (View's Color Scheme and Syntax Highlight). `render` split into
+`render_body` plus a present so the menu loop composites the bar and drop-down
+over the editor and flushes once.
+
+**Increment 3 (DONE).** Mouse. Mouse reporting is on by default: click the
+menu bar to open a pull-down, click an item to run it, click a line to place
+the cursor, drag to extend a selection, and use the wheel to scroll. The bar
+and drop-down reuse the same hit-testing so a click resolves to a menu or an
+item, and a click outside an open menu closes it. `Options > Mouse` toggles
+reporting off, handing the mouse back to the terminal so its own selection
+works again.
+
+**Increment 4 (DONE).** Draggable scrollbars. Press or drag the vertical
+scrollbar to set the top line and the bottom scrollbar to set the horizontal
+offset. A press records which region was grabbed (text, vertical bar, or
+horizontal bar) and later motion events follow that drag until release, so
+the mouse can leave the bar column mid-drag without losing it. An arrow cell
+nudges by one line or column; grabbing the track maps position proportionally,
+and the cursor is pulled back into the new view so it stays visible.
+
+**Increment 5 (DONE).** Toggle indicators. A bullet in a drop-down item's left
+margin marks an enabled toggle (Color Scheme, Syntax Highlight, Vi Keys,
+Mouse), so its state reads at a glance. The mark sits in the existing left
+padding column, so item widths and label alignment are unchanged
+(`menu_checked` drives it).
+
+**Increment 6 (DONE).** The About dialog. `Help > About` opens a centered
+modal box with the program name and version rather than a one-line status
+message. It reuses the drop-down gray palette and box glyphs, draws a
+reverse-video OK button, and repaints on resize. Any key or a fresh left
+click dismisses it; the release trailing the click that opened it is ignored
+so the dialog does not close the instant it appears.
+
+**Increment 7 (DONE).** The unsaved-changes dialog. New, Open, and Exit now
+put up a centered Yes/No/Cancel modal instead of a status-line y/n prompt,
+navigated by the arrow keys or Tab and chosen with Enter, the Y/N keys, or a
+click, so a modified buffer is never replaced or dropped by accident. The
+dialog shares a box helper factored out of the About box, and the three call
+sites (New/Open via `confirm_discard`, and both quit paths) route through one
+`confirm_save` helper, retiring the old `confirm_yn`.
+
+**Increment 8 (DONE).** Mode-aware shortcuts. The menu accelerators and the
+`F1` help screen follow the active personality; see increment 20 of the vi
+keybindings section above for the details.
+
+**Increment 9 (DONE).** Underlined mnemonic keys. Menu titles, drop-down
+items, and the Yes/No/Cancel dialog buttons carry a DOS-style `&` marker
+before their shortcut letter, drawn underlined. Selection now matches that
+mnemonic rather than the first character of the label, so ambiguous items
+are reachable: `Save As...` (`a`) no longer collides with `Save` (`s`), and
+the dialog's `Cancel` gained a `c` key it never had. A single
+`draw_menu_label` renders the `&`-marked strings and `menu_disp_w` /
+`menu_mnemonic` read them; `menu_title_by_mnemonic` and
+`menu_item_by_mnemonic` unify the three match sites (Alt+letter,
+`menu_trigger`, and the in-menu letter). This closes the discoverability
+gap left in the deferred notes below: the underlined letter is now the
+visible cue for the direct chord.
+
+**Increment 10 (DONE).** Internal refactoring pass, no behavior change. As
+the file grew past 5,500 lines the modal and geometry code was factored into
+named helpers so concerns read separately:
+
+- `center_box` and `dialog_palette` replace the centered-overlay geometry
+  and palette fetch that the dialogs had copied inline.
+- `CHROME_BOTTOM` / `CHROME_RIGHT` name the bottom/right border geometry
+  that was scattered as `rows-2` / `rows-4` / `cols-1` / `cols-2`.
+- `current_selection_text` replaces the `sel_bounds` + `region_text` pair
+  that Copy, Cut, and the send-to-pane command each spelled out.
+- `handle_mouse` moves the ~100-line inline mouse block (wheel, scrollbar
+  drag, menu-bar click, click/drag selection) out of the main event loop;
+  the anonymous drag-state enum became `enum drag_mode`.
+- `draw_scroll_view` shares the full-screen header/body/footer skeleton
+  between the `F1` help screen and the build-output viewer, each supplying a
+  `get_line` provider.
+- `modal_run` owns the centered-dialog loop (frame, present, EOF, resize);
+  the save-confirm and About dialogs supply a draw callback, a key callback,
+  and a small context struct. This one is a few lines longer than the inline
+  loops it replaced, kept because a third dialog now costs only its two
+  callbacks.
+
+**Files changed:** `src/cmd/edit/edit.c` throughout, and the `lumi edit`
+section of `doc/lumi.1.in`.
+
+**Deferred / notes.**
+
+- The palette is an editor-local preset, not `tui_theme`-driven; wiring it to
+  the theme system is a later option (shared with the syntax-palette note in
+  the vi section).
+- No keyboard accelerator opens the menus other than `F10`/`Alt+letter`; the
+  drop-downs are the discoverable path and the direct chords still work.
+
+## Build Commands in `lumi edit` (DONE)
+
+**Goal:** SciTE-style per-file-type build commands, giving the editor IDE-like
+compile/make/run hotkeys that integrate with a `lumi` session and `lumi basic`.
+SciTE keys compile/build/go to file patterns in its properties files; we map
+that onto `lumi.conf` and the tiled session.
+
+**Design decisions (settled with the user).**
+
+- Config lives in `lumi.conf` as `[build "<ext>"]` sections with a `[build]`
+  default, plus built-in defaults when the config is silent. Verbs are
+  `compile`, `make`, `run`; keys `dir` (working directory) and `save` also
+  apply. Variables `$(file)`, `$(filedir)`, `$(filebase)`, `$(filename)`,
+  `$(fileext)`.
+- Execution splits by verb, mirroring SciTE (Compile/Build use the output
+  pane with error filtering; Go launches the program). `compile` and `make`
+  are the captured verbs that get error parsing; `run` is interactive.
+- Keys: `F5` run, `F6` compile, `F7` make (mirrored in a `Build` menu so they
+  work by mouse regardless of terminal F-key encoding). Next/prev error will
+  be `F4`/`Shift+F4` (or `]e`/`[e` in vi) in the error-parsing increment.
+
+**Increment 1 (DONE).** Config, verbs, and the simple execution path.
+
+- `edit` reads `[build]` from `lumi.conf` via `libcfg` (`load_build_config`),
+  with a built-in `build_defaults` table (universal `make`; C/C++ compile;
+  shell and BASIC run). `build_cmd` resolves a verb: `lumi.conf` wins over the
+  table, and `[build "<ext>"]` wins over `[build]`. `build_expand` substitutes
+  the five variables; `build_save_wanted` and a `dir` lookup honor those keys.
+- `run_build` saves the buffer (unless disabled), then either sends
+  `(cd '<dir>' && <cmd>)` to the adjacent pane via `lu_send_input` (in a
+  session, the Ctrl-G target) or suspends the display, runs the command in the
+  file's directory, and waits for a key (no session). All three verbs use this
+  path in this increment; `compile`/`make` move to captured output in
+  increment 2.
+- A `Build` menu (Run/Compile/Make, F5/F6/F7) sits between Search and View;
+  the menu columns were renumbered. The keys are handled in the main loop so
+  they work in both the modeless and vi personalities. Help screens (both
+  personalities) and usage text list them.
+- Verified live under `screen`: the Build menu renders with the right keys;
+  the no-session inline path runs `cc -Wall -c foo.c` (producing `foo.o`) and
+  `make` in the file's directory (producing the Makefile's output); a
+  `lumi.conf` `[build "c"]` override replaces the default and expands
+  `$(filebase)`/`$(fileext)` correctly.
+- The pane-send path was verified end to end in a two-window session: F7 in
+  the editor ran `make` in the file's directory in the adjacent pane. Two
+  findings came out of it, both fixed. First, `build_expand` had to resolve
+  the file to an absolute path: the command runs in the target pane's own cwd,
+  so a relative `$(filedir)` of `.` landed in the wrong directory. Second, the
+  send used to need the write role, so in the default single-writer mode with
+  an attached client it was refused as read-only. That is now fixed for every
+  `lu_send_input` caller (see below), so the build loop works in a plain
+  single-writer session.
+- **Files changed:** `src/cmd/edit/edit.c`, `doc/lumi.1.in`.
+
+**Inject capability (DONE, `mserver`/`libipc`/`send-input`).** `send-input`
+attached as an ordinary client, so single-writer mode gave it a view role and
+gated out its input, blocking the pane-send used by `lumi edit` (build and
+Ctrl-G) and `lumi basic` (SEND). Added `IPC_ATTACH_F_INJECT`: the client keeps
+a view role (never takes the keyboard or reshapes the window) but the server
+accepts its input run, restricted to the input-run messages, not
+kill/resize/attribute changes. It is trusted like `IPC_ATTACH_F_TOKEN` (owner
+uid, owner-only sockets). `lu_send_input` attaches with it and no longer needs
+the write role. Test `test_inject_bypasses_keyboard` in `test_mserver.c`;
+verified live that F7 in a single-writer two-window session runs `make` in the
+neighboring pane.
+
+**Increment 2 (DONE).** Captured output and diagnostics.
+
+- `compile` and `make` now run captured, not sent to a pane: `capture_command`
+  forks the command with stdout+stderr to a pipe (stdin from `/dev/null`, cwd
+  the file's directory), reads it into a buffer (4 MB cap), and returns the
+  exit status. `run` stays interactive (pane-send/inline).
+- `show_build_output` displays the captured text in a scrollable full-screen
+  viewer (arrows/PgUp/PgDn/Home/End, any other key returns).
+  `parse_diagnostics`/`parse_one_diag` collect `path:line[:col]: message`
+  diagnostics (gcc/clang and `Makefile:line:` style) into `struct build_err`.
+- On return the cursor jumps to the first diagnostic in this file
+  (`build_goto`), matched by base name; `F4`/`Shift+F4` cycle next/previous,
+  and `Build > Next Error`/`Prev Error` do the same. The column maps through
+  `vi_col_to_byte`. Cross-file diagnostics are listed in the viewer but not
+  jumpable yet (single-buffer editor).
+- Verified live under `screen`: a C file with an error compiled to a viewer
+  showing both gcc diagnostics, then the cursor landed on `foo.c:3:13` and F4
+  advanced to `foo.c:3:9`; a clean file reported `compile: ok` and produced
+  `foo.o`; `Build > Prev Error` cycled correctly.
+- **Files changed:** `src/cmd/edit/edit.c`, `doc/lumi.1.in`.
+
+**Deferred from increment 2 (now DONE).** The build used to block the editor
+while it ran; B1 made the output stream into the viewer live (see the vi
+roadmap's Build integration section), and B2 opens cross-file diagnostics.
+
+**Increment 3 (DONE).** `lumi basic` run loop.
+
+- The original sketch (F5 sends `RUN` to a live REPL beside the editor) did not
+  fit `basic`'s `EDIT`, which runs the editor in-process and full-screen, so no
+  REPL runs alongside it. It also surfaced that the increment-1 `.bas` run
+  default `lumi basic $(file)` was broken: `lumi basic` ignored file arguments.
+- Chosen approach (with the user): spawn-and-run in the pane. `lumi basic` now
+  takes a `[file]` argument: it loads the file as the program, runs it (reusing
+  `load_program_file` + the `RUN` half of `EDIT`), then drops to the REPL. The
+  `.bas` run default now works: `F5` on a `.bas` file sends
+  `lumi basic <file>` to the adjacent pane, which runs the program and leaves a
+  live REPL to inspect it. Stateless, and it reuses the send path and the
+  single-writer inject fix from before.
+- Verified: `lumi basic prog.bas` piped ran the program then read the REPL;
+  live in a two-window single-writer session, F5 in the editor ran the program
+  in the neighboring pane, printing its output and leaving the `>` prompt.
+- **Files changed:** `src/cmd/basic/basic_cmd.c`, `doc/lumi.1.in`.
+
+**Deferred.** A live-REPL loop that reuses one interpreter across F5 presses
+(keeping variable state, the QBasic gesture literally) would need `EDIT` to
+open the editor in a side pane and keep the REPL alive. The spawn-and-run loop
+covers the practical case without that rearchitecture.
+
+## `lumi edit` Remaining-Work Roadmap (SCOPED)
+
+**Status:** In progress. F1 (the test harness) has landed; the rest is open.
+This consolidates the open work for the editor, which the sections above
+record in scattered deferred notes, into one ordered plan. The individual
+sections stay the source of detail; this is the map and the priority. Two of
+the items (the test harness and the `vi.c` split) are new here, not tracked
+elsewhere.
+
+**Why now:** `src/cmd/edit/edit.c` is one file of ~5,675 lines, the
+second-largest command after `attach.c`, and the vi personality (the largest
+remaining feature area) is still growing inside it. Before that growth
+continues, the editor needs a test harness and a module split, or each new vi
+increment adds untested code to a monolith.
+
+### Engineering foundation (do first)
+
+**F1 (DONE).** A `test_edit` suite on the mock draw driver. The editor had no
+automated tests; `libtext` was covered but `edit.c` (the vi state machine,
+menus, dialogs, mouse hit-testing, build-output parsing) was verified only
+live under `screen`. `test_edit.c` includes `edit.c` directly (it is a
+static-heavy single unit with no public header until F2) and drives it
+against a `libdraw` mock driver, asserting on the captured cell grid without
+a real terminal; `lu_send_input` is stubbed. A new `src/cmd/edit/module.mk`
+builds it against the editor's libraries and wires it into `make run-tests`.
+The first suite (9 tests, valgrind-clean) covers rendering, inserting, cursor
+movement, line and selection copy with the OSC 52 mirror, the mnemonic
+lookups, the underlined drop-down mnemonic, a vi motion, and `center_box`.
+Extend it as the work below lands, especially alongside F2 and the vi
+increments.
+
+**F2 (DONE).** Split the editor into an editor core plus `vi.c`. `edit.c` had
+reached ~5,675 lines with the vi personality inline. The vi modal layer moved
+to `src/cmd/edit/vi.c` behind a shared `editor.h`, which carries `struct
+editor` and its enums (`edit_mode`, `req`) plus the two crossing interfaces:
+`edit.c` exports the buffer, cursor, selection, and prompt helpers vi.c calls
+(they stop being static), and `vi.c` exports the six entry points edit.c
+calls (`vi_dispatch`, `vi_colon`, `vi_search`, `vi_clamp`,
+`vi_reset_pending`, `vi_col_to_byte`). The code moved verbatim, no behavior
+change; `edit.c` drops to ~3,796 lines. `test_edit` includes both files so
+the whitebox suite still reaches every internal. Full suite green; F2, a
+motion, `dd`, and `:w`/`:q` verified live.
+
+**F3 (DONE, core).** Multi-file / multi-buffer editing. The editor keeps a
+list of open files (`struct ebuf` array on the editor); the flat
+`struct editor` stays the live copy of the active buffer, and `buf_save`/
+`buf_load` mirror only per-file state (text, cursor, scroll, selection,
+syntax, diagnostics, marks) between the flat editor and a parked slot. Global
+vi state (registers, the dot register, the clipboard, the last search) stays
+flat and is shared across buffers, matching vi. This was the snapshot model,
+chosen over a nested `struct buffer` split to avoid rewriting the ~1365
+per-field accesses in `edit.c`/`vi.c`. Commands: `:e path` (open/switch),
+`:e` (reload), `:enew`, `:ls`, `:bn`/`:bp`, `:b N`, `:bd`/`:bd!`; the top
+border shows a `[cur/total]` indicator. Twelve `test_edit` cases cover the
+buffer API and the ex commands. B2 (cross-file diagnostic jump) can now build
+on `buf_open`.
+
+**F4 (DONE).** Finished the file-editing surface left open by F3.
+
+- Buffer navigation is no longer ex-only. The `File` menu gained `Next
+  Buffer`, `Prev Buffer`, and `Buffer List` entries (routed through
+  `run_menu_act` to `buf_cycle`/`buf_list`), and `F8`/`Shift+F8` cycle to
+  the next/previous open file from every personality, mirroring the
+  `F4`/`Shift+F4` build-error keys.
+- The ex `:r [N]path` (and `:read`) reads a file's contents in below the
+  current line, or below line `N` with a range, leaving the cursor on the
+  first inserted line (`ex_read_file`). It loads into a scratch `struct
+  text`, joins the lines, and inserts them as one undo step via
+  `insert_bytes`. A missing file reports `E484` and edits nothing.
+
+Three `test_edit` cases cover `:r` (insert point and a missing file) and
+the File-menu buffer actions; the mnemonic-lookup test was widened for the
+new File entries.
+
+### vi personality (the main feature roadmap)
+
+Pulled from the "vi Keybindings" deferred list, ordered by value:
+
+**V1 (DONE, charwise and linewise).** Visual mode. `v` and `V` anchor a
+selection at the cursor and extend it by any motion, reusing the existing
+selection engine; the operators `d`/`x`, `y`, and `c`/`s` reuse
+`vi_apply_operator` (a `vi_mot` built from the anchor, charwise inclusive of
+both end cells or linewise), so they match the operator+motion forms. `p`
+replaces the selection with the register (one undo step). `o`
+swaps ends; `v`/`V` again or Esc leaves. `vi_dispatch` routes to a new
+`vi_visual_key` that delegates non-visual keys to `vi_normal_key`, so motions
+move the cursor and the selection follows. Rendering highlights inclusively
+in visual mode; the status bar shows `-- VISUAL --` / `-- VISUAL LINE --`.
+Six tests in `test_edit`. **Deferred:** blockwise visual (`Ctrl-V`) -- a
+rectangular selection and block operators do not reuse the linear selection
+engine, so it is a separate piece of work.
+
+**V2 (DONE).** Text objects. `iw`/`aw` and `iW`/`aW` (word objects,
+line-local), the bracket pairs `i(`/`a(`, `i{`/`a{`, `i[`/`a[`, `i<`/`a<`
+(with the `b`/`B` aliases and either bracket accepted, matching across lines),
+and the quote pairs `i"`/`a"`, `i'`/`a'`, `` i` ``/`` a` `` (line-local). They
+compose with the `d`/`c`/`y` operators (`diw`, `ci(`, `ya"`) and with visual
+mode (`viw`, `va(`). Implemented in `vi.c` as `vi_text_object` (dispatching to
+`vi_word_object`, `vi_bracket_object`, `vi_quote_object`) plus
+`vi_apply_textobject_op`; an `i`/`a` following an operator or in visual mode
+arms `vi_textobj` and the next key names the object. Covered by seven
+`test_edit` tests (diw, daw, di(, da(, ci(, di", viw).
+
+**V3 (DONE).** The `.` repeat, named registers, and marks.
+
+- Marks: `m<letter>` sets one of 26 marks a-z at the cursor; backtick
+  jumps to the exact spot and `'` to the first non-blank of the mark's
+  line. Both double as operator motions (`d`a`, `y'b`). Marks hold
+  absolute positions and do not shift as the buffer is edited.
+  (`vi_do_mark`, `vi_markcmd`.)
+- Named registers: `"<letter>` selects register a-z (A-Z appends) for the
+  next delete, yank, or put; the unnamed register still mirrors every
+  delete and yank. Stored in `struct vi_reg vi_regs[26]`, routed through
+  `vi_reg_store`/`vi_reg_get`, with `insert_clip` split so `vi_put` can
+  paste arbitrary register bytes via `insert_bytes`.
+- `.` repeat: `vi_dispatch` records the keys of each command and, when a
+  command returns to rest having changed the buffer, commits them as the
+  `.` register (`vi_keylog`, `vi_dot_commit`, `vi_dot_replay`). Undo and
+  redo are excluded. Change detection uses a new `text_revision` counter
+  in libtext.
+
+Fifteen test_edit cases cover the three features.
+
+**V4 (DONE).** More operators and edits.
+
+- `D`/`C` delete or change to the end of the line, `s`/`S` substitute a
+  character or a whole line, all composing on the existing operators via
+  `vi_edit_span` (which still opens insert on an empty span).
+- `~` toggles case and advances (`vi_toggle_case`); `J` joins the next
+  line with a single space (`vi_join_lines`). Both take a count.
+- `r<char>` replaces the character(s) under the cursor, `r<CR>` breaks
+  the line (`vi_do_replace`); `R` enters Replace mode, an insert session
+  with an overtype flag so typing overwrites (`vi_overtype`).
+- `>`/`<` are operators that shift lines one indent (a tab) over a motion,
+  a text object, a mark, or doubled (`>>`/`<<`), with a count
+  (`vi_shift_lines`). Visual mode shifts the selection with `>`/`<`.
+
+All are recorded by `.`. The shift operators are handled inside
+`vi_apply_operator` and `vi_apply_textobject_op` so every operator path
+(motion, object, mark) shifts rather than deletes. Visual `~`/`J`/`r` on
+a selection are still not done and are swallowed so they cannot fire the
+normal-mode command mid-selection. Eighteen test_edit cases cover V4.
+
+**V5 (DONE, except offsets).** Search completion.
+
+- `?` searches backward and `/` forward; both share the direction state
+  `vi_search_dir`. `do_find` was generalized to `do_find_dir(e, q, dir)`,
+  with a backward scan that takes the rightmost match on each line above
+  the cursor and wraps around the buffer (`last_match` helper).
+- `n` repeats the last search in its own direction, `N` in the opposite.
+- `*`/`#` search forward/backward for the word under the cursor
+  (`vi_search_word`), matched as a plain substring since the search has
+  no regex or word boundaries.
+
+Five test_edit cases cover backward search, its wrap, `*`, `#`, and `N`.
+Search offsets (`/pat/e`, `/pat/+2`) are not done; they need the search
+to carry a post-match adjustment, which the plain-substring engine does
+not model yet.
+
+**V6 (DONE, except `:e`/`:r` and `:set`).** A richer ex line.
+
+- Line ranges: `ex_addr` parses one address (`.`, `$`, a number, a mark
+  `'x`, `+/-N` offsets) and `ex_parse_range` assembles a clamped, ordered
+  `[lo,hi]`, with `%` for the whole file and `;` re-anchoring `.`. A bare
+  range jumps to its last line (`:N`, `:$`, `:.+3`).
+- Range commands: `:d` (delete), `:y` (yank), `:>`/`:<` (shift).
+- `:[range]s/pat/rep/[g]` substitutes (`ex_substitute`/`ex_subst_line`),
+  the first match per line or, with `g`, all; `%` covers the file, an
+  empty pattern reuses the last search, an empty replacement deletes.
+- `:[range]g/pat/cmd` and `:v` / `:g!` run `d` or `s` on the matching (or
+  non-matching) lines (`ex_global`); matches are collected before the
+  command runs so line numbers stay valid.
+- `vi_colon` was split into `vi_ex_exec` (runs a command line) and the
+  prompting wrapper so ex commands are unit-testable.
+
+Patterns are plain byte substrings; there is no regex engine. `:e` now
+works (F3 shipped) and `:r` (read a file into the buffer) landed in F4.
+`:set` is not done: the editor has few
+toggles to expose (`:syntax` already covers highlighting), so a settings
+line was deferred until there is more to set. Fixing `:%d` uncovered and
+corrected a `delete_region` bug that dropped a multi-line span's middle
+lines. Fifteen test_edit cases cover V6.
+
+**V7 (DONE).** Motion corrections.
+
+- Exclusive-to-linewise promotion: in `vi_apply_operator`, an exclusive
+  charwise motion ending in column 0 of a lower line pulls its end back
+  to the close of the previous line, and becomes linewise when the start
+  is at or before its first non-blank, so `d}`/`d{` delete whole lines.
+  The linewise operator body was extracted into `vi_op_lines` and shared.
+- `N%` jumps to N percent of the file (bare `%` still matches brackets).
+- Column memory: a run of `j`/`k` aims for the display column of the
+  run's first line (`vi_want_col`), so passing through short lines does
+  not lose the column; `$` sets a sticky end-of-line column. The run is
+  tracked with `vi_vert_run`/`vi_vert_prev`, cleared whenever any other
+  command intervenes, so no per-command resets are needed.
+- `G`/`gg` counts (`NG`, `Ngg`, `dG`, `d3G`) already worked; tests now
+  cover them.
+
+Eleven test_edit cases cover V7.
+
+### Build integration
+
+**B1 (DONE).** Live-filling build output. A compile or make no longer blocks
+the editor until the child exits. `build_stream` forks the command with a
+non-blocking pipe and, in a `draw_next_event` timeout-poll loop (40 ms),
+drains output as it arrives, indexes it by line, and repaints the viewer.
+The view follows the tail until the user scrolls up (arrows/PgUp/Home pause
+the follow, Down/PgDn/End rejoin it), and any non-scroll key (q, Esc, Enter)
+cancels the build with SIGTERM and returns to editing. When the child exits
+on its own, the diagnostics are parsed and the viewer becomes the existing
+scrollable browse (`build_browse`, split out of the old `show_build_output`)
+before the first-diagnostic jump. The output is held in `struct build_lines`,
+now an incremental index: the raw bytes grow in one buffer with newlines
+intact (so `parse_diagnostics` still reads it) and a `start` array holds each
+line's byte offset, so a realloc while streaming cannot dangle a pointer. The
+old blocking `capture_command` is gone. One `test_edit` case covers the
+incremental indexer (splitting a line across appends, CRLF, no trailing empty
+line). Verified live: a Makefile that echoes a line per second fills the
+viewer one line at a time, q cancels mid-build, and a real compile error
+still streams then jumps to the line.
+
+**B2 (DONE).** Jump to a cross-file diagnostic. The diagnostics list is now
+one global quickfix list shared by every buffer, not per-buffer state, so it
+survives buffer switches (it was moved out of the `struct ebuf` snapshot and
+the `buf_save`/`buf_load` mirror, and is freed once at teardown). `build_goto`
+cycles the whole list rather than only same-file entries; a diagnostic in
+another file is opened with `buf_open` (`build_resolve_path` joins a relative
+compiler path to the build's recorded working directory) before the cursor
+lands on the line, and an already-open file is switched to rather than
+duplicated. Fixing this exposed a parser bug: gcc's "In file included from
+foo.c:1:" context lines were being recorded as diagnostics with a bogus
+path; the old same-file filter hid them, so `parse_one_diag` now rejects a
+path that contains a space. `build_goto` also checks the file exists before
+opening so a misresolved path does not spawn a blank buffer. Three `test_edit`
+cases cover the shared list, the context-line skip, and the cross-file jump.
+Verified live: compiling a file whose error is in an included header jumps
+into the header, F4/Shift+F4 walk the list across files, and re-entering an
+open file switches to it.
+
+### Syntax highlighting refinements
+
+From the vi-section deferred list, all lower priority (documented DFA limits,
+not bugs):
+
+- Function-call and matched-bracket highlighting.
+- A theme-driven palette (shared with the chrome-palette note below), and a
+  runtime loader that builds `struct syntax` from files.
+- Embedded JS/CSS inside HTML `<script>`/`<style>`.
+- Per-language gaps: GAS numeric local labels (`1:`/`1f`/`1b`) and a broader
+  mnemonic list; Rust raw-string hash levels of 2+ and block-comment nesting
+  past one level; Forth string span; Lua `[==[` equals-level long
+  strings/comments; JS regex-vs-division context and template-interpolation
+  brace depth (both need a counter/stack the DFA lacks).
+
+### Chrome
+
+**C1 (DONE, chrome palette).** Theme-driven chrome palette. The editor chrome
+can now be derived from a `tui_theme` rather than only the hardcoded preset.
+`chrome_from_theme` maps a theme onto the editor's `chrome_pal`: the editing
+area takes `content_fg`/`content_bg`, the frame takes `border_fg`/`border_bg`,
+the title takes `title_fg`, and the menu/status bars invert the content colors
+(a theme has no bar color). An `[edit]` section with `theme = <name>` in
+lumi.conf selects any named theme (turbo, thin, crimson, ...); with no key the
+built-in DOS preset is kept, so the default look is unchanged. One `test_edit`
+case checks the mapping; verified live by capturing the SGR stream (default
+renders blue `44m`, `theme = crimson` renders red `41m`).
+
+**C1b (DONE, syntax palette).** The syntax palette is now configurable too.
+`tui_theme` has no syntax-color fields (highlighting is editor-specific, not a
+widget concern), so rather than extend the shared theme this adds an editor-
+local `[edit.syntax]` section. `load_syntax_colors` walks the style-name table
+(`syn_style_names`), and for each key present in lumi.conf applies the value
+through `syn_apply`, which parses it with `tui_theme_parse_color` (`default`, a
+`0`-`255` index, or `#rrggbb`) into `syn_color[]`. Unset keys keep the built-in
+color; a bad value is ignored. One `test_edit` case covers the name mapping and
+the three color forms; verified live by SGR capture (`keyword = 200` renders
+`38;5;200` on the highlighted keyword, absent by default).
+
+### Hex editor mode (SCOPED)
+
+A hex view and, later, a hex editor for the current buffer, living inside
+`lumi edit`. The same buffer is viewable as hex or as text: it is one
+document with two renderings, not two documents.
+
+**One store, byte-faithful.** `struct text` is already an exact byte
+container, so it stays the single source of truth for both views. Each line
+holds an explicit byte length, not a C string: `text_load` stores the raw
+slice between newlines (NULs and all) and `text_save` writes `line.len` bytes,
+so a load then save is byte-exact and embedded NULs survive. The byte stream a
+hex view walks is just the line buffers joined by an implied `\n`, with a
+trailing `\n` only when `final_newline` is set. The one rough edge is that
+`text_line` returns a NUL-terminated pointer, so the text view (and syntax and
+search) stop at an embedded NUL; that is a display artifact of the text
+rendering, not data loss, and the hex view shows every byte. So hex mode does
+not need a separate byte buffer or a document-kind split, and toggling never
+re-reads the file or drops unsaved edits.
+
+**Shape (decided).** Hex is an alternate view flag on the buffer, not a
+separate command, so it reuses the chrome, the multi-buffer list (F3),
+scrolling, the status bar, save/quit, and even the cursor: the text cursor
+`(cy, cx)` is the position in both views, and a byte offset is just its
+distance from the start of the buffer. A `hex_view` bit (per buffer, saved and
+restored by `buf_save`/`buf_load`) selects the rendering; the editor's draw and
+key dispatch branch on it, the way the build-output viewer sits beside the text
+view. Toggling text<->hex keeps `(cy, cx)`, so the caret stays on the same byte.
+
+Two small mapping helpers carry the design: `hex_offset_of(t, cy, cx)` (sum of
+earlier line lengths plus one per implied newline, plus `cx`) and its inverse
+`hex_pos_at(t, offset, &cy, &cx)`. Both are pure functions over `struct text`
+and are the natural unit-test target.
+
+**H1 (read-only viewer, DONE).** Toggle the current buffer into a scrolling
+hex dump and back.
+
+- A new `src/cmd/edit/hex.c` holds the pure byte-model helpers over
+  `struct text`: `hex_total`, `hex_offset_of`/`hex_pos_at` (position <->
+  byte offset), `hex_gather` (copy a run of the reconstructed stream, implied
+  newlines included), and `hex_format_row` plus `hex_hexcol`/`hex_asciicol`
+  for the dump layout. `text_final_newline` was added to libtext so the byte
+  stream is exact. The screen rendering (`hex_render`) and key handling
+  (`hex_key`) live in `edit.c` where the chrome, menu bar, and draw helpers
+  already are; only the testable byte logic moved to `hex.c`.
+- `render_body` branches to `hex_render` when `e->hex_view` is set: an offset
+  column, 16 hex bytes, and an ASCII gutter (nonprintables shown as `.`), the
+  cursor byte drawn in reverse, following the tail via `hex_top`.
+- Navigation reuses the text cursor `(cy, cx)`: arrows and PgUp/PgDn move the
+  cursor byte, `g` prompts for a hex offset, and `q`/`Esc` return to text.
+  Toggling keeps `(cy, cx)`, so the caret stays on the same byte.
+- Entry: the `View > Hex Dump` menu item (a per-buffer `hex_view` flag mirrored
+  by `buf_save`/`buf_load`); the status bar shows the offset and total size.
+  A byte/ASCII search is deferred to land alongside H2 editing.
+- One `test_edit` case covers the offset mapping, `hex_gather` across a line
+  boundary, and the row formatter; verified live on a file with a control byte
+  (the dump matched `od`, and the cursor position survived the toggle).
+
+**H2 (overwrite editing, DONE).** The hex view now edits. `Tab` toggles the
+active sub-column (`hex_ascii`); in the hex column two hex digits accumulate a
+byte (`hex_pending` holds the typed high nibble and the cursor cell shows it),
+and in the ascii column any printable character writes one. `hex_overwrite`
+maps the cursor offset to `(cy, cx)` and rewrites the byte as one undo group
+through `text_delete` + `text_insert`, so undo and dirty tracking come for
+free, and `hex_advance` steps to the next byte. Writing over, or with, an
+implied newline is refused (line-structure edits are H3). Saving is `File >
+Save` (which `text_save` already writes verbatim); the status bar shows a `*`
+while dirty and which column is active. The transient edit state resets on
+entry and on a buffer switch. A new `test_edit` case covers the byte overwrite,
+the newline refusals, and undo; verified live: typing `58` then Tab and `Y`
+turned `48 69 ..` into `58 59 ..`, and File > Save wrote those exact bytes to
+disk.
+
+**H3 (structural editing, DONE).** The hex view now inserts and deletes bytes,
+not just overwrites. `Ins` toggles a `hex_insert` flag (the status line shows
+`OVR` or `INS`), which resets on entry and on a buffer switch. In insert mode a
+completed byte calls `hex_insert_byte`: a `0a` byte splits the line with
+`text_split`, any other byte is added with `text_insert`, and the cursor lands
+on the byte after it. `Del` (`hex_delete_at`) removes the byte under the cursor,
+`Backspace` (`hex_delete_prev`) the byte before it; deleting an implied interior
+newline joins the lines with `text_join`. The one trailing newline of the file
+is the `final_newline` flag, not a byte, so the delete keys leave it alone. Each
+edit is one undo group, so undo and dirty tracking still come for free. A
+`test_edit` case covers insert, the newline split, the join-on-delete, the
+protected trailing newline, backspace, and undo; verified live with a screen
+session (Alt-v h opened the dump, Ins flipped OVR to INS, and typing `4142` in
+insert mode prepended `41 42` to the buffer with the total and dirty flag
+updating).
+
+**H3b (search, DONE).** The hex view searches its byte stream. In the hex
+column `/` prompts for text (matched as its literal bytes) and `\` for a hex
+pattern (byte pairs such as `0a 0d`, spaces ignored); `n` and `N` repeat the
+last pattern forward and backward. Two pure helpers in `hex.c` carry it,
+`hex_parse_bytes` (parse the hex pairs) and `hex_find` (a wrapping byte search
+over the reconstructed stream, so a pattern may cross an implied newline and
+the match under the cursor is skipped). The last pattern lives in
+`hex_pat`/`hex_pat_len`/`hex_pat_dir` on `struct editor` (global, not
+per-buffer). The command letters act only in the hex sub-column, where they are
+not byte data. `hex_render` now shows a transient message (the match offset, or
+"pattern not found") on its status line. A `test_edit` case covers the parser
+and forward, backward, wrapping, cross-newline, and not-found searches; verified
+live (`/world` and `n`/`N` walked the two matches, `\0a` found a newline, and a
+missing pattern reported not found). This also fixed a latent bug: `hex_goto`
+and the search prompt passed an uninitialized buffer to `prompt_line`, which
+starts from `strlen(buf)`, so both now clear `buf[0]` first.
+
+**H3c (configurable width, DONE).** The hex view's `w` key cycles the dump
+width between 8, 16, and 32 bytes per row (`hex_cols` on `struct editor`, a
+global view preference defaulting to 16). The layout helpers in `hex.c` are now
+parametric: `hex_hexcol` keeps a wider gap after every group of eight (so it
+works past 16), and `hex_ascii_start`, `hex_asciicol`, and `hex_row_width` take
+the column count. `hex_render` and the cursor-movement math divide by `hex_cols`
+rather than the old fixed 16, and the per-row scratch buffers grew to hold a
+32-byte row. Wider rows simply clip on a narrow terminal (the draw layer bounds
+each row to the screen width). A `test_edit` case checks the 8- and 16-byte
+layouts and the group-gap columns; verified live (w cycled 16 -> 32 -> 8, each
+with correct gutters).
+
+**H3d (data inspector, DONE).** The hex view's `i` key toggles a footer line
+(above the status bar, so it costs one content row) that decodes the bytes at
+the cursor: the first byte as unsigned and signed 8-bit and as a character,
+then the 16- and 32-bit values in little-endian and big-endian. A pure
+`hex_inspect_line` helper in `hex.c` formats the text from the up-to-four bytes
+gathered at the cursor, showing "-" for fields without enough bytes, so it is
+unit-tested directly. Verified live: the line tracked the cursor and its u16/u32
+little- and big-endian decodes matched the bytes on screen.
+
+**H4 (byte copy/paste, DONE).** The hex view has a byte-native clipboard. `v`
+starts a selection at the cursor (a second `v`, or Esc, clears it) and moving
+the cursor extends it; `y` copies the selected bytes, or the single byte under
+the cursor, to the editor clipboard (which `clip_set` also mirrors to the system
+clipboard via OSC 52); and `p` inserts the clipboard bytes at the cursor as one
+undo group, splitting the line on any newline byte via the shared
+`insert_bytes`. The selection is a byte range anchored at `hex_anchor` with
+`hex_sel` set, highlighted in reverse video in both the hex and ascii columns,
+with its extent shown on the status line. A `test_edit` case covers the range
+yank, the single-byte yank, paste, and a newline paste; verified live (selecting
+three bytes, yanking, and pasting them before the trailing newline).
+
+**H5 (save/quit through the shared framework, DONE).** The hex view saves and
+quits through the editor's one request framework rather than a parallel path.
+Previously the main loop short-circuited hex keys (`hex_key(); continue;`), so
+the hex view could not reach the save/quit handling and had no way to write the
+buffer except the File menu. `hex_key` now returns an `enum req` like
+`vi_dispatch` does, Ctrl-S returns `REQ_SAVE` and Ctrl-Q returns `REQ_QUIT`, and
+a new `run_req` helper carries out `REQ_FIND`/`REQ_GOTO`/`REQ_HELP`/`REQ_SAVE`/
+`REQ_QUIT` for both the text (modeless) and hex views. Save funnels through the
+single `save_editor`, and quit through the single `confirm_save` dialog, so the
+two views behave identically around the one backing buffer. The text view's
+dispatch tail was refactored onto `run_req` too, removing the duplicated switch.
+Verified live: from the hex view Ctrl-S wrote an edited byte to disk and cleared
+the dirty flag, and Ctrl-Q on a modified buffer raised the same save-changes
+dialog as the text view.
+
+With H1 through H5 shipped, the hex view covers a read-only dump, overwrite and
+structural editing, text and hex-byte search, a configurable row width, a data
+inspector, byte copy/paste, and save/quit, all sharing the text view's
+framework around the backing buffer. The hex view is now a peer of the modeless
+and vi personalities: its own key interpretation over the common editor core.
+
+**Files to change.** `src/cmd/edit/editor.h` (a `hex_view` bit on
+`struct editor`/`struct ebuf`, mirrored by `buf_save`/`buf_load`), a new
+`src/cmd/edit/hex.c` for the offset<->position helpers, the dump renderer, and
+the hex key handler (kept out of `edit.c`/`vi.c` behind `editor.h`, matching
+the `vi.c` split), `src/cmd/edit/module.mk` to compile it, `test_edit.c` for
+the offset mapping and the dump formatter, and `doc/lumi.1.in` for the mode and
+its keys.
+
+### Suggested order
+
+F1 (tests) -> F2 (`vi.c` split) -> V1 (visual mode) -> V2/V3 (text objects,
+registers) alongside B1 (async build) -> F3 (multi-buffer) -> B2 and the ex
+`:e`/`:r` work -> the remaining vi, syntax, and chrome refinements, then the
+hex editor mode, as they are wanted.
+
+## Rendering / Drawing Abstraction
+
+A backend-neutral drawing layer (`libdraw`) is proposed so the apps and editor
+draw into a cell grid through a driver seam instead of emitting raw terminal
+escapes, which would let a graphical backend replace the terminal one day. The
+design (surface API, `struct draw_driver` vtable, terminal driver reusing
+`librender`/`libtxl`/`libtio`, input via `tkbd_seq`, and an adoption roadmap) is
+in `doc/DRAW.md`. Status: `libdraw` and `libdraw_term` have landed with a
+mock-driven `test_draw` suite, and `edit`, `files`, and `splash` are ported onto
+the surface. The driver also owns SIGWINCH and SIGTSTP and delivers resize and
+suspend as `draw_wait` events, so the apps carry no signal code. Remaining:
+re-express the pad-stack `tui_backend` on `draw_driver` and migrate attach's
+overlay apps, then a graphical driver.
 
 ---
 

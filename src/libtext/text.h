@@ -69,6 +69,15 @@ int text_join(struct text *t, size_t line);
 /** Non-zero if the buffer changed since the last load or save. */
 int text_dirty(const struct text *t);
 
+/** Non-zero if the content ends with a trailing newline (as loaded or saved).
+ *  Used to reconstruct the exact byte stream, for example a hex view. */
+int text_final_newline(const struct text *t);
+
+/** A counter bumped on every primitive mutation (insert, delete, split,
+ * join). It only ever increases, so a caller can snapshot it and later tell
+ * whether the buffer changed in between. */
+size_t text_revision(const struct text *t);
+
 /*
  * Undo and redo. Each edit pushes its inverse onto the undo stack, and a
  * run of consecutive insertions coalesces into one step. Call
@@ -89,5 +98,16 @@ int text_redo(struct text *t, size_t *line, size_t *col);
 /** End the current coalescing run so the next insertion starts a new undo
  *  step. */
 void text_undo_boundary(struct text *t);
+
+/*
+ * Undo grouping. Every primitive recorded between a begin and its matching
+ * end collapses into a single undo (and redo) step, so a command built from
+ * several primitives -- a multi-line delete, a paste, a vi operator -- is
+ * reversed as one unit. Calls nest: only the outermost pair bounds the
+ * group. Begin also ends any coalescing run, so a group never merges with an
+ * edit made before it.
+ */
+void text_undo_group_begin(struct text *t);
+void text_undo_group_end(struct text *t);
 
 #endif /* TEXT_H */

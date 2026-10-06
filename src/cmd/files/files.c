@@ -6,7 +6,8 @@
 
 #include "tkbd.h"
 #include "tui_theme.h"
-#include "tui_out.h"
+#include "draw.h"
+#include "draw_term.h"
 #include "utf8.h"
 #include "vt_cell.h"
 #include "rune_width.h"
@@ -20,15 +21,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 static const char *progname = "lumi-files";
-
-/* Set by the SIGWINCH handler; polled from the input loop's idle tick. */
-static volatile sig_atomic_t resized;
 
 /* Result of handling one key: keep going, quit, or open the selection in
  * an external pager or editor (performed by the main loop). */
@@ -63,6 +60,7 @@ struct browser {
 	int		rows;		/* terminal size, refreshed on resize */
 	int		cols;
 	int		in_session;
+	struct draw	*d;		/* drawing surface and input source */
 	char		status[160];	/* transient footer message */
 };
 
@@ -326,27 +324,38 @@ human_size(char *buf, size_t sz, long long n)
 		snprintf(buf, sz, "%.1f%c", v, units[u]);
 }
 
+/* Fill row [col, col+width) with a color, then write s over the start of it,
+ * so the text sits in a uniformly colored field. Mirrors tui_out_field. */
 static void
-draw_bar(struct tui_out *ob, const struct tui_theme *t, const char *text,
-    int width)
+draw_field(struct draw *d, int row, int col, int width, const char *s,
+    struct vt_color fg, struct vt_color bg, uint16_t attrs)
 {
-	tui_out_sgr(ob, &t->title_fg, &t->border_bg, 1);
-	tui_out_field(ob, text, width);
-	tui_out_sgr_reset(ob);
+	draw_fill(d, row, col, width, ' ', fg, bg, attrs);
+	draw_text(d, row, col, s, fg, bg, attrs);
 }
 
-/* Draw one list row into exactly `width` columns: a leading gutter, the
- * name (with a trailing '/' for directories), and a right-aligned size for
- * files. Colors come from the theme; the selected row and directories are
- * emphasized. */
 static void
-draw_entry_row(struct tui_out *ob, const struct tui_theme *t,
+draw_bar(struct draw *d, const struct tui_theme *t, int row, const char *text,
+    int width)
+{
+	draw_field(d, row, 0, width, text, t->title_fg, t->border_bg,
+	    VT_ATTR_BOLD);
+}
+
+/* Draw one list row into exactly `width` columns starting at col: a leading
+ * gutter, the name (with a trailing '/' for directories), and a right-aligned
+ * size for files. Colors come from the theme; the selected row and
+ * directories are emphasized. */
+static void
+draw_entry_row(struct draw *d, const struct tui_theme *t, int row, int col,
     const struct entry *e, int width, int selected)
 {
 	char left[NAME_MAX + 4];
 	char right[20];
 	int rightw = 0;
 	int leftw;
+	struct vt_color fg, bg;
+	uint16_t attrs;
 
 	if (!e->is_dir && !e->is_updir) {
 		char size[16];
@@ -368,14 +377,18 @@ draw_entry_row(struct tui_out *ob, const struct tui_theme *t,
 		rightw = 0;
 	}
 
-	if (selected)
-		tui_out_sgr(ob, &t->sel_fg, &t->sel_bg, 1);
-	else
-		tui_out_sgr(ob, &t->content_fg, &t->content_bg, e->is_dir);
-	tui_out_field(ob, left, leftw);
+	if (selected) {
+		fg = t->sel_fg;
+		bg = t->sel_bg;
+		attrs = VT_ATTR_BOLD;
+	} else {
+		fg = t->content_fg;
+		bg = t->content_bg;
+		attrs = e->is_dir ? VT_ATTR_BOLD : 0;
+	}
+	draw_field(d, row, col, leftw, left, fg, bg, attrs);
 	if (rightw > 0)
-		tui_out_field(ob, right, rightw);
-	tui_out_sgr_reset(ob);
+		draw_field(d, row, col + leftw, rightw, right, fg, bg, attrs);
 }
 
 /****************************************************************
@@ -557,7 +570,7 @@ build_preview(struct browser *b, struct preview *pv)
  ****************************************************************/
 
 static void
-render(struct browser *b, struct tui_out *ob)
+render(struct browser *b, struct draw *d)
 {
 	const struct tui_theme *t = tui_theme_default();
 	struct preview pv;
@@ -567,6 +580,7 @@ render(struct browser *b, struct tui_out *ob)
 	int two_pane = b->cols >= 64;
 	int list_w = b->cols;
 	int prev_w = 0;
+	int status_row = (b->rows > 0 ? b->rows : 24) - 1;
 	int i;
 
 	if (body_h < 1)
@@ -603,57 +617,52 @@ render(struct browser *b, struct tui_out *ob)
 			b->pv_scroll = 0;
 	}
 
-	tui_out_reset(ob);
-	tui_out_puts(ob, "\033[?25l\033[H\033[2J");	/* hide cursor, clear */
+	draw_clear(d);
+	draw_cursor_vis(d, 0);		/* the browser view has no text cursor */
 
 	/* header */
 	snprintf(header, sizeof(header), " lumi files  %s%s", b->cwd,
 	    b->in_session ? "  [session]" : "");
-	tui_out_move(ob, 1, 1);
-	draw_bar(ob, t, header, b->cols);
+	draw_bar(d, t, 0, header, b->cols);
 
 	/* body: list on the left, optional preview on the right */
 	for (i = 0; i < body_h; i++) {
 		int idx = b->scroll + i;
+		int row = list_top - 1 + i;
 
-		tui_out_move(ob, list_top + i, 1);
-		if (idx >= b->n_ents) {
-			tui_out_sgr(ob, &t->content_fg, &t->content_bg, 0);
-			tui_out_field(ob, "", list_w);
-			tui_out_sgr_reset(ob);
-		} else {
-			draw_entry_row(ob, t, &b->ents[idx], list_w,
+		if (idx >= b->n_ents)
+			draw_field(d, row, 0, list_w, "", t->content_fg,
+			    t->content_bg, 0);
+		else
+			draw_entry_row(d, t, row, 0, &b->ents[idx], list_w,
 			    idx == b->sel);
-		}
 
 		if (two_pane) {
 			int pvidx = b->pv_scroll + i;
-			const char *line = pvidx < pv.nlines ? pv.lines[pvidx] : "";
+			const char *line = pvidx < pv.nlines ? pv.lines[pvidx]
+			    : "";
 
-			tui_out_sgr(ob, &t->border_fg, &t->border_bg, 0);
-			tui_out_puts(ob, t->border[TUI_BORDER_L]);
-			tui_out_sgr_reset(ob);
-			tui_out_sgr(ob, &t->content_fg, &t->content_bg, 0);
-			tui_out_field(ob, line, prev_w);
-			tui_out_sgr_reset(ob);
+			draw_text(d, row, list_w, t->border[TUI_BORDER_L],
+			    t->border_fg, t->border_bg, 0);
+			draw_field(d, row, list_w + 1, prev_w, line,
+			    t->content_fg, t->content_bg, 0);
 		}
 	}
 
 	/* footer: transient status, else key hints */
-	tui_out_move(ob, b->rows > 0 ? b->rows : 24, 1);
 	if (b->status[0]) {
 		char msg[512];
 
 		snprintf(msg, sizeof(msg), " %s", b->status);
-		draw_bar(ob, t, msg, b->cols);
+		draw_bar(d, t, status_row, msg, b->cols);
 	} else {
-		draw_bar(ob, t, b->in_session
+		draw_bar(d, t, status_row, b->in_session
 		    ? " j/k move  Enter open  e edit  o/O win  d/r/m ops  . hidden  q quit"
 		    : " j/k move  Enter open  e edit  d/r/m ops  . hidden  ^U/^D preview  q quit",
 		    b->cols);
 	}
 
-	(void)tui_out_flush(ob, STDOUT_FILENO);
+	draw_present(d);
 }
 
 /****************************************************************
@@ -684,25 +693,6 @@ usage(void)
 	    "  d             delete the selection (asks to confirm)\n"
 	    "  q, Esc        quit\n",
 	    progname);
-}
-
-static void
-on_sigwinch(int sig)
-{
-	(void)sig;
-	resized = 1;
-}
-
-static int
-get_term_size(int *rows, int *cols)
-{
-	struct winsize ws;
-
-	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) < 0)
-		return -1;
-	*rows = ws.ws_row > 0 ? ws.ws_row : 24;
-	*cols = ws.ws_col > 0 ? ws.ws_col : 80;
-	return 0;
 }
 
 /* Move the selection by delta, clamping to the list bounds. */
@@ -750,23 +740,18 @@ is_quit(const struct tkbd_seq *seq)
  * has no text field, so pasted content is discarded rather than acted on as
  * a run of key commands. */
 static void
-swallow_paste(struct tkbd_stream *s)
+swallow_paste(struct browser *b)
 {
 	for (;;) {
-		struct tkbd_seq seq;
-		int n;
+		struct draw_event ev;
 
-		memset(&seq, 0, sizeof(seq));
-		seq.ch = TKBD_CH_NONE;
-		n = tkbd_read(s, &seq);
-		if (n < 0) {
-			if (errno == EINTR)
-				continue;
+		if (draw_wait(b->d, &ev) == DRAW_EVENT_EOF)
 			break;
-		}
-		if (n == 0)
+		if (ev.type != DRAW_EVENT_KEY) {
+			draw_size(b->d, &b->rows, &b->cols);	/* resize/resume */
 			continue;
-		if (seq.type == TKBD_KEY && seq.key == TKBD_KEY_PASTE_END)
+		}
+		if (ev.key.type == TKBD_KEY && ev.key.key == TKBD_KEY_PASTE_END)
 			break;
 	}
 }
@@ -883,8 +868,7 @@ handle_key(struct browser *b, const struct tkbd_seq *seq)
  * flags in $PAGER/$EDITOR are honored, then restore the TUI. The filename
  * is passed as a positional argument so it needs no shell quoting. */
 static void
-open_file(struct browser *b, struct tkbd_stream *stream, struct tui_out *ob,
-    const char *env, const char *fallback)
+open_file(struct browser *b, const char *env, const char *fallback)
 {
 	struct entry *e;
 	char path[PATH_MAX];
@@ -909,10 +893,7 @@ open_file(struct browser *b, struct tkbd_stream *stream, struct tui_out *ob,
 	snprintf(cmd, sizeof(cmd), "%s \"$1\"", prog);
 
 	/* leave the alternate screen and restore cooked mode for the child */
-	tui_out_reset(ob);
-	tui_out_puts(ob, "\033[?2004l\033[?25h\033[?1049l");
-	(void)tui_out_flush(ob, STDOUT_FILENO);
-	tkbd_detach(stream);
+	draw_end(b->d);
 
 	pid = fork();
 	if (pid < 0) {
@@ -929,13 +910,10 @@ open_file(struct browser *b, struct tkbd_stream *stream, struct tui_out *ob,
 			;
 	}
 
-	/* re-enter raw mode and the alternate screen; refresh the size in
-	 * case the child left the terminal a different shape */
-	tkbd_attach(stream, STDIN_FILENO);
-	tui_out_reset(ob);
-	tui_out_puts(ob, "\033[?1049h\033[?2004h");
-	(void)tui_out_flush(ob, STDOUT_FILENO);
-	(void)get_term_size(&b->rows, &b->cols);
+	/* re-enter raw mode and the alternate screen; draw_begin re-syncs the
+	 * surface to the terminal size, which the child may have changed */
+	draw_begin(b->d);
+	draw_size(b->d, &b->rows, &b->cols);
 	b->status[0] = '\0';
 }
 
@@ -1001,47 +979,40 @@ open_in_window(struct browser *b, int use_editor)
 /* Draw the frame, then overlay a prompt on the footer row with the cursor
  * shown at the end of the typed text. */
 static void
-draw_prompt(struct browser *b, struct tui_out *ob, const char *q,
-    const char *buf)
+draw_prompt(struct browser *b, const char *q, const char *buf)
 {
 	const struct tui_theme *t = tui_theme_default();
 	char line[512];
-	int col, row = b->rows > 0 ? b->rows : 24;
+	int col, row = (b->rows > 0 ? b->rows : 24) - 1;
 
-	render(b, ob);				/* frame, with the cursor hidden */
-	tui_out_reset(ob);
-	tui_out_puts(ob, "\033[?25h");		/* show the cursor for input */
+	render(b, b->d);			/* frame, with the cursor hidden */
 	col = snprintf(line, sizeof(line), "%s%s", q, buf ? buf : "");
-	tui_out_move(ob, row, 1);
-	tui_out_sgr(ob, &t->sel_fg, &t->sel_bg, 1);
-	tui_out_field(ob, line, b->cols);
-	tui_out_sgr_reset(ob);
+	draw_field(b->d, row, 0, b->cols, line, t->sel_fg, t->sel_bg,
+	    VT_ATTR_BOLD);
 	if (col >= b->cols)
 		col = b->cols - 1;
-	tui_out_move(ob, row, col + 1);
-	(void)tui_out_flush(ob, STDOUT_FILENO);
+	draw_cursor_vis(b->d, 1);		/* show the cursor for input */
+	draw_cursor(b->d, row, col);
+	draw_present(b->d);
 }
 
 /* Read a y/n answer. Returns 1 for yes, 0 for no, -1 if cancelled. */
 static int
-confirm_yn(struct browser *b, struct tui_out *ob, struct tkbd_stream *s,
-    const char *q)
+confirm_yn(struct browser *b, const char *q)
 {
-	draw_prompt(b, ob, q, "");
+	draw_prompt(b, q, "");
 	for (;;) {
+		struct draw_event ev;
 		struct tkbd_seq seq;
-		int n;
 
-		memset(&seq, 0, sizeof(seq));
-		seq.ch = TKBD_CH_NONE;
-		n = tkbd_read(s, &seq);
-		if (n < 0) {
-			if (errno == EINTR)
-				continue;
+		if (draw_wait(b->d, &ev) == DRAW_EVENT_EOF)
 			return -1;
-		}
-		if (n == 0)
+		if (ev.type != DRAW_EVENT_KEY) {
+			draw_size(b->d, &b->rows, &b->cols);	/* resize/resume */
+			draw_prompt(b, q, "");
 			continue;
+		}
+		seq = ev.key;
 		if (seq.ch == 'y' || seq.ch == 'Y')
 			return 1;
 		if (seq.ch == 'n' || seq.ch == 'N')
@@ -1056,25 +1027,23 @@ confirm_yn(struct browser *b, struct tui_out *ob, struct tkbd_stream *s,
  * with a default. Returns 1 with buf filled, or 0 if cancelled or left
  * empty. */
 static int
-prompt_line(struct browser *b, struct tui_out *ob, struct tkbd_stream *s,
-    const char *q, char *buf, size_t bufsz)
+prompt_line(struct browser *b, const char *q, char *buf, size_t bufsz)
 {
 	size_t len = strlen(buf);
 
 	for (;;) {
+		struct draw_event ev;
 		struct tkbd_seq seq;
-		int n;
 
-		draw_prompt(b, ob, q, buf);
-		memset(&seq, 0, sizeof(seq));
-		seq.ch = TKBD_CH_NONE;
-		n = tkbd_read(s, &seq);
-		if (n < 0) {
-			if (errno == EINTR)
-				continue;
+		draw_prompt(b, q, buf);
+		if (draw_wait(b->d, &ev) == DRAW_EVENT_EOF)
 			return 0;
+		if (ev.type != DRAW_EVENT_KEY) {
+			draw_size(b->d, &b->rows, &b->cols);	/* resize/resume */
+			continue;			/* loop redraws the prompt */
 		}
-		if (n == 0 || seq.type != TKBD_KEY)
+		seq = ev.key;
+		if (seq.type != TKBD_KEY)
 			continue;
 		if (seq.key == TKBD_KEY_ENTER)
 			return len > 0;
@@ -1119,7 +1088,7 @@ sel_path(struct browser *b, const char *name, char *out, size_t outsz)
 
 /* Delete the selection after a confirm. Directories must be empty (rmdir). */
 static void
-do_delete(struct browser *b, struct tui_out *ob, struct tkbd_stream *s)
+do_delete(struct browser *b)
 {
 	struct entry *e;
 	char path[PATH_MAX], q[NAME_MAX + 32];
@@ -1136,7 +1105,7 @@ do_delete(struct browser *b, struct tui_out *ob, struct tkbd_stream *s)
 
 	snprintf(q, sizeof(q), "Delete %s%s? (y/n) ", e->name,
 	    e->is_dir ? "/" : "");
-	if (confirm_yn(b, ob, s, q) != 1) {
+	if (confirm_yn(b, q) != 1) {
 		snprintf(b->status, sizeof(b->status), "delete cancelled");
 		return;
 	}
@@ -1151,7 +1120,7 @@ do_delete(struct browser *b, struct tui_out *ob, struct tkbd_stream *s)
 
 /* Rename the selection within the current directory. */
 static void
-do_rename(struct browser *b, struct tui_out *ob, struct tkbd_stream *s)
+do_rename(struct browser *b)
 {
 	struct entry *e;
 	char oldp[PATH_MAX], newp[PATH_MAX], name[NAME_MAX + 1];
@@ -1164,7 +1133,7 @@ do_rename(struct browser *b, struct tui_out *ob, struct tkbd_stream *s)
 		return;
 	}
 	snprintf(name, sizeof(name), "%s", e->name);	/* pre-fill current */
-	if (!prompt_line(b, ob, s, "Rename to: ", name, sizeof(name))) {
+	if (!prompt_line(b, "Rename to: ", name, sizeof(name))) {
 		snprintf(b->status, sizeof(b->status), "rename cancelled");
 		return;
 	}
@@ -1187,12 +1156,12 @@ do_rename(struct browser *b, struct tui_out *ob, struct tkbd_stream *s)
 
 /* Create a directory in the current directory. */
 static void
-do_mkdir(struct browser *b, struct tui_out *ob, struct tkbd_stream *s)
+do_mkdir(struct browser *b)
 {
 	char name[NAME_MAX + 1], path[PATH_MAX];
 
 	name[0] = '\0';
-	if (!prompt_line(b, ob, s, "New directory: ", name, sizeof(name))) {
+	if (!prompt_line(b, "New directory: ", name, sizeof(name))) {
 		snprintf(b->status, sizeof(b->status), "mkdir cancelled");
 		return;
 	}
@@ -1216,9 +1185,7 @@ int
 cmd_files_main(int argc, char **argv)
 {
 	struct browser b;
-	struct tui_out ob = { 0 };
-	struct tkbd_stream stream;
-	struct sigaction sa;
+	struct draw_term *term;
 	const char *start = ".";
 	int rc = 0;
 
@@ -1256,55 +1223,48 @@ cmd_files_main(int argc, char **argv)
 		return 1;
 	}
 
-	if (get_term_size(&b.rows, &b.cols) < 0) {
-		b.rows = 24;
-		b.cols = 80;
-	}
-
-	memset(&sa, 0, sizeof(sa));
-	sa.sa_handler = on_sigwinch;
-	sigemptyset(&sa.sa_mask);
-	sa.sa_flags = 0;		/* let read()/tkbd_read see EINTR */
-	sigaction(SIGWINCH, &sa, NULL);
-
-	if (tkbd_attach(&stream, STDIN_FILENO) < 0) {
-		fprintf(stderr, "%s: cannot enter raw mode: %s\n",
-		    progname, strerror(errno));
+	/* The terminal driver owns raw mode, the alt screen (so the shell
+	 * scrollback survives), bracketed paste (so a stray paste is swallowed
+	 * rather than read as navigation keys), and the SIGWINCH and SIGTSTP
+	 * handling delivered as draw_wait events. Mouse stays off. */
+	term = draw_term_new(STDIN_FILENO, STDOUT_FILENO, NULL);
+	if (!term) {
+		fprintf(stderr, "%s: cannot open the terminal\n", progname);
 		entries_free(&b);
 		return 1;
 	}
-
-	/* switch to the alternate screen so the shell scrollback survives, and
-	 * enable bracketed paste (DECSET 2004) so a stray paste is swallowed
-	 * rather than read as a run of navigation keys */
-	tui_out_puts(&ob, "\033[?1049h\033[?2004h");
-	(void)tui_out_flush(&ob, STDOUT_FILENO);
-	render(&b, &ob);
+	b.d = draw_new(draw_term_driver(), term);
+	if (!b.d) {
+		fprintf(stderr, "%s: out of memory\n", progname);
+		entries_free(&b);
+		return 1;
+	}
+	draw_size(b.d, &b.rows, &b.cols);
+	draw_begin(b.d);
+	render(&b, b.d);
 
 	for (;;) {
+		struct draw_event ev;
 		struct tkbd_seq seq;
-		int n;
 
-		if (resized) {
-			resized = 0;
-			if (get_term_size(&b.rows, &b.cols) == 0)
-				render(&b, &ob);
-		}
-
-		memset(&seq, 0, sizeof(seq));
-		seq.ch = TKBD_CH_NONE;
-		n = tkbd_read(&stream, &seq);
-		if (n < 0) {
-			if (errno == EINTR)
-				continue;	/* SIGWINCH: loop re-checks */
+		switch (draw_wait(b.d, &ev)) {
+		case DRAW_EVENT_EOF:
 			rc = 1;
+			goto done;
+		case DRAW_EVENT_RESIZE:
+		case DRAW_EVENT_RESUME:
+			draw_size(b.d, &b.rows, &b.cols);
+			render(&b, b.d);
+			continue;
+		case DRAW_EVENT_KEY:
+			seq = ev.key;
 			break;
+		default:
+			continue;
 		}
-		if (n == 0)
-			continue;		/* idle tick */
 
 		if (seq.type == TKBD_KEY && seq.key == TKBD_KEY_PASTE_BEGIN) {
-			swallow_paste(&stream);
+			swallow_paste(&b);
 			continue;
 		}
 
@@ -1312,10 +1272,10 @@ cmd_files_main(int argc, char **argv)
 		case ACT_QUIT:
 			goto done;
 		case ACT_PAGE:
-			open_file(&b, &stream, &ob, "PAGER", "less");
+			open_file(&b, "PAGER", "less");
 			break;
 		case ACT_EDIT:
-			open_file(&b, &stream, &ob, "EDITOR", "vi");
+			open_file(&b, "EDITOR", "vi");
 			break;
 		case ACT_WIN_PAGE:
 			open_in_window(&b, 0);
@@ -1324,28 +1284,23 @@ cmd_files_main(int argc, char **argv)
 			open_in_window(&b, 1);
 			break;
 		case ACT_DELETE:
-			do_delete(&b, &ob, &stream);
+			do_delete(&b);
 			break;
 		case ACT_RENAME:
-			do_rename(&b, &ob, &stream);
+			do_rename(&b);
 			break;
 		case ACT_MKDIR:
-			do_mkdir(&b, &ob, &stream);
+			do_mkdir(&b);
 			break;
 		case ACT_CONTINUE:
 			break;
 		}
-		render(&b, &ob);
+		render(&b, b.d);
 	}
 done:
 
-	/* restore: show cursor, leave the alternate screen, stop paste mode */
-	tui_out_reset(&ob);
-	tui_out_puts(&ob, "\033[?2004l\033[?25h\033[?1049l");
-	(void)tui_out_flush(&ob, STDOUT_FILENO);
-
-	tkbd_detach(&stream);
-	tui_out_free(&ob);
+	draw_end(b.d);
+	draw_free(b.d);			/* also frees the terminal driver */
 	entries_free(&b);
 	return rc;
 }

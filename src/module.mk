@@ -12,7 +12,7 @@ lumi_SRCS = multicall.c \
 	cmd/new/new.c \
 	cmd/list/list.c \
 	cmd/files/files.c \
-	cmd/edit/edit.c \
+	cmd/edit/edit.c cmd/edit/vi.c cmd/edit/hex.c \
 	cmd/basic/basic_cmd.c \
 	cmd/version/version.c \
 	cmd/kill/kill.c \
@@ -28,7 +28,8 @@ lumi_SRCS = multicall.c \
 lumi_LIBS = lu_mserver lu_iox lu_ipc lu_net lu_attr lu_sessdir lu_session \
 	lu_tio lu_render lu_txl lu_termlib lu_vt lu_utf8 lu_pty lu_keys lu_cfg \
 	lu_taskbar lu_tui lu_tui_term lu_wm lu_tile lu_splash lu_predict \
-	lu_netproxy lu_proxy lu_text lu_basic lu_core
+	lu_netproxy lu_proxy lu_text lu_syntax lu_basic lu_draw lu_draw_term \
+	lu_core
 lumi_LDLIBS = -lm $(if $(findstring darwin,$(TARGET_TRIPLET)),,-lutil)
 lumi_CPPFLAGS = -I$(lumi_DIR)
 
@@ -100,8 +101,9 @@ uninstall:
 
 SUBDIRS = libcore libutf8 libiox libpty libvt libtio librender libtxl \
 	libtermlib libipc libnet libattr libsessdir libsession libkeys libcfg \
-	libtaskbar libsplash libtui libtui_term libwm libtile libtext libbasic \
+	libtaskbar libsplash libtui libtui_term libwm libtile libtext libsyntax \
+	libbasic libdraw libdraw_term libtui_draw \
 	cmd/attr cmd/mserver cmd/attach cmd/new cmd/list \
 	cmd/proxy cmd/net-proxy cmd/version cmd/kill cmd/detach cmd/send-keys \
-	cmd/share \
+	cmd/share cmd/edit \
 	cmd/send-input cmd/new-window cmd/reload cmd/splash

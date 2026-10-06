@@ -15,3 +15,13 @@ define test_vt_TESTCMD
 $(test_vt_EXEC)
 endef
 TEST_TARGETS += test_vt
+
+test_vt_torture_DIR := $(lu_vt_DIR)
+test_vt_torture_SRCS = test_vt_torture.c
+test_vt_torture_LIBS = lu_vt lu_utf8 lu_core
+EXECUTABLES += test_vt_torture
+
+define test_vt_torture_TESTCMD
+$(test_vt_torture_EXEC)
+endef
+TEST_TARGETS += test_vt_torture

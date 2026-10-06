@@ -2,7 +2,7 @@
 
 lu_splash_DIR := $(dir $(lastword $(MAKEFILE_LIST)))
 lu_splash_SRCS = splash.c splash_space.c splash_mountain.c splash_beach.c
-lu_splash_LIBS = lu_core lu_vt lu_utf8 lu_tio lu_render
+lu_splash_LIBS = lu_core lu_vt lu_utf8
 lu_splash_EXPORTED_CPPFLAGS = -I$(lu_splash_DIR)
 LIBRARIES += lu_splash
 

@@ -538,6 +538,58 @@ out:
 	server_stop();
 }
 
+/* an inject-only client keeps a view role but its input still reaches the
+ * PTY, so a send lands in a pane whose keyboard another client holds */
+static void
+test_inject_bypasses_keyboard(void)
+{
+	char *path;
+	int writer = -1, inj = -1;
+	uint8_t role = IPC_ROLE_WRITE;
+
+	TEST("an inject client can type without the keyboard");
+
+	path = server_start();
+	if (!path) {
+		FAIL("server did not start");
+		return;
+	}
+
+	writer = client_attach_as(path, 24, 80, 0, &role);
+	if (writer < 0 || role != IPC_ROLE_WRITE) {
+		FAIL("the first client was not granted write");
+		goto out;
+	}
+
+	inj = client_attach_as(path, 24, 80,
+	    IPC_ATTACH_F_SIZE_OBSERVE | IPC_ATTACH_F_INJECT, &role);
+	if (inj < 0) {
+		FAIL("inject attach failed");
+		goto out;
+	}
+	if (role != IPC_ROLE_VIEW) {
+		FAIL("inject client did not stay view-only");
+		goto out;
+	}
+
+	/* the inject client's input reaches the PTY even though the writer
+	 * holds the keyboard: the writer sees the echoed text */
+	if (client_input(inj, "echo LUMI-INJECTED\n") < 0) {
+		FAIL("inject send failed");
+		goto out;
+	}
+	if (client_expect(writer, "LUMI-INJECTED", 5000) != 1) {
+		FAIL("injected input did not reach the PTY");
+		goto out;
+	}
+	PASS();
+out:
+	ipc_close(writer);
+	ipc_close(inj);
+	free(path);
+	server_stop();
+}
+
 /* a second client that wants to type is told it cannot, rather than
  * silently sharing the keyboard */
 static void
@@ -1148,6 +1200,7 @@ main(void)
 	test_table_full();
 	test_slow_client_dropped();
 	test_view_only();
+	test_inject_bypasses_keyboard();
 	test_second_writer_is_viewer();
 	test_role_request();
 	test_client_events();

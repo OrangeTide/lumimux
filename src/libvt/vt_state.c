@@ -460,7 +460,10 @@ vt_state_putchar(struct vt_state *st, uint32_t cp, int width)
 			st->cursor_col = 0;
 			vt_state_index(st);
 		} else {
-			st->cursor_col = cols - width;
+			/* no autowrap: park at the last cell the glyph fits
+			 * in; clamp so a narrow terminal (cols < width) stays
+			 * >= 0 */
+			st->cursor_col = cols > width ? cols - width : 0;
 		}
 	}
 
@@ -508,7 +511,12 @@ vt_state_putchar(struct vt_state *st, uint32_t cp, int width)
 
 	st->cursor_col += width;
 
-	/* clamp -- cursor can sit at cols (pending wrap) only with autowrap */
+	/* clamp -- cursor can sit at cols (pending wrap) only with autowrap.
+	 * a glyph wider than the whole terminal wraps to column 0 and still
+	 * overflows, so cap at cols before the autowrap-off case pulls it
+	 * back onto a real cell. */
+	if (st->cursor_col > cols)
+		st->cursor_col = cols;
 	if (!(st->modes & VT_MODE_AUTOWRAP) && st->cursor_col >= cols)
 		st->cursor_col = cols - 1;
 

@@ -7,8 +7,6 @@
 
 #include "vt_buf.h"
 #include "vt_cell.h"
-#include "vt_state.h"
-#include "render.h"
 #include "utf8.h"
 #include "xmalloc.h"
 
@@ -460,59 +458,6 @@ splash_create(enum splash_scene scene, const char *name)
 	}
 
 	return buf;
-}
-
-int
-splash_show(struct vt_buf *canvas, int fd, int term_rows, int term_cols)
-{
-	int canvas_rows, canvas_cols;
-	int row_off, col_off, vis_rows, vis_cols;
-	struct vt_state *st;
-	struct render *rnd;
-	int r, c;
-
-	canvas_rows = vt_buf_rows(canvas);
-	canvas_cols = vt_buf_cols(canvas);
-
-	/* bottom-right anchored crop */
-	row_off = (canvas_rows > term_rows) ? canvas_rows - term_rows : 0;
-	col_off = (canvas_cols > term_cols) ? canvas_cols - term_cols : 0;
-	vis_rows = canvas_rows - row_off;
-	vis_cols = canvas_cols - col_off;
-	if (vis_rows > term_rows)
-		vis_rows = term_rows;
-	if (vis_cols > term_cols)
-		vis_cols = term_cols;
-
-	/* create a terminal-sized vt_state and blit the visible portion */
-	st = vt_state_new(term_rows, term_cols, 0);
-	if (!st)
-		return -1;
-
-	for (r = 0; r < vis_rows; r++) {
-		for (c = 0; c < vis_cols; c++) {
-			struct vt_cell *src, *dst;
-
-			src = vt_buf_cell(canvas, r + row_off, c + col_off);
-			dst = vt_buf_cell(st->buf, r, c);
-			if (src && dst)
-				*dst = *src;
-		}
-	}
-	vt_buf_dirty_all(st->buf);
-	st->modes &= ~VT_MODE_CURSOR_VIS;
-
-	rnd = render_new(term_rows, term_cols, NULL);
-	if (!rnd) {
-		vt_state_free(st);
-		return -1;
-	}
-
-	render_full(rnd, fd, st);
-
-	render_free(rnd);
-	vt_state_free(st);
-	return 0;
 }
 
 void

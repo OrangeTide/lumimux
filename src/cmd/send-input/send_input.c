@@ -166,15 +166,16 @@ lu_send_input(const char *session, pid_t target, const char *data, size_t len)
 		return LU_SEND_ERROR;
 	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-	if (ipc_client_attach(fd, IPC_ATTACH_F_SIZE_OBSERVE, "send-input",
-	    &role) < 0) {
+	/* Attach as an inject-only client: it keeps a view role (so it never
+	 * takes the keyboard from an attached writer) but the server accepts
+	 * its input run, which is what lets a send reach a pane in
+	 * single-writer mode. */
+	if (ipc_client_attach(fd, IPC_ATTACH_F_SIZE_OBSERVE | IPC_ATTACH_F_INJECT,
+	    "send-input", &role) < 0) {
 		ipc_close(fd);
 		return LU_SEND_ERROR;
 	}
-	if (role != IPC_ROLE_WRITE) {
-		ipc_close(fd);
-		return LU_SEND_READONLY;
-	}
+	(void)role;			/* inject does not depend on the role */
 	if (send_run(fd, data, len) < 0) {
 		ipc_close(fd);
 		return LU_SEND_ERROR;

@@ -37,6 +37,7 @@ struct erec {
 	size_t		col;
 	char		*bytes;		/* owned; the payload for OP_INSERT */
 	size_t		n;		/* byte count for INSERT and DELETE */
+	unsigned	group;		/* group id; 0 = a standalone step */
 };
 
 struct estack {
@@ -51,10 +52,19 @@ struct text {
 	size_t		cap;
 	int		final_newline;	/* source ended with a newline */
 	int		dirty;
+	size_t		rev;		/* bumped on every primitive mutation */
 
 	struct estack	undo;
 	struct estack	redo;
 	int		can_coalesce;	/* a typing run may extend the top */
+
+	/* Undo grouping: while a group is open every recorded primitive is
+	 * tagged with cur_group, and undo/redo replay the whole run as one
+	 * step. group_depth counts nested begin/end pairs; group_seq hands
+	 * out fresh ids. */
+	unsigned	cur_group;
+	unsigned	group_depth;
+	unsigned	group_seq;
 };
 
 /****************************************************************
@@ -237,6 +247,8 @@ text_load(struct text *t, const char *path)
 	estack_clear(&t->undo);		/* history does not span a reload */
 	estack_clear(&t->redo);
 	t->can_coalesce = 0;
+	t->group_depth = 0;
+	t->cur_group = 0;
 	t->final_newline = (len > 0 && data[len - 1] == '\n');
 
 	start = 0;
@@ -337,6 +349,18 @@ text_dirty(const struct text *t)
 	return t->dirty;
 }
 
+int
+text_final_newline(const struct text *t)
+{
+	return t->final_newline;
+}
+
+size_t
+text_revision(const struct text *t)
+{
+	return t->rev;
+}
+
 /****************************************************************
  * Undo primitives
  ****************************************************************/
@@ -384,6 +408,7 @@ apply_op(struct text *t, const struct erec *in, struct erec *inv)
 	inv->bytes = NULL;
 	inv->n = 0;
 	inv->col = 0;
+	inv->group = 0;
 
 	switch (in->op) {
 	case OP_INSERT: {
@@ -479,6 +504,7 @@ apply_op(struct text *t, const struct erec *in, struct erec *inv)
 		return ERR;
 	}
 	t->dirty = 1;
+	t->rev++;
 	return OK;
 }
 
@@ -488,12 +514,13 @@ static void
 record_undo(struct text *t, struct erec *inv)
 {
 	estack_clear(&t->redo);
+	inv->group = t->cur_group;
 
 	if (t->can_coalesce && inv->op == OP_DELETE && t->undo.n > 0) {
 		struct erec *top = &t->undo.v[t->undo.n - 1];
 
-		if (top->op == OP_DELETE && top->line == inv->line &&
-		    top->col + top->n == inv->col) {
+		if (top->op == OP_DELETE && top->group == inv->group &&
+		    top->line == inv->line && top->col + top->n == inv->col) {
 			top->n += inv->n;	/* inv carries no bytes */
 			return;
 		}
@@ -642,26 +669,67 @@ text_undo_boundary(struct text *t)
 	t->can_coalesce = 0;
 }
 
-/* Shared engine for undo and redo: pop one record from `from`, apply it,
- * and push the resulting inverse onto `to`. */
+void
+text_undo_group_begin(struct text *t)
+{
+	if (t->group_depth == 0)
+		t->cur_group = ++t->group_seq;
+	t->group_depth++;
+	t->can_coalesce = 0;	/* do not merge into a pre-group record */
+}
+
+void
+text_undo_group_end(struct text *t)
+{
+	if (t->group_depth > 0)
+		t->group_depth--;
+	if (t->group_depth == 0)
+		t->cur_group = 0;
+	t->can_coalesce = 0;	/* the next edit starts a fresh record */
+}
+
+/* Apply one recorded primitive during undo/redo: mutate the buffer, push the
+ * inverse onto `to` (preserving its group so the reverse direction regroups),
+ * and update the cursor location. */
 static int
-undo_step(struct text *t, struct estack *from, struct estack *to,
+undo_apply_one(struct text *t, struct estack *from, struct estack *to,
     size_t *line, size_t *col)
 {
 	struct erec rec, inv;
 
-	t->can_coalesce = 0;
-	if (from->n == 0)
-		return ERR;
 	rec = from->v[--from->n];
 	if (apply_op(t, &rec, &inv) != OK) {
 		free(rec.bytes);
 		return ERR;
 	}
+	inv.group = rec.group;
 	if (estack_push(to, &inv) != OK)
 		free(inv.bytes);
 	cursor_after(&rec, &inv, line, col);
 	free(rec.bytes);
+	return OK;
+}
+
+/* Shared engine for undo and redo: reverse one step. A grouped step spans
+ * every record at the top of `from` sharing the same non-zero group id, so a
+ * multi-primitive edit undoes and redoes as a unit. */
+static int
+undo_step(struct text *t, struct estack *from, struct estack *to,
+    size_t *line, size_t *col)
+{
+	unsigned group;
+
+	t->can_coalesce = 0;
+	if (from->n == 0)
+		return ERR;
+
+	group = from->v[from->n - 1].group;
+	if (undo_apply_one(t, from, to, line, col) != OK)
+		return ERR;
+	while (group != 0 && from->n > 0 &&
+	    from->v[from->n - 1].group == group)
+		if (undo_apply_one(t, from, to, line, col) != OK)
+			break;
 	return OK;
 }
 

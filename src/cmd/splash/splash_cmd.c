@@ -1,14 +1,16 @@
 /* splash_cmd.c : display ANSI art splash screen */
-/* Copyright (c) 2026 Jon Mayo
- * Licensed under MIT-0 OR PUBLIC DOMAIN */
 
 #include "splash.h"
 #include "multicall.h"
 
+#include "draw.h"
+#include "draw_term.h"
+#include "vt_buf.h"
+#include "vt_cell.h"
+#include "tkbd.h"
+
 #include <stdio.h>
 #include <string.h>
-#include <sys/ioctl.h>
-#include <termios.h>
 #include <unistd.h>
 
 static const char *progname = "lumi-splash";
@@ -24,16 +26,35 @@ usage(void)
 	    progname);
 }
 
-static int
-get_term_size(int *rows, int *cols)
+/* Copy the splash canvas into the surface, cropped bottom-right so the logo
+ * stays visible and overflow scenery is trimmed from the top-left. */
+static void
+blit_splash(struct draw *d, struct vt_buf *canvas, int rows, int cols)
 {
-	struct winsize ws;
+	int canvas_rows = vt_buf_rows(canvas);
+	int canvas_cols = vt_buf_cols(canvas);
+	int row_off = canvas_rows > rows ? canvas_rows - rows : 0;
+	int col_off = canvas_cols > cols ? canvas_cols - cols : 0;
+	int vis_rows = canvas_rows - row_off;
+	int vis_cols = canvas_cols - col_off;
+	int r, c;
 
-	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) < 0)
-		return -1;
-	*rows = ws.ws_row;
-	*cols = ws.ws_col;
-	return 0;
+	if (vis_rows > rows)
+		vis_rows = rows;
+	if (vis_cols > cols)
+		vis_cols = cols;
+
+	draw_clear(d);
+	for (r = 0; r < vis_rows; r++) {
+		for (c = 0; c < vis_cols; c++) {
+			const struct vt_cell *src =
+			    vt_buf_cell(canvas, r + row_off, c + col_off);
+
+			if (src)
+				draw_cell(d, r, c, src->codepoint, src->fg,
+				    src->bg, src->attrs);
+		}
+	}
 }
 
 int
@@ -42,9 +63,9 @@ cmd_splash_main(int argc, char **argv)
 	enum splash_scene scene;
 	const char *name;
 	struct vt_buf *buf;
+	struct draw_term *term;
+	struct draw *d;
 	int rows, cols;
-	struct termios old, raw;
-	char c;
 
 	if (argv[0])
 		progname = argv[0];
@@ -74,9 +95,9 @@ cmd_splash_main(int argc, char **argv)
 	if (argc > 2)
 		name = argv[2];
 
-	if (get_term_size(&rows, &cols) < 0) {
-		rows = 24;
-		cols = 80;
+	if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
+		fprintf(stderr, "%s: not a terminal\n", progname);
+		return 1;
 	}
 
 	buf = splash_create(scene, name);
@@ -85,24 +106,45 @@ cmd_splash_main(int argc, char **argv)
 		return 1;
 	}
 
-	/* raw mode so we can wait for a single keypress */
-	tcgetattr(STDIN_FILENO, &old);
-	raw = old;
-	raw.c_lflag &= (unsigned)~(ICANON | ECHO);
-	raw.c_cc[VMIN] = 1;
-	raw.c_cc[VTIME] = 0;
-	tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+	term = draw_term_new(STDIN_FILENO, STDOUT_FILENO, NULL);
+	if (!term) {
+		fprintf(stderr, "%s: cannot open the terminal\n", progname);
+		splash_free(buf);
+		return 1;
+	}
+	d = draw_new(draw_term_driver(), term);
+	if (!d) {
+		fprintf(stderr, "%s: out of memory\n", progname);
+		splash_free(buf);
+		return 1;
+	}
 
-	splash_show(buf, STDOUT_FILENO, rows, cols);
+	draw_begin(d);
+	for (;;) {
+		struct draw_event ev;
 
-	/* wait for keypress */
-	(void)read(STDIN_FILENO, &c, 1);
+		draw_size(d, &rows, &cols);
+		draw_cursor_vis(d, 0);
+		blit_splash(d, buf, rows, cols);
+		draw_present(d);
 
-	/* restore terminal */
-	tcsetattr(STDIN_FILENO, TCSANOW, &old);
-	printf("\033[2J\033[H\033[?25h");
-	fflush(stdout);
-
+		switch (draw_wait(d, &ev)) {
+		case DRAW_EVENT_KEY:
+			if (ev.key.type == TKBD_KEY)
+				goto done;	/* any key dismisses */
+			break;
+		case DRAW_EVENT_EOF:
+			goto done;
+		case DRAW_EVENT_RESIZE:
+		case DRAW_EVENT_RESUME:
+			break;			/* loop re-blits at the new size */
+		default:
+			break;
+		}
+	}
+done:
+	draw_end(d);
+	draw_free(d);			/* also frees the terminal driver */
 	splash_free(buf);
 	return 0;
 }

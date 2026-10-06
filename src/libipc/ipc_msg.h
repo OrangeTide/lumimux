@@ -72,6 +72,18 @@
 #define IPC_ATTACH_F_SIZE_OBSERVE 0x02	/* do not constrain the window size */
 #define IPC_ATTACH_F_MIRROR	0x04	/* follow the session layout and focus */
 #define IPC_ATTACH_F_TOKEN	0x08	/* holds the session write token */
+#define IPC_ATTACH_F_INJECT	0x10	/* may send an input run without the keyboard */
+
+/*
+ * IPC_ATTACH_F_INJECT lets a transient client (lumi send-input and the
+ * in-session send bindings) deliver one input run without holding the
+ * keyboard. The client keeps a view role, so it never displaces the writer
+ * or reshapes the window, but its input messages reach the PTY. This is what
+ * makes "send to the pane beside it" work in single-writer mode. It is
+ * trusted for the same reason as IPC_ATTACH_F_TOKEN: it comes from the
+ * session owner's own uid, which can already do anything to these windows,
+ * and a client of another uid never reaches a server.
+ */
 
 /*
  * IPC_ATTACH_F_TOKEN settles which client has the keyboard when clients

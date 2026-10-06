@@ -442,6 +442,12 @@ role_for(struct mclient *mc, uint8_t asked)
 	if (asked & IPC_ATTACH_F_VIEW)
 		return IPC_ROLE_VIEW;
 
+	/* An inject-only client (lumi send-input) never takes the keyboard: it
+	 * observes like a viewer and relies on IPC_ATTACH_F_INJECT to have its
+	 * one input run accepted, so it does not displace the writer. */
+	if (asked & IPC_ATTACH_F_INJECT)
+		return IPC_ROLE_VIEW;
+
 	/* the session write token outranks whoever got here first: it is
 	 * the only thing that makes the answer the same on every window
 	 * when two clients are attaching at once */
@@ -529,6 +535,14 @@ msg_mutates(uint32_t type)
 		return 1;
 	}
 	return 0;
+}
+
+/* the input-run messages, the only mutations an inject-only client may send */
+static int
+msg_is_input(uint32_t type)
+{
+	return type == IPC_MSG_INPUT || type == IPC_MSG_INPUT_BEGIN ||
+	    type == IPC_MSG_INPUT_END;
 }
 
 /* Tell a client its message was refused, at most once a second.
@@ -961,8 +975,11 @@ on_client_read(struct iox_loop *lp, int fd, unsigned events, void *arg)
 
 	/* One check covers every message that could change the window, so a
 	 * message type added later is refused by default rather than
-	 * quietly allowed. */
-	if (mc->role != IPC_ROLE_WRITE && msg_mutates(type)) {
+	 * quietly allowed. An inject-only client is the exception: it may
+	 * deliver an input run (but not kill, resize, or attribute changes)
+	 * without holding the keyboard. */
+	if (mc->role != IPC_ROLE_WRITE && msg_mutates(type) &&
+	    !((mc->flags & IPC_ATTACH_F_INJECT) && msg_is_input(type))) {
 		mclient_deny(mc, "read-only");
 		return;
 	}
