@@ -1047,6 +1047,142 @@ test_layout_generation(void)
 	printf("ok\n");
 }
 
+/* write a raw layout file for a session, as a client of some version would */
+static void
+layout_write_raw(const char *session, const char *contents)
+{
+	char *dir = sessdir_session_path(session);
+	char path[4096];
+	FILE *f;
+
+	snprintf(path, sizeof(path), "%s/layout", dir);
+	free(dir);
+	f = fopen(path, "w");
+	if (f) {
+		fputs(contents, f);
+		fclose(f);
+	}
+}
+
+static void
+test_layout_screen_by_number(void)
+{
+	struct sessdir_screen_layout layout, got;
+	struct sessdir_tree_node *l0, *l1, *l3, *h;
+
+	printf("  screen layout keeps panes by window number ... ");
+	sessdir_session_create("layoutnum");
+
+	/* windows 0, 1 and 3 are open; number 2 was closed earlier and is a
+	 * spare, the kind of gap a window-order index could not survive */
+	l0 = calloc(1, sizeof(*l0));
+	l1 = calloc(1, sizeof(*l1));
+	l3 = calloc(1, sizeof(*l3));
+	h = calloc(1, sizeof(*h));
+	l0->win_num = 0;
+	l1->win_num = 1;
+	l3->win_num = 3;
+	h->type = SESSDIR_TREE_SPLIT_H;
+	h->split_pos = 100;
+	h->a = l0;
+	h->b = l1;
+	memset(&layout, 0, sizeof(layout));
+	layout.root = calloc(1, sizeof(*layout.root));
+	layout.root->type = SESSDIR_TREE_SPLIT_V;
+	layout.root->split_pos = 128;
+	layout.root->a = h;
+	layout.root->b = l3;
+	layout.focus = 3;
+
+	CHECK(sessdir_layout_save_screen("layoutnum", &layout) == 0,
+	    "save failed");
+	sessdir_tree_free(layout.root);
+
+	CHECK(sessdir_layout_mode("layoutnum") == SESSDIR_LAYOUT_SCREEN,
+	    "mode probe did not see a screen layout");
+	CHECK(sessdir_layout_load_screen("layoutnum", &got) == 0,
+	    "load failed");
+	CHECK(got.focus == 3, "focus is not window number 3");
+	CHECK(got.root && got.root->type == SESSDIR_TREE_SPLIT_V &&
+	    got.root->split_pos == 128, "root split lost");
+	CHECK(got.root->a && got.root->a->type == SESSDIR_TREE_SPLIT_H &&
+	    got.root->a->a && got.root->a->a->win_num == 0 &&
+	    got.root->a->b && got.root->a->b->win_num == 1,
+	    "inner split's window numbers lost");
+	CHECK(got.root->b && got.root->b->type == SESSDIR_TREE_LEAF &&
+	    got.root->b->win_num == 3,
+	    "the pane past the spare number did not keep number 3");
+	sessdir_tree_free(got.root);
+	printf("ok\n");
+}
+
+static void
+test_layout_turbo_by_number(void)
+{
+	struct sessdir_turbo_layout layout, got;
+
+	printf("  turbo layout keeps windows by number across a gap ... ");
+	sessdir_session_create("layoutturbo");
+
+	memset(&layout, 0, sizeof(layout));
+	layout.wins[0].x = 1;
+	layout.wins[0].y = 1;
+	layout.wins[0].w = 40;
+	layout.wins[0].h = 10;
+	layout.wins[0].valid = 1;
+	layout.wins[3].x = 5;
+	layout.wins[3].y = 6;
+	layout.wins[3].w = 30;
+	layout.wins[3].h = 8;
+	layout.wins[3].valid = 1;
+	layout.nwins = 4;
+	layout.focus = 3;
+
+	CHECK(sessdir_layout_save_turbo("layoutturbo", &layout) == 0,
+	    "save failed");
+	CHECK(sessdir_layout_load_turbo("layoutturbo", &got) == 0,
+	    "load failed");
+	CHECK(got.nwins == 4 && got.focus == 3, "slot count or focus wrong");
+	CHECK(got.wins[0].valid && got.wins[0].w == 40,
+	    "window 0 geometry lost");
+	CHECK(!got.wins[1].valid && !got.wins[2].valid,
+	    "spare numbers came back as windows");
+	CHECK(got.wins[3].valid && got.wins[3].x == 5 && got.wins[3].h == 8,
+	    "window 3 geometry lost or moved to another slot");
+	printf("ok\n");
+}
+
+static void
+test_layout_old_version_ignored(void)
+{
+	struct sessdir_screen_layout sl;
+	struct sessdir_turbo_layout tl;
+
+	printf("  a layout file without the current version is ignored ... ");
+	sessdir_session_create("layoutold");
+
+	/* version 1 keyed panes by window-order index and had no VERSION */
+	layout_write_raw("layoutold",
+	    "MODE=screen\nGEN=7\nFOCUS=0\nTREE=\"v128 0 1\"\n");
+	CHECK(sessdir_layout_mode("layoutold") == SESSDIR_LAYOUT_NONE,
+	    "mode probe accepted an unversioned file");
+	CHECK(sessdir_layout_load_screen("layoutold", &sl) < 0,
+	    "screen load accepted an unversioned file");
+	CHECK(sessdir_layout_generation("layoutold") == 7,
+	    "the generation must still be readable for the next save");
+
+	layout_write_raw("layoutold",
+	    "MODE=turbo\nVERSION=1\nGEN=8\nWIN_0=\"1 1 10 10\"\n");
+	CHECK(sessdir_layout_load_turbo("layoutold", &tl) < 0,
+	    "turbo load accepted a stale version");
+
+	layout_write_raw("layoutold",
+	    "MODE=turbo\nVERSION=2\nGEN=9\nWIN_0=\"1 1 10 10\"\n");
+	CHECK(sessdir_layout_load_turbo("layoutold", &tl) == 0 &&
+	    tl.wins[0].valid, "the current version was not loaded");
+	printf("ok\n");
+}
+
 /* ---- main ---- */
 
 int
@@ -1091,6 +1227,9 @@ main(void)
 	test_share_mode();
 	test_share_display();
 	test_layout_generation();
+	test_layout_screen_by_number();
+	test_layout_turbo_by_number();
+	test_layout_old_version_ignored();
 
 	teardown();
 

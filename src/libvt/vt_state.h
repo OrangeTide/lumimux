@@ -78,6 +78,8 @@ struct vt_state {
 
 	/* reply fd for DSR/DA responses (-1 = disabled) */
 	int		reply_fd;
+	void		(*bell_cb)(void *ctx);	/* BEL from the program, or NULL */
+	void		*bell_ctx;
 
 	/* child mouse tracking mode (0 = off, 1000/1002/1003) */
 	int		mouse_mode;
@@ -87,6 +89,13 @@ struct vt_state {
 	int		kitty_kbd_stack[VT_KITTY_KBD_STACK_MAX];
 	int		kitty_kbd_depth;	/* entries on the kitty stack */
 	int		modify_other_keys;	/* CSI > 4 ; Pm m (0 = off) */
+
+	/* the hosting terminal's default foreground and background as X11
+	 * color specs ("rgb:rrrr/gggg/bbbb"), reported by an attached client
+	 * so OSC 10/11 queries can be answered in order with everything
+	 * else; NULL while unknown, and then a query goes unanswered */
+	char		*term_fg;
+	char		*term_bg;
 
 	/* window title set by OSC 0/2 */
 	char		*title;
@@ -131,8 +140,28 @@ void vt_state_reverse_index(struct vt_state *st);
 void vt_kgfx_account(struct vt_state *st, const char *data, size_t len,
     int cell_pw, int cell_ph);
 
+/* Pixel size of the image a kitty graphics command carries: its s=/v= keys,
+ * or, when a PNG (f=100) is sent without them, the width and height in the
+ * PNG header, read from the first bytes of a direct payload (t=d) or of the
+ * file a path transfer names (t=f, t=t).  Returns 0 with *pw and *ph set,
+ * or -1 when the size cannot be known (a raw format without keys, a
+ * compressed stream, a file that cannot be read), leaving them alone.
+ * data/len is the APC payload beginning with 'G'. */
+int vt_kgfx_image_size(const char *data, size_t len, int *pw, int *ph);
+
 /* set the fd for DSR/DA reply writes (-1 to disable) */
 void vt_state_set_reply_fd(struct vt_state *st, int fd);
+
+/* called when the program rings the bell (BEL); the state itself does
+ * nothing with it, the owner decides whether and where it sounds */
+void vt_state_set_bell_cb(struct vt_state *st, void (*cb)(void *ctx),
+    void *ctx);
+
+/* record the hosting terminal's default colors as X11 color specs, the
+ * answers to OSC 10 (fg) and OSC 11 (bg) queries. NULL or "" leaves that
+ * color unknown, in which case its query is not answered. */
+void vt_state_set_term_colors(struct vt_state *st, const char *fg,
+    const char *bg);
 
 /* enable/disable capturing alt-screen content into primary scrollback when
  * an application leaves the alternate screen (default disabled). */

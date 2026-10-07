@@ -3,9 +3,8 @@
 ## Introduction
 
 lumimux is a rewrite of GNU Screen with a git-style sub-command architecture.
-`lumi <cmd>` searches for `lumi-<cmd>` relative to its own binary
-(`../lib/lumi-core/`), then `LUMI_LIBEXEC_PATH`, then
-`/usr/lib/lumi-core:~/.local/lib/lumi-core`.
+`lumi <cmd>` dispatches to a built-in table of sub-commands. An unknown command
+errors out (there is no external search path).
 
 Default keybindings are identical to GNU Screen (Ctrl-A prefix).
 Terminal control code handling is data-driven rather than hard-coded.
@@ -28,8 +27,9 @@ feature: the build auto-detects the libgpm development headers (the
 Force it on or off with `make GPM=1` or `make GPM=0`. Inside a terminal
 emulator the mouse works without gpm.
 
-Output goes to `_out/<triplet>/bin/` (binaries) and `_build/<triplet>/`
-(objects), where `<triplet>` comes from `$(CC) -dumpmachine`.
+Output goes to `_out/<triplet>/bin/` (plain build), `_out/<triplet>/release/bin/`
+(RELEASE=1), or `_out/<triplet>/san-<list>/bin/` (SANITIZE builds).
+Objects go to `_build/<triplet>/`, where `<triplet>` comes from `$(CC) -dumpmachine`.
 
 The build system is a modular GNU Make setup based on [OrangeTide/makefile][1].
 
@@ -39,8 +39,6 @@ The build system is a modular GNU Make setup based on [OrangeTide/makefile][1].
 # build
 make
 
-# set up the search path for development (points to build output)
-export LUMI_LIBEXEC_PATH=_out/x86_64-linux-gnu/bin
 alias lumi=_out/x86_64-linux-gnu/bin/lumi
 
 # create a session named "work" and attach
@@ -96,7 +94,8 @@ lumi kill -s work
   to select and copy text.
 - **Configurable key bindings:** remap keys, define state-dependent binding
   layers that activate by window title regex or toggle state.
-- **DCS pass-through:** SIXEL graphics forwarded to the outer terminal.
+- **Graphics pass-through:** SIXEL and kitty graphics forwarded to the outer
+  terminal (with kitty anchoring, animation, and turbo-mode cropping).
 - **Speculative local echo:** predicted characters rendered immediately,
   confirmed or rolled back on server response.
 - **Kitty keyboard protocol:** prefix key recognized in both traditional
@@ -107,7 +106,7 @@ lumi kill -s work
 - **Themes:** 9 built-in themes; user-defined themes via config file.
 - **Config-driven:** gitconfig-style `lumi.conf` for key bindings, taskbar
   format, menu colors, and UI theme.
-- **Single static binary:** 330 KB stripped musl build with no runtime
+- **Single static binary:** musl build (850 KB stripped) with no runtime
   dependencies.
 
 ## Commands
@@ -115,12 +114,25 @@ lumi kill -s work
 | Command | Description |
 |---------|-------------|
 | `lumi new [-Ad] [-f window] [-m mode] [-s name] [shell]` | Create a session and attach (`-d` detached, `-A` reattach) |
-| `lumi attach [-f window] [-m mode] [-s name] [-v] [-x] [name]` | Attach to a local or remote session (`-x` share, `-v` read-only) |
+| `lumi attach [-f window] [-m mode] [-n] [-s name] [-v] [-x] [-F] [-V] [name]` | Attach to a local or remote session (`-n` netchan, `-x` share, `-v` read-only, `-V` verify host key) |
 | `lumi detach [-s name] [-c id]` | Detach every client from a session, or one with `-c` |
 | `lumi list` | List active sessions |
 | `lumi kill [-s name]` | Terminate a session |
 | `lumi new-window [-s name] [shell]` | Create a window in a running session |
 | `lumi attr [-s name] get\|set\|delete\|list [key] [value]` | Manage per-session attributes |
+| `lumi share` | Show connected clients and pass the keyboard |
+| `lumi send-keys [-s name] [keys]` | Send keystrokes to a session |
+| `lumi send-input` | Send raw input to a pane |
+| `lumi files` | Browse the filesystem (TUI) |
+| `lumi edit [file]` | Edit a text file (TUI) |
+| `lumi basic` | BASIC-style calculator REPL |
+| `lumi reload` | Reload server configuration |
+| `lumi splash` | Display splash screen |
+| `lumi net-proxy` | Encrypted netchan net-proxy for networked attach |
+| `lumi net-keygen` | Generate keys for net-proxy |
+| `lumi net-passwd` | Manage passwords for net-proxy |
+| `lumi proxy` | Local connection proxy |
+| `lumi mserver` | Per-window micro-server (internal; owns one PTY) |
 | `lumi version` | Print version information |
 
 The default session name is `0` when not specified.
@@ -128,16 +140,16 @@ Remote sessions use scp-style syntax: `[user@]host:session`.
 
 ## Installation
 
-Extract the release tarball under `/opt` or `/usr/local` and add the
-`bin/` directory to your PATH:
+Extract the release tarball (lumi-${VER}-linux-x86_64.tar.gz) under `/opt`
+or `/usr/local` and add the `bin/` directory to your PATH:
 
 ```sh
-tar xzf lumi-*-linux-x86-64.tar.gz -C /opt
+tar xzf lumi-*-linux-x86_64.tar.gz -C /opt
 export PATH=/opt/lumi-*/bin:$PATH
 ```
 
-The dispatcher finds sub-commands relative to its own binary, so no
-additional environment variables are needed.
+The single binary contains all sub-commands, so no additional environment
+variables are needed.
 
 ## Terminal Configuration
 
@@ -215,11 +227,6 @@ Internal libraries are static (.a), linked only by the sub-commands that
 need them. See [doc/DEV.md][2] for the full developer guide, IPC protocol
 format, and library dependency graph.
 
-## Known Issues
-
-- QUIC networked connections are not yet implemented (Unix sockets and SSH
-  tunneling only).
-
 ## Credits and Inspiration
 
 lumimux draws ideas and inspiration from several projects:
@@ -231,7 +238,7 @@ lumimux draws ideas and inspiration from several projects:
 - [dtach][5] -- minimal detach/attach tool. Its single-purpose design
   influenced the micro-server approach (one process per PTY).
 - [mosh][6] -- mobile shell with speculative local echo and roaming.
-  Inspired lumimux's predictive echo and planned QUIC transport.
+  Inspired lumimux's predictive echo and roaming netchan-v2 transport.
 - [DESQview][7] -- Quarterdeck's DOS multitasker. Its guided keystroke
   menus inspired the prefix-key popup that shows available actions.
 - [Turbo Vision][8] -- Borland's text-mode UI framework. Its overlapping

@@ -1328,6 +1328,180 @@ test_keyboard_query(void)
 	PASS();
 }
 
+/* a 400x120 PNG's first 29 bytes, as a program would send them in the
+ * first chunk of a direct (t=d) transfer */
+#define PNG_HEAD_B64 "iVBORw0KGgoAAAANSUhEUgAAAZAAAAB4CAYAAAA="
+static const unsigned char png_head[] = {
+	0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n',
+	0, 0, 0, 13, 'I', 'H', 'D', 'R',
+	0, 0, 1, 0x90, 0, 0, 0, 0x78, 8, 6, 0, 0, 0,
+};
+
+static int bell_rings;
+
+static void
+count_bell(void *ctx)
+{
+	*(int *)ctx += 1;
+}
+
+static void
+test_bell_cb(void)
+{
+	struct vt_state *st;
+	struct vt_parse *p;
+
+	TEST("BEL reaches the bell callback");
+	st = vt_state_new(24, 80, 100);
+	ASSERT(st != NULL, "state new failed");
+	p = vt_parse_new(vt_ops_default(), st);
+	ASSERT(p != NULL, "parse new failed");
+
+	/* no callback: BEL is swallowed without harm */
+	vt_parse_feed(p, "a\ab", 3);
+	ASSERT(st->cursor_col == 2, "BEL moved the cursor");
+
+	bell_rings = 0;
+	vt_state_set_bell_cb(st, count_bell, &bell_rings);
+	vt_parse_feed(p, "\a\a", 2);
+	ASSERT(bell_rings == 2, "bell count wrong");
+	ASSERT(st->cursor_col == 2, "BEL moved the cursor with a callback");
+
+	vt_parse_free(p);
+	vt_state_free(st);
+	PASS();
+}
+
+static void
+test_kgfx_image_size(void)
+{
+	struct vt_state *st;
+	char tmpl[] = "/tmp/vtpngXXXXXX";
+	char cmd[256];
+	int w = 0, h = 0, fd;
+
+	TEST("kitty graphics image size from keys or PNG header");
+
+	/* explicit keys win, whatever the payload */
+	ASSERT(vt_kgfx_image_size("Ga=T,f=100,s=10,v=20;" PNG_HEAD_B64,
+	    21 + sizeof(PNG_HEAD_B64) - 1, &w, &h) == 0, "keys not read");
+	ASSERT(w == 10 && h == 20, "keys wrong");
+
+	/* a PNG without keys: the header has the size */
+	w = h = 0;
+	ASSERT(vt_kgfx_image_size("Ga=T,f=100;" PNG_HEAD_B64,
+	    11 + sizeof(PNG_HEAD_B64) - 1, &w, &h) == 0, "header not read");
+	ASSERT(w == 400 && h == 120, "header size wrong");
+
+	/* a raw format without keys cannot be sized; nor can a compressed
+	 * PNG, or a payload that is not a PNG */
+	w = h = 0;
+	ASSERT(vt_kgfx_image_size("Ga=T,f=32;" PNG_HEAD_B64,
+	    10 + sizeof(PNG_HEAD_B64) - 1, &w, &h) == -1, "sized raw data");
+	ASSERT(vt_kgfx_image_size("Ga=T,f=100,o=z;" PNG_HEAD_B64,
+	    15 + sizeof(PNG_HEAD_B64) - 1, &w, &h) == -1,
+	    "sized compressed data");
+	ASSERT(vt_kgfx_image_size("Ga=T,f=100;AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+	    43, &w, &h) == -1, "sized a non-PNG");
+	ASSERT(vt_kgfx_image_size("Ga=T,f=100;iVBORw0K", 19, &w, &h) == -1,
+	    "sized a truncated header");
+	ASSERT(w == 0 && h == 0, "failure touched the outputs");
+
+	/* a file transfer: the header is read from the named file */
+	fd = mkstemp(tmpl);
+	ASSERT(fd >= 0, "mkstemp failed");
+	ASSERT(write(fd, png_head, sizeof(png_head)) == sizeof(png_head),
+	    "write failed");
+	close(fd);
+	{
+		/* base64 of the path, by hand */
+		const char *tab = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+		    "abcdefghijklmnopqrstuvwxyz0123456789+/";
+		size_t i, len = strlen(tmpl), o;
+
+		o = (size_t)snprintf(cmd, sizeof(cmd), "Ga=T,f=100,t=f;");
+		for (i = 0; i < len; i += 3) {
+			unsigned long v = (unsigned long)(unsigned char)tmpl[i] << 16;
+
+			if (i + 1 < len)
+				v |= (unsigned long)(unsigned char)tmpl[i + 1] << 8;
+			if (i + 2 < len)
+				v |= (unsigned char)tmpl[i + 2];
+			cmd[o++] = tab[(v >> 18) & 63];
+			cmd[o++] = tab[(v >> 12) & 63];
+			cmd[o++] = i + 1 < len ? tab[(v >> 6) & 63] : '=';
+			cmd[o++] = i + 2 < len ? tab[v & 63] : '=';
+		}
+		cmd[o] = '\0';
+		ASSERT(vt_kgfx_image_size(cmd, o, &w, &h) == 0,
+		    "file header not read");
+		ASSERT(w == 400 && h == 120, "file size wrong");
+	}
+	unlink(tmpl);
+
+	/* cursor accounting uses the header size: 120px tall at 20px cells
+	 * is 6 rows, so the cursor moves down 5 */
+	st = vt_state_new(24, 80, 100);
+	ASSERT(st != NULL, "state new failed");
+	snprintf(cmd, sizeof(cmd), "Ga=T,f=100;%s", PNG_HEAD_B64);
+	vt_kgfx_account(st, cmd, strlen(cmd), 10, 20);
+	ASSERT(st->cursor_row == 5, "row not advanced from header size");
+	ASSERT(st->cursor_col == 40, "col not advanced from header size");
+	vt_state_free(st);
+	PASS();
+}
+
+static void
+test_term_color_query(void)
+{
+	struct vt_state *st;
+	struct vt_parse *p;
+	int fds[2];
+	char buf[96];
+
+	TEST("OSC 10/11 color query replies");
+	st = vt_state_new(24, 80, 100);
+	ASSERT(st != NULL, "state new failed");
+	p = vt_parse_new(vt_ops_default(), st);
+	ASSERT(p != NULL, "parse new failed");
+	ASSERT(pipe(fds) == 0, "pipe failed");
+	fcntl(fds[0], F_SETFL, O_NONBLOCK);
+	vt_state_set_reply_fd(st, fds[1]);
+
+	/* unknown colors: no reply at all */
+	vt_parse_feed(p, "\033]11;?\033\\", 8);
+	read_reply(fds[0], buf, sizeof(buf));
+	ASSERT(buf[0] == '\0', "replied without a known color");
+
+	vt_state_set_term_colors(st, "rgb:ffff/ffff/ffff",
+	    "rgb:158e/193a/1e75");
+	vt_parse_feed(p, "\033]11;?\033\\", 8);
+	read_reply(fds[0], buf, sizeof(buf));
+	ASSERT(strcmp(buf, "\033]11;rgb:158e/193a/1e75\033\\") == 0,
+	    "bg reply wrong");
+	vt_parse_feed(p, "\033]10;?\a", 7);
+	read_reply(fds[0], buf, sizeof(buf));
+	ASSERT(strcmp(buf, "\033]10;rgb:ffff/ffff/ffff\033\\") == 0,
+	    "fg reply wrong");
+
+	/* a set request is not a query */
+	vt_parse_feed(p, "\033]11;#000000\033\\", 14);
+	read_reply(fds[0], buf, sizeof(buf));
+	ASSERT(buf[0] == '\0', "replied to a set request");
+
+	/* one color may be known without the other */
+	vt_state_set_term_colors(st, NULL, "rgb:0000/0000/0000");
+	vt_parse_feed(p, "\033]10;?\033\\", 8);
+	read_reply(fds[0], buf, sizeof(buf));
+	ASSERT(buf[0] == '\0', "replied for an unknown fg");
+
+	close(fds[0]);
+	close(fds[1]);
+	vt_parse_free(p);
+	vt_state_free(st);
+	PASS();
+}
+
 static void
 test_keyboard_stack(void)
 {
@@ -1636,6 +1810,9 @@ main(void)
 	test_integrated_cursor_shape();
 	test_integrated_tbc();
 	test_keyboard_query();
+	test_term_color_query();
+	test_kgfx_image_size();
+	test_bell_cb();
 	test_keyboard_stack();
 
 	/* screen dump */

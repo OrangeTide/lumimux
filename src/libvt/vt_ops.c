@@ -103,7 +103,9 @@ op_execute(void *ctx, uint8_t c)
 	int rows = vt_buf_rows(st->buf);
 
 	switch (c) {
-	case 0x07:	/* BEL -- ignore for now */
+	case 0x07:	/* BEL -- the owner rings it */
+		if (st->bell_cb)
+			st->bell_cb(st->bell_ctx);
 		break;
 
 	case 0x08:	/* BS -- backspace */
@@ -891,6 +893,25 @@ op_esc(void *ctx, int intermed, int final)
 
 /* ---- OSC dispatch ---- */
 
+/* answer an OSC 10/11 "?" query with the hosting terminal's color, in the
+ * form the terminal itself would use: ESC ] N ; rgb:rrrr/gggg/bbbb ST.
+ * Replying here keeps the answer in order with the DA1 reply programs
+ * send right after as a sentinel. Unknown colors stay unanswered, which
+ * such programs treat as "not supported" rather than hanging. */
+static void
+osc_color_reply(struct vt_state *st, int num)
+{
+	const char *spec = (num == 10) ? st->term_fg : st->term_bg;
+	char rep[96];
+	int n;
+
+	if (!spec)
+		return;
+	n = snprintf(rep, sizeof(rep), "\033]%d;%s\033\\", num, spec);
+	if (n > 0 && n < (int)sizeof(rep))
+		vt_reply(st, rep, (size_t)n);
+}
+
 static void
 op_osc(void *ctx, const char *data, size_t len)
 {
@@ -925,6 +946,12 @@ op_osc(void *ctx, const char *data, size_t len)
 			memcpy(st->title, semi, len);
 			st->title[len] = '\0';
 		}
+		break;
+
+	case 10:	/* query default foreground */
+	case 11:	/* query default background */
+		if (len == 1 && semi[0] == '?')
+			osc_color_reply(st, num);
 		break;
 	}
 }

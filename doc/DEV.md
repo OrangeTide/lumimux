@@ -7,38 +7,54 @@ Information for developers working on lumimux.
 | Directory            | Description                                               |
 |----------------------|-----------------------------------------------------------|
 | src/                 | Main source and module.mk entry point                     |
-| src/lumi.c           | Sub-command dispatcher (`lumi <cmd>` -> `lumi-<cmd>`)     |
-| src/libcfg/          | Gitconfig-style config file parser with key-value lookup  |
+| src/multicall.c      | Sub-command dispatcher (multi-call binary with built-in command table) |
 | src/libattr/         | Transactional key-value attribute store with IPC and CLI  |
-| src/libcore/         | Logging, safe allocation (xmalloc), string helpers, PATH search |
+| src/libbasic/        | BASIC-style interpreter                                   |
+| src/libcfg/          | Gitconfig-style config file parser with key-value lookup  |
+| src/libcore/         | Logging, safe allocation (xmalloc), string helpers, daemonize, PATH search |
+| src/libdraw/         | Backend-neutral drawing surface for full-screen cell grid |
+| src/libdraw_term/    | Terminal backend for draw surface (differential rendering) |
 | src/libiox/          | Poll-based I/O multiplexer with fd watchers, signals, idle callbacks |
 | src/libipc/          | Unix domain socket IPC with TLV message framing           |
 | src/libkeys/         | Key binding table and prefix-key state machine            |
+| src/libnet/          | Netchan-v2 encrypted transport for networked IPC          |
 | src/libpty/          | Pseudo-terminal allocation, shell spawning, resize        |
 | src/librender/       | Differential screen renderer (shadow buffer diffing)      |
 | src/libsessdir/      | Filesystem session directory for micro-server discovery (inotify) |
 | src/libsession/      | Window lifecycle management (PTY + VT state per window)   |
 | src/libsplash/       | ANSI art splash screen scenes with viewport cropping      |
+| src/libsyntax/       | Data-driven syntax highlighter (joe/JSF-style state machine) |
 | src/libtaskbar/      | Taskbar with shell-like template expansion                |
+| src/libtext/         | Editable text buffer with line index (used by edit)       |
 | src/libtermlib/      | Vendored terminfo parser (aux01/termlib, MIT)             |
 | src/libtile/         | Binary split-pane compositor for screen mode splits       |
 | src/libtio/          | Terminal raw mode, 8KB buffered writes, restore on exit   |
-| src/libtxl/          | Terminal translation engine (operations -> escape sequences) |
+| src/libtui/          | Themed widget toolkit                                     |
+| src/libtui_draw/     | Draw-surface backend for libtui pad stack                 |
+| src/libtui_term/     | Terminal backend for libtui widgets                       |
+| src/libtxl/          | Terminal translation engine (data-driven control-code handling) |
 | src/libutf8/         | UTF-8 encode/decode, Unicode-version-aware rune_width()   |
 | src/libvt/           | VT500 terminal emulator: parser, ops, cell grid, scrollback |
 | src/libwm/           | Overlapping window manager compositor (z-order, hit test) |
-| src/cmd/attach/      | lumi-attach -- connect to server, relay I/O, menu overlay |
+| src/cmd/attach/      | lumi-attach -- connect to session, relay I/O, menu overlay |
 | src/cmd/attr/        | lumi-attr -- get/set/delete per-session attributes        |
+| src/cmd/basic/       | lumi-basic -- BASIC-style calculator REPL                 |
 | src/cmd/detach/      | lumi-detach -- detach clients from a session              |
+| src/cmd/edit/        | lumi-edit -- edit a text file (TUI)                       |
+| src/cmd/files/       | lumi-files -- browse the filesystem (TUI)                 |
 | src/cmd/kill/        | lumi-kill -- terminate a session                          |
 | src/cmd/list/        | lumi-list -- list active sessions                         |
 | src/cmd/mserver/     | lumi-mserver -- single-PTY micro-server (one per window)  |
+| src/cmd/net-keygen/  | lumi-net-keygen -- generate netchan identity keys         |
+| src/cmd/net-passwd/  | lumi-net-passwd -- manage netchan passwords               |
+| src/cmd/net-proxy/   | lumi-net-proxy -- encrypted netchan proxy for roaming attach |
 | src/cmd/new/         | lumi-new -- create session and attach                     |
 | src/cmd/new-window/  | lumi-new-window -- create window in existing session      |
-| src/cmd/proxy/       | lumi-proxy -- multiplexing proxy for remote session tunneling |
+| src/cmd/proxy/       | lumi-proxy -- multiplexing proxy for SSH-tunneled remote attach and broker |
 | src/cmd/reload/      | lumi-reload -- tell server to reload config               |
 | src/cmd/send-input/  | lumi-send-input -- inject raw input into a pane           |
 | src/cmd/send-keys/   | lumi-send-keys -- send keystrokes to a session            |
+| src/cmd/share/       | lumi-share -- show connected clients and pass keyboard    |
 | src/cmd/splash/      | lumi-splash -- display ANSI art splash screens            |
 | src/cmd/version/     | lumi-version -- print version info                        |
 
@@ -161,7 +177,7 @@ The mode can be set on the command line (`lumi attach -m turbo`,
 Command-line flags override the config file.
 
 The client puts the terminal in raw mode, enables SGR mouse tracking
-(mode 1002 + 1006 in turbo, 1000 + 1006 in screen, none in minimal),
+(mode 1002 + 1006 in all non-minimal modes, none in minimal),
 and runs its own `iox_loop` with:
 
 - **stdin** -- input parsed by `tkbd_parse()` into structured key/mouse
@@ -437,7 +453,7 @@ Types are organized by category (high byte):
 | ERROR         | `0x0005` | S -> C    | error message bytes                          |
 
 See `src/libipc/ipc_msg.h` for `IPC_ATTACH_F_VIEW`, `_SIZE_OBSERVE`, `_MIRROR`,
-and `_TOKEN`, and the Client Roles and Attach Handshake sections below.
+`_TOKEN`, and `_INJECT`, and the Client Roles and Attach Handshake sections below.
 
 **0x01xx -- Data Transfer**
 
@@ -458,10 +474,11 @@ disconnect) instead of writing each one immediately.
 
 **0x02xx -- Window / PTY Management**
 
-| Type       | Code     | Direction | Payload                          |
-|------------|----------|-----------|-------------------------------------|
-| PTY_FLAGS  | `0x0201` | S -> C    | 1 byte bitmask (`IPC_PTY_ECHO`)   |
-| WIN_RESIZE | `0x0207` | C -> S    | microser `IpcWinResize`          |
+| Type        | Code     | Direction | Payload                                  |
+|-------------|----------|-----------|------------------------------------------|
+| PTY_FLAGS   | `0x0201` | S -> C    | 1 byte bitmask (`IPC_PTY_ECHO`)          |
+| WIN_RESIZE  | `0x0207` | C -> S    | microser `IpcWinResize`                  |
+| TERM_COLORS | `0x0208` | C -> S    | two NUL-terminated X11 color specs (fg, bg) |
 
 **0x03xx -- Attribute Store**
 
@@ -540,9 +557,10 @@ peer on either side decodes the shared prefix and ignores the rest:
 ### IDL and Code Generation
 
 Structured message definitions live in `src/libipc/lumi.idl`. The IDL file
-is the source of truth for all microser-encoded payloads (`IpcSize`,
-`IpcWinResize`). Raw byte payloads (INPUT, OUTPUT) and empty messages
-(ATTACH, DETACH, KILL, OK) are not defined in the IDL.
+is the source of truth for all IDL-encoded payloads: `IpcAttach`,
+`IpcAttachReply`, `IpcWinId`, `IpcWinEntry`, `IpcWinResize`, and attribute
+store messages. Raw byte payloads (INPUT, OUTPUT) and empty messages
+(DETACH, KILL, OK) are not defined in the IDL.
 
 To regenerate `lumi_msg.h` and `lumi_msg.c` from the IDL:
 
@@ -627,7 +645,7 @@ returns -- it always `_exit()`s once its one client is done:
 1. Reads the peer's kernel-reported uid/gid via `ipc_peer_cred()`. No peer
    credential support on the platform is a hard refusal, not an open door.
 2. Checks `sessdir_access_check()` against `<session>/access` (see
-   `doc/lumi.1`'s Cross-user access section for the file format) to get a
+   `doc/lumi.1.in`'s Cross-user access section for the file format) to get a
    role ceiling.
 3. If the matching rule was `ask`, admits the connection as pending
    (`sessdir_client_register()` with `pending=1`) rather than granting or
@@ -674,7 +692,7 @@ Local and broker tiers assume trust in the local kernel's uid/gid
 reporting and the session directory's own file permissions; the SSH and
 netchan tiers assume trust in, respectively, the system's SSH
 configuration or the netchan key/password stores under
-`~/.config/lumi`. See `doc/lumi.1`'s Security and Cross-user access
+`~/.config/lumi`. See `doc/lumi.1.in`'s Security and Cross-user access
 sections for the exact file paths, modes, and ACL rule syntax.
 
 ## Configuration
@@ -709,20 +727,23 @@ setting.
 Key names: `C-x` (ctrl), `space`, `quote`, `tab`, `esc`, `backspace`, or a
 single character. Action names match `keys_action_to_name()` output.
 
-### Menu Colors
+### Themes
 
 ```ini
-[menu]
-    fg = 7
-    bg = 4
-    sel_fg = 0
-    sel_bg = 15
-    key_fg = 10
-    sel_key_fg = 2
+[ui]
+    theme = thin
+
+[theme "custom"]
     border_fg = 7
+    border_bg = 0
+    shadow = half
 ```
 
-Values are indexed terminal colors (0-255).
+The `ui.theme` key selects a built-in theme: `ascii`, `thin` (default
+under UTF-8), `double`, `rounded`, `turbo`, `crimson`, `acid`, `shade`,
+or `borderless`. Custom themes override built-in ones via `[theme
+"name"]` sections; see `src/libtui/tui_theme.c` for the available color
+and shadow keys.
 
 ### Taskbar
 
@@ -732,8 +753,30 @@ Values are indexed terminal colors (0-255).
     position = bottom
 ```
 
-Template variables: `${window-list}`, `${session-name}`, plus functions like
+Template variables: `${window-list}`, plus functions like
 `$(left)`, `$(right)`, `$(center)`, `$(fill)`, `$(truncate N,...)`.
+
+### Sharing and Attach Options
+
+Brief entries for additional configuration keys:
+
+- `share.indicator` -- Shows the number of viewers or pending approval requests
+- `share.resize` -- Allow cross-user clients to resize windows
+- `attach.keep-open` -- Keep the session open when the last client detaches
+- `attach.altscreen-scrollback` -- Capture scrollback when entering alternate screen
+- `attach.graphics-replay` -- Replay kitty graphics on attach
+- `edit.theme` -- Select a built-in theme for the edit command
+
+### Core, Build, and Environment
+
+- `[core]` section holds `shell` (shell command for new windows) and `name`
+  (session name template)
+- `[build]` section holds `dir` (build output directory) and `save`
+  (save file name template) for the edit command
+- `[environment]` section allows setting environment variables passed to
+  child shells; use `environment.VAR_NAME = value`
+
+For details on all keys, see `lumi(1)`.
 
 ## Build System
 
@@ -754,6 +797,8 @@ files. No filesystem scanning -- the tree is driven entirely by `SUBDIRS`.
 `-I$(<name>_DIR)`) inherited transitively by consumers via `_LIBS`.
 
 Output: `_build/<triplet>/` (objects), `_out/<triplet>/bin/` (binaries).
+Build variants (RELEASE, SANITIZE) create subdirectories like
+`_out/<triplet>/release/` and `_out/<triplet>/san-<list>/`.
 
 ### Adding a New Module
 
@@ -769,44 +814,57 @@ Output: `_build/<triplet>/` (objects), `_out/<triplet>/bin/` (binaries).
 `make run-tests` builds and runs all test suites. Test binaries are declared
 via `_TESTCMD` in module.mk files.
 
-| Suite          | Library    | Tests |
-|----------------|------------|-------|
-| test_iox       | libiox     | 14    |
-| test_vt        | libvt      | 32    |
-| test_render    | librender  | 11    |
-| test_txl       | libtxl     | 38    |
-| test_ipc       | libipc     | 8     |
-| test_attr_store| libattr    | 15    |
-| test_sessdir   | libsessdir | 55    |
-| test_keys      | libkeys    | 31    |
-| test_cfg       | libcfg     | 39    |
-| test_taskbar   | libtaskbar | 27    |
-| test_splash    | libsplash  | 131   |
-| test_utf8      | libutf8    | 48    |
-| test_tui       | libtui     | 27    |
-| test_wm        | libwm      | 23    |
-| test_tile      | libtile    | 19    |
-| test_input     | attach     | 15    |
-| test_predict   | attach     | 12    |
-| **Total**      |            | **545** |
+| Suite             | Component      |
+|-------------------|-----------------|
+| test_runtime_dir  | libcore         |
+| test_iox          | libiox          |
+| test_vt           | libvt           |
+| test_vt_torture   | libvt (stress)  |
+| test_render       | librender       |
+| test_txl          | libtxl          |
+| test_ipc          | libipc          |
+| test_ipc_transport| libnet          |
+| test_netchan      | libnet          |
+| test_nc_auth      | libnet          |
+| test_ipc_transport_net | libnet      |
+| test_attr_store   | libattr         |
+| test_sessdir      | libsessdir      |
+| test_access       | libsessdir      |
+| test_keys         | libkeys         |
+| test_cfg          | libcfg          |
+| test_taskbar      | libtaskbar      |
+| test_splash       | libsplash       |
+| test_tui          | libtui          |
+| test_tui_draw     | libtui_draw     |
+| test_wm           | libwm           |
+| test_tile         | libtile         |
+| test_text         | libtext         |
+| test_syntax       | libsyntax       |
+| test_basic        | libbasic        |
+| test_draw         | libdraw         |
+| test_draw_term    | libdraw_term    |
+| test_mserver      | cmd/mserver     |
+| test_input        | cmd/attach      |
+| test_predict      | cmd/attach      |
+| test_proxy        | cmd/proxy       |
+| test_net_proxy    | cmd/net-proxy   |
+| test_edit         | cmd/edit        |
+| test_utf8         | libutf8         |
 
 ## Library Dependency Graph
 
-```
-lumi-mserver: libiox, libsessdir, libsession, libipc, libpty, libvt,
-              libutf8, libcore
-lumi-attach:  libiox, libsessdir, libipc, libtio, librender, libtxl,
-              libtermlib, libvt, libutf8, libkeys, libcfg, libtaskbar,
-              libcore, libtui, libtui_term, libwm, libtile, libattr
-lumi-proxy:   libiox, libsessdir, libipc, libcore
-libwm:        libvt, libtui, libutf8
-libtui:       libvt, libutf8
-libtui_term:  libtui, libtxl, libtio, libtermlib, libvt, libutf8, libcore
-```
+All sub-commands are built into a single `lumi` executable, linked with all
+required libraries from `lumi_LIBS` in `src/module.mk`. Key sub-libraries:
 
-Internal libraries are static archives (.a), linked only by the sub-commands
-that need them. Transitive dependencies are resolved by the build system via
-`_LIBS`.
+**lu_mserver:** libiox, libipc, luattr, libsessdir, libsession, libvt,
+  libutf8, libpty, libcfg, libcore
+
+**lu_netproxy:** libnet, libipc, libsessdir, libcore
+
+**lu_proxy:** libiox, libipc, libsessdir, libcore
+
+Transitive dependencies are resolved by the build system via `_LIBS`.
+Internal libraries are static archives (.a) linked at the final executable.
 
 ## VT Emulation Pipeline
 

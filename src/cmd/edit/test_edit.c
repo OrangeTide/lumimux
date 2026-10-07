@@ -1500,6 +1500,102 @@ test_search_repeat_reverse(void)
 }
 
 static void
+test_search_offset_end(void)
+{
+	struct editor e;
+	struct mock m;
+
+	TEST("/pat/e lands on the match end and n moves on");
+	ed_open(&e, &m, 24, 80);
+	ed_settext(&e, "x foo y foo z");	/* foo at 2 and 8 */
+	e.mode = MODE_NORMAL;
+	e.cx = 0;
+	ASSERT(vi_search_cmd(&e, "foo/e", 1) == 0, "search rejected");
+	ASSERT(e.cy == 0 && e.cx == 4, "did not land on the last 'o'");
+	ed_vi_type(&e, "n");
+	ASSERT(e.cx == 10, "n did not reach the second match end");
+	ed_vi_type(&e, "n");			/* wraps to the first */
+	ASSERT(e.cx == 4, "n did not wrap to the first match end");
+	ASSERT(vi_search_cmd(&e, "foo/e-1", 1) == 0, "e-1 rejected");
+	ASSERT(e.cx == 9, "e-1 did not step back one character");
+	ed_close(&e);
+	PASS();
+}
+
+static void
+test_search_offset_start_negative(void)
+{
+	struct editor e;
+	struct mock m;
+
+	TEST("/pat/s-2 leaves the cursor before the match without sticking");
+	ed_open(&e, &m, 24, 80);
+	ed_settext(&e, "ab foo cd foo");	/* foo at 3 and 10 */
+	e.mode = MODE_NORMAL;
+	e.cx = 0;
+	ASSERT(vi_search_cmd(&e, "foo/s-2", 1) == 0, "search rejected");
+	ASSERT(e.cx == 1, "s-2 did not land two before the match");
+	ed_vi_type(&e, "n");
+	ASSERT(e.cx == 8, "n re-found the same match instead of the next");
+	ed_vi_type(&e, "N");
+	ASSERT(e.cx == 1, "N did not go back to the first match's offset");
+	ASSERT(vi_search_cmd(&e, "foo/b+", 1) == 0, "b+ rejected");
+	ASSERT(e.cx == 11, "b+ did not land one into the match");
+	ed_close(&e);
+	PASS();
+}
+
+static void
+test_search_offset_lines(void)
+{
+	struct editor e;
+	struct mock m;
+
+	TEST("/pat/+N and ?pat?-N move whole lines and rest in column 0");
+	ed_open(&e, &m, 24, 80);
+	ed_settext(&e, "  foo\nbar\nbaz\n  foo\nend");
+	e.mode = MODE_NORMAL;
+	e.cy = 1;
+	e.cx = 0;
+	ASSERT(vi_search_cmd(&e, "foo/+1", 1) == 0, "search rejected");
+	ASSERT(e.cy == 4 && e.cx == 0, "+1 did not land on the line below");
+	ed_vi_type(&e, "n");			/* wraps to the first foo */
+	ASSERT(e.cy == 1 && e.cx == 0, "n did not move to the next match");
+	ASSERT(vi_search_cmd(&e, "foo?-1", -1) == 0, "backward rejected");
+	ASSERT(e.cy == 2 && e.cx == 0, "?-1 did not land above the match");
+	ASSERT(vi_search_cmd(&e, "foo/+9", 1) == 0, "+9 rejected");
+	ASSERT(e.cy == 4, "a line offset past the end did not clamp");
+	ed_close(&e);
+	PASS();
+}
+
+static void
+test_search_offset_reuse_and_errors(void)
+{
+	struct editor e;
+	struct mock m;
+
+	TEST("//e reuses the last pattern; a bad offset is refused");
+	ed_open(&e, &m, 24, 80);
+	ed_settext(&e, "a foo b a/b");
+	e.mode = MODE_NORMAL;
+	e.cx = 0;
+	ASSERT(vi_search_cmd(&e, "foo", 1) == 0, "plain search rejected");
+	ASSERT(e.cx == 2 && e.vi_off_kind == 0, "plain search has an offset");
+	ASSERT(vi_search_cmd(&e, "/e", 1) == 0, "empty pattern rejected");
+	ASSERT(e.cx == 4, "//e did not reuse the pattern with the offset");
+	ASSERT(vi_search_cmd(&e, "foo/x", 1) == -1, "bad offset accepted");
+	ASSERT(e.cx == 4, "a bad offset moved the cursor");
+	ASSERT(strstr(e.status, "bad search offset") != NULL, "no error");
+	ASSERT(vi_search_cmd(&e, "a\\/b", 1) == 0, "escaped delimiter rejected");
+	ASSERT(e.cx == 8, "escaped '/' was not part of the pattern");
+	ed_vi_type(&e, "*");			/* word search drops the offset */
+	ASSERT(e.vi_off_kind == 0, "* kept the previous offset");
+	ed_close(&e);
+	PASS();
+}
+
+static void
 test_ex_delete_range(void)
 {
 	struct editor e;
@@ -2897,6 +2993,10 @@ main(void)
 	test_search_word_star();
 	test_search_word_hash();
 	test_search_repeat_reverse();
+	test_search_offset_end();
+	test_search_offset_start_negative();
+	test_search_offset_lines();
+	test_search_offset_reuse_and_errors();
 	test_ex_delete_range();
 	test_ex_delete_all();
 	test_ex_goto_dollar();

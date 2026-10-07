@@ -25,13 +25,13 @@ sessdir_tree_free(struct sessdir_tree_node *n)
 }
 
 static struct sessdir_tree_node *
-tree_new_leaf(int win_index)
+tree_new_leaf(int win_num)
 {
 	struct sessdir_tree_node *n;
 
 	n = xcalloc(1, sizeof(*n));
 	n->type = SESSDIR_TREE_LEAF;
-	n->win_index = win_index;
+	n->win_num = win_num;
 	return n;
 }
 
@@ -170,6 +170,17 @@ kv_get(const struct kv_table *kv, const char *key)
 	return NULL;
 }
 
+/* the file is the current format: a VERSION line equal to ours. A file
+ * from before versioning keyed panes by window-order index, which reads as
+ * a window number only by coincidence, so it is treated as no layout. */
+static int
+kv_version_ok(const struct kv_table *kv)
+{
+	const char *val = kv_get(kv, "VERSION");
+
+	return val && strtol(val, NULL, 10) == SESSDIR_LAYOUT_VERSION;
+}
+
 /* ---- layout file I/O ---- */
 
 static char *
@@ -228,10 +239,11 @@ layout_read(const char *session)
 /*
  * Preorder text format:
  *   split:  "v<pos>" or "h<pos>"  followed by two children
- *   leaf:   "<index>"
+ *   leaf:   "<window number>"
  *
- * Example: "v128 h128 0 1 2"
- *   = vertical split(128) of [horizontal split(128) of [leaf 0, leaf 1], leaf 2]
+ * Example: "v128 h128 0 1 3"
+ *   = vertical split(128) of [horizontal split(128) of [window 0, window 1],
+ *     window 3]
  */
 
 static struct sessdir_tree_node *
@@ -289,7 +301,7 @@ tree_serialize(const struct sessdir_tree_node *n, char *buf, int buflen)
 
 	if (n->type == SESSDIR_TREE_LEAF) {
 		rc = snprintf(buf + pos, (size_t)(buflen - pos),
-		    "%d", n->win_index);
+		    "%d", n->win_num);
 		if (rc > 0)
 			pos += rc;
 		return pos;
@@ -329,7 +341,7 @@ sessdir_layout_mode(const char *session)
 		return SESSDIR_LAYOUT_NONE;
 
 	kv_parse(data, &kv);
-	mode = kv_get(&kv, "MODE");
+	mode = kv_version_ok(&kv) ? kv_get(&kv, "MODE") : NULL;
 	if (mode) {
 		if (strcmp(mode, "turbo") == 0)
 			result = SESSDIR_LAYOUT_TURBO;
@@ -361,7 +373,7 @@ sessdir_layout_load_turbo(const char *session,
 
 	kv_parse(data, &kv);
 	mode = kv_get(&kv, "MODE");
-	if (!mode || strcmp(mode, "turbo") != 0) {
+	if (!kv_version_ok(&kv) || !mode || strcmp(mode, "turbo") != 0) {
 		free(data);
 		return -1;
 	}
@@ -407,7 +419,7 @@ sessdir_layout_load_screen(const char *session,
 
 	kv_parse(data, &kv);
 	mode = kv_get(&kv, "MODE");
-	if (!mode || strcmp(mode, "screen") != 0) {
+	if (!kv_version_ok(&kv) || !mode || strcmp(mode, "screen") != 0) {
 		free(data);
 		return -1;
 	}
@@ -484,6 +496,7 @@ sessdir_layout_save_turbo(const char *session,
 	}
 
 	fprintf(f, "MODE=turbo\n");
+	fprintf(f, "VERSION=%d\n", SESSDIR_LAYOUT_VERSION);
 	fprintf(f, "GEN=%lu\n", gen);
 	if (layout->focus >= 0)
 		fprintf(f, "FOCUS=%d\n", layout->focus);
@@ -534,6 +547,7 @@ sessdir_layout_save_screen(const char *session,
 	}
 
 	fprintf(f, "MODE=screen\n");
+	fprintf(f, "VERSION=%d\n", SESSDIR_LAYOUT_VERSION);
 	fprintf(f, "GEN=%lu\n", gen);
 	if (layout->focus >= 0)
 		fprintf(f, "FOCUS=%d\n", layout->focus);

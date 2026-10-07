@@ -2565,15 +2565,16 @@ last_match(const char *s, size_t slen, size_t lo, size_t hi, const char *q)
 }
 
 /* Search for q from the cursor in direction dir (1 forward, -1 backward),
- * wrapping around the buffer, and move the cursor to the match. */
-void
+ * wrapping around the buffer, and move the cursor to the match. Returns 1
+ * when a match was found and 0 when the cursor was left alone. */
+int
 do_find_dir(struct editor *e, const char *q, int dir)
 {
 	size_t nlines = text_lines(e->t);
 	size_t i;
 
 	if (!q[0])
-		return;
+		return 0;
 
 	if (dir >= 0) {
 		/* Current line after the cursor, then each following line, then
@@ -2594,7 +2595,7 @@ do_find_dir(struct editor *e, const char *q, int dir)
 				e->sel_active = 0;
 				snprintf(e->status, sizeof(e->status),
 				    "found '%.80s' (line %zu)", q, ln + 1);
-				return;
+				return 1;
 			}
 		}
 	} else {
@@ -2624,11 +2625,12 @@ do_find_dir(struct editor *e, const char *q, int dir)
 				e->sel_active = 0;
 				snprintf(e->status, sizeof(e->status),
 				    "found '%.80s' (line %zu)", q, ln + 1);
-				return;
+				return 1;
 			}
 		}
 	}
 	snprintf(e->status, sizeof(e->status), "not found: %.80s", q);
+	return 0;
 }
 
 void
@@ -3005,6 +3007,7 @@ static void
 buf_load(struct editor *e, const struct ebuf *b)
 {
 	e->t = b->t;
+	e->vi_match_valid = 0;	/* the remembered match was in another file */
 	memcpy(e->path, b->path, sizeof(e->path));
 	e->has_name = b->has_name;
 	e->cy = b->cy;

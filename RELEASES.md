@@ -1,5 +1,57 @@
 # lumiMUX Release Notes
 
+## v26.10.1 -- 2026-10-06
+
+### Terminal color queries answered in place
+
+Programs that ask the terminal for its foreground and background (OSC 10
+and 11), such as `gh` and prompt frameworks, used to see the reply arrive
+late and land on the shell's command line as `^[]11;rgb:...`. The attach
+client now asks the outer terminal itself at startup, on a session switch,
+and after roaming, reports the answers to every micro-server, and the
+micro-server's VT answers the program directly. The client also strips any
+terminal reply from its own input before the key parser can turn it into
+keystrokes.
+
+### Kitty graphics, finished
+
+The kitty graphics pass-through now covers the whole plan. The host's
+reply to a command is routed back to the window that sent it, and image
+numbers are resolved to the ids the host assigned. Images show in turbo
+mode too, placed at the focused window's origin and cropped to its edges.
+An image's chunks, animation frames, and control commands are kept
+together in a byte-capped per-window store, so animations survive a
+window switch and the program's deletes are honored. A PNG sent without a
+size is measured from its header, and when the tty reports no cell pixel
+size the client asks the terminal (CSI 16 t / 14 t). A redraw re-places an
+image the host already holds instead of re-sending its data, falling back
+to a full re-send when the host reports it gone; `attach.graphics-replay =
+full` turns that off. A window switch replays images once rather than
+twice.
+
+### Sharing
+
+A client that does not hold the keyboard shows the session title with a
+`[viewing]` suffix. The presence indicator counts a client waiting for
+approval under an `ask` rule separately, as `+N?`, through the new `%p`
+and `%P` format tokens. OSC 52 clipboard writes from a program reach only
+the client that holds the keyboard.
+
+### Other changes
+
+- A program's bell now rings the outer terminal when its window is on
+  screen, and shows a "bell in window N" notice when it is hidden.
+- Saved layouts are keyed by stable window number (format version 2), so
+  a layout survives windows closing or being renumbered between save and
+  restore. Older layout files are ignored.
+- `lumi edit` vi search accepts offsets (`/pat/e`, `/pat/s-1`, and the
+  line forms). All further editor work is deferred.
+- The man page and the other documents were brought back in line with the
+  code, and the missing release notes between v26.06.1 and v26.09.1 were
+  filled in.
+
+---
+
 ## v26.10.0 -- 2026-10-05
 
 This release turns `lumi edit` from a splash-era placeholder into a usable
@@ -50,8 +102,8 @@ byte and text search, a data inspector, and byte copy and paste.
 ### Syntax highlighting
 
 A new `libsyntax` library provides a data-driven, joe/JSF-style highlighting
-state machine. It ships tables for Rust, Go, Lua, Python, JavaScript, HTML,
-BASIC, Forth, NASM, GAS, and Pascal, and edit highlights a file by type.
+state machine. It ships tables for C, Shell, Rust, Go, Lua, Python, JavaScript,
+HTML, BASIC, Forth, NASM, GAS, and Pascal, and edit highlights a file by type.
 Highlight colors are configurable and derive from the active TUI theme.
 
 ### Build integration
@@ -88,6 +140,80 @@ every step, and is meant to run under the sanitizers and the coverage build.
 - The renderer parks the cursor at the requested position in its flat-cell
   path.
 - `libtext` groups multiple edit primitives into a single undo step.
+
+---
+
+## v26.09.1 -- 2026-09-19
+
+This release brings the first bundled utilities, the first cut of kitty
+graphics, and an install target.
+
+### Bundled utilities
+
+`lumi files` browses the filesystem with a preview pane, opens a file in
+`$PAGER` or `$EDITOR`, and inside a session opens it in a new window; it
+can toggle hidden files and make, rename, or delete entries behind a
+confirm. `lumi edit` is a modeless text editor on the new `libtext`
+buffer with undo and redo, search, goto-line, selection with copy, cut,
+and paste mirrored to the system clipboard, and an F1 help screen.
+`lumi basic` is a BASIC-style calculator REPL on the new `libbasic`
+engine, with programs by file line and label, `SAVE`, `LOAD`, `EDIT`
+(in `lumi edit`), `DEF FN`, vector and matrix values, and ASCII graphing.
+All three accept bracketed paste.
+
+### Sending input to windows
+
+`lumi send-input` and `lumi send-keys` send raw bytes or named keys to a
+window, chosen by focus or by index; edit and basic use the same path to
+send a selection or a program to a pane. `lumi attr` attaches before
+sending its requests. `new-window` runs a command with arguments.
+
+### Kitty graphics, first cut
+
+Kitty graphics commands are anchored to their cell, the cursor is
+advanced past the image on both the client and the server, and the
+images are replayed across window switches. The design and its limits
+are recorded in `doc/kitty-graphics.md`.
+
+### Other changes
+
+- A window's OSC 52 clipboard write is forwarded to the outer terminal,
+  and the VT's OSC buffer grew so large clipboards get through.
+- An `[environment]` config section sets environment defaults for new
+  windows.
+- Mouse reports split at an ESC boundary (macOS Terminal.app) no longer
+  corrupt a selection; `tkbd_drain()` decodes fragmented input safely.
+- `make install` and `make uninstall` were added, defaulting to
+  `~/.local`, and the man page is generated from `doc/lumi.1.in` at
+  build and install time. Release artifacts are staged with the install
+  target.
+- Fixed the first-window startup hang on macOS.
+
+---
+
+## v26.09.0 -- 2026-09-15
+
+- Optional GPM mouse support on the Linux console (`make GPM=0` turns it
+  off).
+- Cells are erased with the current background color (BCE), fixing
+  programs that rely on it.
+- Keyboard-enhancement state is replayed on attach, so a kitty-protocol
+  program keeps its flags after a reattach.
+- Session state is locked through a stable file rather than the renamed
+  inode, fixing a window number map race.
+- The guided prefix menu scrolls instead of clipping on short terminals.
+- An index outside the scroll margins no longer scrolls the region.
+- The README gained a See Also section listing related multiplexers.
+
+---
+
+## v26.08.3 -- 2026-08-27
+
+- Kitty keyboard flags are mirrored with a set rather than stack push and
+  pop, fixing a leak that left enhancement flags on after a program
+  exited. Regression test added.
+- `vt_state_dump` no longer bleeds a cell's style down the screen.
+- TBC 3 clears every tab stop instead of restoring the defaults.
 
 ---
 
@@ -187,6 +313,130 @@ v1.8.8, which adds the `-L` for `LIBDIR` only when the project builds
 shared libraries. lumi builds none, so the flag leaves the link line
 entirely, and with it a warning from Apple's linker about a search path
 that does not exist.
+
+---
+
+## v26.08.1 -- 2026-08-02
+
+- Fixed an inotify feedback loop that pegged any attached client's CPU at
+  100% as soon as a second client attached.
+
+---
+
+## v26.08.0 -- 2026-08-02
+
+This release delivers shared attach (Phase 12): several clients on one
+session, one keyboard, access control for other users, and a networked
+broker.
+
+### Several clients, one keyboard
+
+Several clients can attach to one window. Identity and role travel in the
+attach handshake, the keyboard is decided per session, and `lumi share`
+lists the clients and passes the keyboard between them. `lumi attach -v`
+attaches read-only; a watching client follows the keyboard holder's view;
+the window is sized for the clients that can type. The taskbar shows who
+else is attached and says when that changes. `share.mode` lets a
+multi-writer session grant the keyboard to everyone, with speculative
+echo gated off while more than one writer is attached, and `share.display`
+with a layout generation counter keeps shared displays in step.
+
+### Access control and the broker
+
+A session-wide ACL (`session/access`) decides what another local user may
+do, with `ask` rules that admit a client pending approval. `lumi proxy -L`
+is the local cross-user broker, and `lumi net-proxy -L` forks a child per
+client and applies the same ACL to networked clients. Broker-relayed
+clients appear in the session roster, the ACL is re-evaluated on clients
+already connected, and the share indicator is colored for foreign uids
+with coupling and pending columns in `lumi share -l`. The runtime
+directory is refused when it is not ours, and Unix socket peer credentials
+are reported.
+
+### Other changes
+
+- OSC 10/11 color queries are forwarded so the outer terminal can answer
+  (superseded in a later release by mserver-side answers).
+- Input runs are bracketed so a paste cannot be torn in half.
+- Window titles survive a reattach, a restored split whose window is gone
+  collapses, and a screen layout never restores a pane with no window.
+- Several teardown, error-path, and multi-writer bugs found in review were
+  fixed. Vendored libiox 0.1.0.
+
+---
+
+## v26.07.1 -- 2026-07-24
+
+- `lumi net-keygen` makes a netchan client identity key and `lumi
+  net-passwd` enrolls a direct-connect password; the netchan transport
+  gained an ssh-shaped userauth phase and server-identity plumbing.
+- Direct-connect net-proxy deployment without ssh, covered by tests that
+  found and fixed two listener bugs.
+- Opt-in ssh-style host-key verification for networked attach
+  (`attach -V`).
+- `lumi new -d` no longer blocks captured output: the mserver detaches its
+  standard descriptors.
+- Vendored netchan re-synced to upstream 0.6.0; entropy comes from
+  `getentropy()` so macOS builds; release build paths fixed for the
+  variant directory.
+
+---
+
+## v26.07.0 -- 2026-07-16
+
+This release lands networked connections (11C) on netchan-v2 instead of
+the originally planned QUIC.
+
+### Networked attach
+
+An `ipc_transport` seam, the extracted `libnet` transport core, and a
+stress-tested reliable channel underpin `lumi net-proxy`, the netchan
+bridge. `lumi attach -n` reaches a proxy on this host, or on another host
+over ssh (`-n host:session`), with the link encrypted under a per-session
+pre-shared key. A moved client roams automatically on a network change.
+
+### Other changes
+
+- Alt-screen content can be captured into scrollback on exit.
+- A `Ctrl-A :` command line takes directives, including `:title` as a
+  client-side override and `:number` to renumber the window; the doubled
+  text bug in it was fixed.
+- Most-recently-used window order; redisplay action; panes resync at
+  attach size; the taskbar highlights the live focus, elides overflowing
+  titles, and switches focus on a tab click. The status line was renamed
+  the taskbar throughout.
+- Desktop-notification OSCs pass through to the outer terminal.
+- The prefix menu no longer strobes over a live backdrop, and send-prefix
+  from it works. xterm modifyOtherKeys (CSI 27) is decoded for the prefix
+  key. Input parsing resyncs on incomplete CSI sequences.
+- Vi-style keyboard copy mode in scrollback; stale selections clear on
+  paste, scroll, and focus change; stuck bracketed-paste state is
+  cancelled on focus change.
+- The mserver re-registers its socket on SIGHUP; a use-after-free when a
+  window closed in a tiled layout was fixed.
+- Terminal configuration for common terminals is documented.
+
+---
+
+## v26.06.2 -- 2026-06-26
+
+- Mouse selection no longer bounces to the start of the screen.
+
+---
+
+## v26.06.1 -- 2026-06-24
+
+- Windows get stable numbers that survive other windows closing.
+- The kitty keyboard protocol is modelled as a flag stack and
+  capability queries are answered.
+- Mouse wheel events are forwarded to alt-screen programs that want
+  mouse tracking.
+- New-window creation works without the session directory watch; windows
+  are resized to the screen-mode area on entry; orphan tile panes are
+  dropped when a window closes in turbo mode; stale tab bar titles on
+  window switch were fixed.
+- The Phase 11 plan moved to `doc/FUTURE.md`. Fixed the mserver build on
+  macOS and BSD.
 
 ---
 

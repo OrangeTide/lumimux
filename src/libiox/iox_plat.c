@@ -100,12 +100,11 @@ iox_plat_socket_nonblock(int fd)
 #ifdef __APPLE__
 
 /* macOS poll() does not report readiness on a pseudo-terminal master. A
- * process whose only ready descriptor is a pty master, such as the mserver
- * blocking for its shell's output, never wakes: startup shows a blank window
- * that only comes alive once unrelated socket traffic (a second window's
- * refresh request) wakes poll() and the level-triggered pty read finally
- * runs. select() does report ptys correctly here, so translate the pollfd
- * set into a select() call on this platform.
+ * process whose only ready descriptor is a pty master blocks forever: it
+ * wakes only once unrelated traffic on another descriptor returns from
+ * poll(), at which point the level-triggered pty read finally runs.
+ * select() reports ptys correctly here, so translate the pollfd set into a
+ * select() call on this platform.
  *
  * Only POLLIN and POLLOUT are honored. A hangup or error surfaces through
  * select()'s read/write sets: an ended or errored descriptor reads ready and

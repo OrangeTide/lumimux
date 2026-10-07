@@ -599,6 +599,46 @@ into CI next to the smoke tests.
 
 ---
 
+## OSC 10/11 Color Query Junk on the Command Line (DONE)
+
+**Status:** Fixed (commits e86d83a, 4f4e29f, e51c462), libvt test added.
+
+**Symptom:** On iTerm2, after running a program that asks the terminal for
+its background color (gh, and powerline-style prompts on each redraw), the
+reply showed up as typed text on the bash command line:
+`^[]11;rgb:158e/193a/1e75^[\`, sometimes several copies.
+
+**Cause:** Two problems stacked. First, the attach client relayed a
+window's OSC 10/11 query to the outer terminal and routed the reply back
+from stdin, but the same stdin bytes also went through the keyboard parser,
+which does not know OSC. It read the reply as Alt+] followed by typed
+characters and forwarded that to the focused window as keystrokes, so every
+reply arrived twice. Second, even one copy came too late. termenv (used by
+gh) sends the color query followed by DA1 as a sentinel and stops listening
+once the DA1 reply arrives. The mserver's VT answers DA1 at once, so the
+relayed color reply always lost the race and reached the shell instead.
+
+**Fix:** The mserver answers OSC 10/11 itself, like DA1. The attach client
+asks the outer terminal for its colors at startup, again on a session
+switch and after a roam, picks the replies out of stdin before the keyboard
+parser sees them, and reports them to every mserver over a new
+`IPC_MSG_TERM_COLORS` message (also to windows that connect later, and again
+when this client gains the keyboard). libvt stores the two color specs and
+answers `OSC 10;?` / `OSC 11;?` through its reply fd, in order with DA1.
+Unknown colors leave the query unanswered, which such programs treat as
+unsupported. The per-window relay and its reply routing are gone. A stdin
+scanner still strips any stray OSC reply so it can never be typed into a
+window; a partial reply split across reads is held back only while the
+startup query's answer is still expected, so an Alt+] keystroke is never
+delayed.
+
+**Verification:** `test_vt` covers the unanswered, answered, set-request,
+and half-known cases. Driven end to end under GNU screen: a fake terminal
+reply split across two writes was learned, and a pane sending OSC 11 then
+DA1 received the color reply and the DA1 reply, in that order, once each.
+
+---
+
 ## Window Number Map Race (DONE)
 
 **Status:** Fixed (commit 7f6a0ce), regression test added in the same commit.
@@ -670,11 +710,27 @@ and `test_iox` plus the full `make run-tests` suite pass.
 
 ---
 
-## Layout Persistence Hardening (SCOPED)
+## Layout Persistence Hardening (DONE)
 
-**Status:** Not started. The blank-screen and lost-title bugs it came from
-are fixed (commits 14f62d4, a47b7b1, 9ea000a); the format weakness that
-allowed them is not.
+**Status:** Done. The blank-screen and lost-title bugs it came from were
+fixed earlier (commits 14f62d4, a47b7b1, 9ea000a); the format weakness that
+allowed them is now closed as designed below. The layout file is version 2:
+it carries a `VERSION=2` line, screen leaves and turbo `WIN_<n>` keys name
+the stable window number, and `FOCUS` is a window number too. A file
+without the current version (every version 1 file) is ignored by the mode
+probe and both loaders, while its `GEN` stays readable so the next save
+still advances the generation. In `attach.c` the five save/restore paths
+resolve numbers through the state file's `WINDOW_NUMS` slot map
+(`layout_get_nums`, `layout_num_of`, `layout_pid_of`); a spare number or
+one whose window has exited fails to resolve, which the import path
+already turns into a collapsed split or a skipped turbo window. Turbo
+layouts were converted in the same pass, answering the open question.
+`test_sessdir` round-trips a screen tree and a turbo layout across a
+spare number and checks that unversioned and wrong-version files are
+ignored. Verified live under GNU screen: a three-pane layout saved over
+windows 2, 3, 4 was reattached after window 3's mserver was killed, and
+came back as two panes showing windows 2 and 4 with focus on 4, saving
+as `TREE="v128 2 4"`.
 
 **Goal:** Make a saved layout survive changes to the session's window set,
 and make an unusable layout impossible to write rather than merely
@@ -713,20 +769,32 @@ name so an old file is ignored rather than misread as the new format.
 | `src/cmd/attach/attach.c` | Export and import panes by window number in `screen_export_tree()` / `screen_build_tile_tree()` |
 | `src/libsessdir/test_sessdir.c` | Round-trip a layout whose windows changed between save and load |
 
-**Open question:** Turbo layouts (`sessdir_layout_save_turbo()`) index the
-same window order and have the same weakness, though an unplaceable turbo
-window is skipped rather than turned into an empty pane. Worth converting
-in the same pass.
+**Turbo layouts** (`sessdir_layout_save_turbo()`) indexed the same window
+order and had the same weakness, though an unplaceable turbo window is
+skipped rather than turned into an empty pane. They were converted in the
+same pass (see the status above).
 
 ---
 
 ## Kitty Graphics Protocol (SCOPED)
 
 **Status:** Partially implemented. Anchoring, client and server cursor
-accounting, cell-pixel plumbing, and screen-mode window-switch replay have
-shipped. Image-number resolution, animation, and turbo-mode clipping remain
-design only. See `doc/kitty-graphics.md` (section "As implemented") for what
-the code does today.
+accounting, cell-pixel plumbing, screen-mode window-switch replay,
+image-number resolution (the host's replies routed back to the window that
+asked, ids recorded, replays sent quiet), and turbo-mode support (the top
+window's images offset to its origin and cropped to its rectangle) have
+shipped, and so has animation: an image's frames and control commands are
+kept with it and replayed in order, with a byte-capped store that evicts
+whole images and applies the program's deletes. A PNG sent without a size
+is measured from its header, and the cell pixel size is asked of the
+terminal (CSI 16 t / 14 t) when the tty reports none. Replay is lazy for
+images the host knows by id (placements only, data re-sent on the host's
+error) and a full re-transmit for the rest; `attach.graphics-replay =
+full` disables the lazy path. A switch replays a window's images once, now
+that the session-directory refresh no longer forces a redraw for a layout
+save. Nothing of the kitty plan remains open. See
+`doc/kitty-graphics.md` (section "As implemented") for what the code does
+today.
 
 Extends the existing SIXEL/DCS pass-through (11B) to carry the kitty
 graphics protocol through lumi. Because lumi is a screen-buffer
@@ -740,15 +808,19 @@ Feasibility by mode:
   pass-through.
 - Screen mode: feasible and is the target. One full-screen window at a
   time, so the window rect equals the host rect and no clipping is needed.
-- Turbo mode: dead end for overlapping windows. The protocol has no clip
-  or occlusion primitive, so replay is meaningful only for the top window.
+- Turbo mode: the top (focused) window only. The protocol has no occlusion
+  primitive, so images of windows underneath are not drawn; the top
+  window's are offset to its origin and cropped to its rectangle.
 
 The design adds a per-window placement table, a record path in
 `dcs_passthru()`, switch hooks in `micro_select_window()`, and
-image-number resolution from host replies (mirroring the OSC color-query
-round trip). Replay defaults to re-transmitting image bytes on each switch
-(portable, no host assumptions); a lazy variant that trusts host
-persistence is deferred behind a latency measurement.
+image-number resolution from host replies (a reply-routing path from the
+client's stdin back to the asking window; the OSC color-query relay that
+once did this was replaced by mserver-side answers, so it would be new).
+Replay re-transmits image bytes for images the host cannot name
+(portable, no host assumptions) and, as shipped later, only re-places
+images the host knows by id, falling back to a re-transmit when the host
+reports one gone.
 
 As shipped, the record path and re-transmit replay use a minimal per-window
 store (raw APC bytes plus the anchor cell), not the general placement table;
@@ -769,9 +841,11 @@ diacritics, and foreground-encoded image id) not present today.
 
 ---
 
-## Phase 12: Shared Attach (SCOPED)
+## Phase 12: Shared Attach (DONE)
 
-**Status:** Not started.
+**Status:** Shipped. Steps 1 through 14 below have all landed; the plan is
+kept for the design record. The open questions at the end are resolved
+where noted.
 
 **Goal:** Let several clients be attached to one session at the same time.
 Two stages: **12A** gives one writer plus any number of view-only clients,
@@ -1159,9 +1233,10 @@ The transient notice is not the mechanism that matters. A persistent
 indicator is, in the same spirit as a VNC server's tray icon.
 
 - The taskbar carries a share field whenever more than one client is
-  attached: `share:1w+2v` for one writer and two viewers, with a distinct
-  color when any attached client is not the session owner's uid. The exact
-  format is configurable through `share.indicator`.
+  attached: `share:1w+2v` for one writer and two viewers, `share:1w+2v+1?`
+  when a client is also waiting for approval under an `ask` rule, with a
+  distinct color when any attached client is not the session owner's uid.
+  The exact format is configurable through `share.indicator`.
 - In turbo mode the same badge appears in the focused window's title bar,
   since the taskbar can be covered.
 - In minimal mode there is no taskbar, so the indicator goes in the host
@@ -1230,7 +1305,7 @@ users, **step 13** is `screen -x`.
 
 ---
 
-**Step 1. Peer credentials in libipc.**
+**Step 1. Peer credentials in libipc. (DONE)**
 
 Add `ipc_peer_cred(int fd, uid_t *uid, gid_t *gid, pid_t *pid)` to
 `src/libipc/ipc.[ch]`: `SO_PEERCRED` on Linux, `getpeereid()` on macOS and
@@ -1245,7 +1320,7 @@ Done when: `test_ipc` covers both socket kinds and the unsupported path.
 
 ---
 
-**Step 2. Harden the runtime directory and socket modes.**
+**Step 2. Harden the runtime directory and socket modes. (DONE)**
 
 `ipc_socket_dir()` and `sessdir_base()` both `mkdir(path, 0700)` and continue
 on `EEXIST`, which another local user can pre-create under a world-writable
@@ -1264,7 +1339,7 @@ Done when: no code path uses a runtime directory it has not validated.
 
 ---
 
-**Step 3. mserver client table, still single client.**
+**Step 3. mserver client table, still single client. (DONE)**
 
 Pure refactor of `src/cmd/mserver/mserver.c`. Replace the `client_fd`,
 `outq*`, and `output_paused` globals with `struct mclient` and a
@@ -1278,7 +1353,7 @@ cycle shows no regression. No protocol change, no new tests.
 
 ---
 
-**Step 4. Fan-out.**
+**Step 4. Fan-out. (DONE)**
 
 Raise `MCLIENT_MAX` to 8. `on_new_client()` appends rather than replacing.
 OUTPUT, PTY\_FLAGS, and title updates broadcast; ATTACH\_REPLY and the
@@ -1306,7 +1381,7 @@ Input from both still reaches the PTY, which is the wrong behavior and step
 
 ---
 
-**Step 5. Attach handshake.**
+**Step 5. Attach handshake. (DONE)**
 
 Add `IpcAttach` and `IpcAttachReply` to `src/libipc/lumi.idl` with tags 1
 and 2 identical to `IpcSize`, run `make gen-ipc-msg`, review the generated
@@ -1326,7 +1401,7 @@ by hand against the previous build.
 
 ---
 
-**Step 6. Role enforcement and the read-only client.**
+**Step 6. Role enforcement and the read-only client. (DONE)**
 
 The mserver grants `WRITE` to the first connection that asks and `VIEW` to
 every later one, and rejects `INPUT`, `WIN_RESIZE`, `KILL`, `FLOW_CTRL`, and
@@ -1345,7 +1420,7 @@ cannot type into it. This is the first genuinely useful milestone.
 
 ---
 
-**Step 7. Session control: token and roster.**
+**Step 7. Session control: token and roster. (DONE)**
 
 New `src/libsessdir/sessdir_control.[ch]`: acquire and release the
 `control.lock` flock, write and read `control.req`, register and enumerate
@@ -1364,7 +1439,7 @@ window in the session, and killing it lets the other take over.
 
 ---
 
-**Step 8. `lumi share` and the share overlay.**
+**Step 8. `lumi share` and the share overlay. (DONE)**
 
 New `src/cmd/share/share.c` with `-l`, `-g`, `-t`, `-k`, `-L`, registered in
 `multicall.c` and a `module.mk`. Add `KEYS_ACTION_SHARE_MENU` to
@@ -1381,7 +1456,7 @@ either the subcommand or the overlay.
 
 ---
 
-**Step 9. Notices and the presence indicator.**
+**Step 9. Notices and the presence indicator. (DONE)**
 
 `CLIENT_EVENT` fan-out on join, leave, role change, and kick. In the attach
 client, a transient notice for every event, to every client. In
@@ -1400,7 +1475,7 @@ Done when: no client can be attached without every other client showing it.
 
 ---
 
-**Step 10. Mirror coupling and size negotiation.**
+**Step 10. Mirror coupling and size negotiation. (DONE)**
 
 Two independent changes, one commit each.
 
@@ -1460,7 +1535,7 @@ subject to the role rules from step 6.
 
 ---
 
-**Step 12. Cross-user access: ACL, broker, prompt, audit.**
+**Step 12. Cross-user access: ACL, broker, prompt, audit. (DONE)**
 
 Split into sub-steps, one commit each, matching the size of step 10's
 12A/12B split.
@@ -1635,7 +1710,7 @@ belongs with whatever step first needs to hand out a view-only key (most
 likely 12-d or a follow-up once pending clients exist to make the
 distinction matter).
 
-**Step 12. Pending clients, the indicator, and the audit trail end to end.**
+**Step 12. Pending clients, the indicator, and the audit trail end to end. (DONE)**
 
 Split into sub-steps, one commit each, for the same reason 12-a/b/c were:
 this bundles several independent pieces (roster visibility, live
@@ -1915,7 +1990,7 @@ moment the ACL changes.
 
 ---
 
-**Step 13. Multi-writer (12B).**
+**Step 13. Multi-writer (12B). (DONE)**
 
 Split into sub-steps, one commit each, for the same reason 12-d was: this
 bundles several independent pieces (mode setting, input atomicity, size,
@@ -2236,28 +2311,40 @@ than trusting a first-pass draft.
 
 ### Open Questions
 
-- **Bell and OSC.** A bell should reach every client. Clipboard sync
-  (OSC 52) from the application is arguably writer-only, since a viewer
-  probably does not want its clipboard replaced.
-- **Host title.** Should a mirroring viewer also set its terminal title from
-  the session, or keep its own?
+- **Bell and OSC.** A bell reaches every client (resolved): each client
+  parses the window's output itself, and libvt hands BEL to the attach
+  client, which rings the outer terminal when the window is on screen and
+  shows a "bell in window N" notice when it is hidden. Clipboard sync
+  (OSC 52) from the application is writer-only (resolved): a viewer does
+  not want its clipboard replaced by what someone else copied, so the
+  attach client forwards OSC 52 to its terminal only while it holds the
+  keyboard (`osc_passthru` in `attach.c`). Notifications still reach every
+  client, since they are about the session rather than one person's
+  copy.
+- **Host title.** Decided (2026-10-06): a viewer sets the session title
+  like the writer, with a " [viewing]" suffix so its role is visible at a
+  glance. Built: `sync_host_title` in `attach.c` adds the suffix for a
+  view-role client and the title is resynced when the keyboard moves.
 - **`lumi kill` from a viewer.** Denied by role enforcement, but the error
   needs a clear message rather than silence.
 - **Roster identity.** `user@host` is fine locally. For netchan clients the
   keystore key name is the more honest identifier.
-- **Pending clients in the indicator.** Counting a pending client in the
-  presence indicator tells the owner someone is knocking, which is useful,
-  but it also lets any local user make a mark appear on the owner's status
-  line. The rate limit bounds the nuisance; whether pending clients are
-  counted separately or not at all is worth deciding with the UI in front of
-  us.
-- **Cross-user without a shared group.** The 0666 broker endpoint is safe
-  under the credential check but still connectable by any local user. An
-  alternative is passing the connected fd over an existing channel, which
-  avoids a public endpoint entirely but requires a channel to already exist.
-- **Owner definition.** The uid that created the session, or the uid the
-  mservers run as? They are the same today. Writing it down now avoids a
-  subtle divergence later.
+- **Pending clients in the indicator.** Decided (2026-10-06): counted
+  separately, as their own figure in the presence indicator, so the owner
+  sees a knock without mistaking it for an admitted viewer; the rate limit
+  bounds the nuisance of a local user making the mark appear. Built: a
+  pending client is counted in neither figure, `%p` is its count, and the
+  default format ends in `%P`, which reads `+N?` only when N is non-zero.
+- **Cross-user without a shared group.** Decided (2026-10-06): keep the
+  credential-checked 0666 broker endpoint, created only when the owner
+  opts in with `lumi share -u` or `-G`; an unshared session has no
+  reachable endpoint at all. Passing a connected fd over an existing
+  channel is not pursued. This matches the code as it stands.
+- **Owner definition.** Decided (2026-10-06): the owner is the uid the
+  mservers run as. It follows the processes that hold the ptys and is
+  checkable from socket peer credentials at any time. The ACL already
+  evaluates `owner` against the broker's own uid (`getuid()` in
+  `proxy.c`), which `lumi share` runs as that user.
 
 ---
 
@@ -2411,8 +2498,8 @@ later: mutating ops in the browser, behind confirm
   (capped at 100 KB, best effort); the reverse direction is covered by
   bracketed paste, so no OSC 52 read is needed. Inside a session the attach
   client forwards a window's OSC 52 set-clipboard request out to the outer
-  terminal (in osc_passthru, next to the OSC 9/99/777 notification and OSC
-  10/11 color forwarding), so an in-session copy reaches the real system
+  terminal (in osc_passthru, next to the OSC 9/99/777 notification
+  forwarding), so an in-session copy reaches the real system
   clipboard; read requests are dropped. The VT parser's OSC buffer now grows
   on demand (like its DCS buffer) up to a 256 KB cap, so it forwards
   clipboards of roughly 190 KB rather than truncating at the old fixed 4 KB;
@@ -2586,7 +2673,7 @@ later: mutating ops in the browser, behind confirm
 
 ---
 
-## vi Keybindings in `lumi edit` (IN PROGRESS)
+## vi Keybindings in `lumi edit` (DEFERRED)
 
 **Goal:** grow the modeless `lumi edit` into a vi/nvi/elvis/vim-style modal
 editor, in increments. The buffer engine (`libtext`) and rendering are
@@ -2638,8 +2725,8 @@ status/cursor), `src/libtext/text.c` and `text.h` (undo groups),
   `c(`). The backward sentence walks forward from at most a paragraph earlier
   and keeps the last start before the cursor, which handles crossing a blank
   line. These are charwise-exclusive motions; the vim rule that promotes an
-  exclusive motion ending at column 0 to linewise is not yet implemented, so
-  `d}` can leave one blank line where vim leaves the paragraph gap.
+  exclusive motion ending at column 0 to linewise landed later in roadmap
+  item V7, so `d}` now deletes whole lines as vim does.
 
 **Increment 4 (DONE).** The `%` match-pair motion.
 
@@ -2647,8 +2734,9 @@ status/cursor), `src/libtext/text.c` and `text.h` (undo groups),
   and scanning across lines. When the cursor is not on a bracket it uses the
   first one at or after the cursor on the line. It is an inclusive motion, so
   `d%` covers through the match, and `d%` from before a bracket deletes from
-  the cursor through the match. The count prefix is ignored (vi's `N%`
-  go-to-percentage variant is deferred). Helpers `vi_bracket_info` and
+  the cursor through the match. The count prefix was ignored at first; the
+  `N%` go-to-percentage variant landed in roadmap item V7. Helpers
+  `vi_bracket_info` and
   `vi_match_pair` in `edit.c`.
 
 **Increment 5 (DONE).** The `H`, `M`, `L` window motions.
@@ -2866,20 +2954,17 @@ status/cursor), `src/libtext/text.c` and `text.h` (undo groups),
 - Embedded JS/CSS highlighting inside HTML `<script>`/`<style>`.
 - A runtime loader that builds `struct syntax` from files (the "loader later"
   half of the format decision).
-- Function-call and matched-bracket highlighting; theme-driven palette.
-- Backward search `?` and reverse repeat `N`; search offsets; `*`/`#`.
-- Text objects (`iw`, `aw`, `i(`, `i"`, ...).
-- The exclusive-to-linewise motion promotion (affects `d}`, `d{`).
-- The `N%` go-to-percentage variant of `%`.
-- The `.` repeat register, named registers (`"a`), and marks (`m`, backtick).
-- Visual mode: `v` charwise and `V` linewise are done (see roadmap V1).
-  Blockwise `Ctrl-V` (rectangular selection and block operators) remains.
-- `r`, `R` (replace), `~`, `J` (join), `>>`/`<<` (shift), `s`/`S`, `D`/`C`.
-- A richer ex line: ranges, `:s///`, `:g`, `:%`, `:e`, `:r`, settings.
-- Line-preserving column memory for `j`/`k`, and `count` with `G`/`gg` edge
-  cases.
-- Extract the vi section to its own file (DONE): it now lives in
-  `src/cmd/edit/vi.c` behind the shared `editor.h`. See roadmap item F2.
+- Function-call and matched-bracket highlighting. (The chrome and syntax
+  palettes are now theme-driven; see roadmap items C1 and C1b.)
+- Blockwise `Ctrl-V` (rectangular selection and block operators). Charwise
+  `v` and linewise `V` shipped in roadmap item V1.
+- `:set`; deferred until the editor has more to set (roadmap item V6).
+
+Everything else once listed here has shipped and is recorded under the
+roadmap items V2 through V7 and F2 below: backward search and `*`/`#`,
+text objects, the `.` register, named registers and marks, the
+exclusive-to-linewise promotion, `N%`, the replace/join/shift operators,
+the ranged ex line, column memory for `j`/`k`, and the `vi.c` split.
 
 ## DOS EDIT-style Chrome in `lumi edit` (DONE)
 
@@ -3113,9 +3198,13 @@ roadmap's Build integration section), and B2 opens cross-file diagnostics.
 open the editor in a side pane and keep the REPL alive. The spawn-and-run loop
 covers the practical case without that rearchitecture.
 
-## `lumi edit` Remaining-Work Roadmap (SCOPED)
+## `lumi edit` Remaining-Work Roadmap (DEFERRED)
 
-**Status:** In progress. F1 (the test harness) has landed; the rest is open.
+**Status:** Deferred as of October 2026. All editor work (`lumi edit`,
+its vi personality, syntax highlighting, chrome, and the hex view) is on
+hold for the foreseeable future; do not pick items from this section as
+next work. F1 through F4, V1 through V7, B1, B2, C1, C1b, and H1 through
+H5 landed before the pause; what is listed as open below stays open.
 This consolidates the open work for the editor, which the sections above
 record in scattered deferred notes, into one ordered plan. The individual
 sections stay the source of detail; this is the map and the priority. Two of
@@ -3256,7 +3345,7 @@ All are recorded by `.`. The shift operators are handled inside
 a selection are still not done and are swallowed so they cannot fire the
 normal-mode command mid-selection. Eighteen test_edit cases cover V4.
 
-**V5 (DONE, except offsets).** Search completion.
+**V5 (DONE).** Search completion.
 
 - `?` searches backward and `/` forward; both share the direction state
   `vi_search_dir`. `do_find` was generalized to `do_find_dir(e, q, dir)`,
@@ -3268,9 +3357,16 @@ normal-mode command mid-selection. Eighteen test_edit cases cover V4.
   no regex or word boundaries.
 
 Five test_edit cases cover backward search, its wrap, `*`, `#`, and `N`.
-Search offsets (`/pat/e`, `/pat/+2`) are not done; they need the search
-to carry a post-match adjustment, which the plain-substring engine does
-not model yet.
+Search offsets landed later: `/pat/e`, `/pat/e+2`, `/pat/s-1` (`b` for
+`s`), and the line forms `/pat/+3` / `?pat?-1`, parsed by `vi_search_cmd`
+from the text after a second delimiter (`\/` escapes one in the pattern,
+and an empty pattern reuses the last). The offset is kept with the search
+so `n`/`N` apply it. Because an offset can leave the cursor before its
+own match, where a repeat would find the same match forever, the match
+start and the landing place are both remembered and a repeat that starts
+from the landing place resumes from the match start (`vi_search_run`).
+Four more test_edit cases cover the end, start, and line offsets, the
+repeat behaviour, reuse, escaping, and a rejected offset.
 
 **V6 (DONE, except `:e`/`:r` and `:set`).** A richer ex line.
 
@@ -3561,10 +3657,12 @@ its keys.
 
 ### Suggested order
 
-F1 (tests) -> F2 (`vi.c` split) -> V1 (visual mode) -> V2/V3 (text objects,
-registers) alongside B1 (async build) -> F3 (multi-buffer) -> B2 and the ex
-`:e`/`:r` work -> the remaining vi, syntax, and chrome refinements, then the
-hex editor mode, as they are wanted.
+The original order (F1 -> F2 -> V1 -> V2/V3 with B1 -> F3 -> B2 and the ex
+`:e`/`:r` work -> hex editor mode) has run to completion. Editor work is
+deferred (see the status above). If it resumes, the remaining items in the
+order they are likely to be wanted: blockwise `Ctrl-V`, the syntax
+highlighting refinements above, then `:set` once the editor has settings
+worth exposing.
 
 ## Rendering / Drawing Abstraction
 

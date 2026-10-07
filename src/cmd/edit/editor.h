@@ -110,6 +110,13 @@ struct editor {
 	int		clip_linewise;	/* clip holds whole lines (vi p/P) */
 	char		last_find[256];	/* last search string, for repeat */
 	int		vi_search_dir;	/* last search direction: 1 fwd, -1 back */
+	int		vi_off_kind;	/* search offset: 0 none, l lines, e end, s start */
+	long		vi_off_n;	/* the offset's signed count */
+	int		vi_match_valid;	/* the match and landing fields are current */
+	size_t		vi_match_cy;	/* where the last match starts */
+	size_t		vi_match_cx;
+	size_t		vi_placed_cy;	/* where the offset then put the cursor */
+	size_t		vi_placed_cx;
 	int		vi_want_col;	/* display column j/k aim for (INT_MAX=EOL) */
 	int		vi_vert_run;	/* this command was a vertical j/k/$ move */
 	int		vi_vert_prev;	/* the previous command was one */
@@ -192,7 +199,7 @@ void do_newline(struct editor *e);
 void do_delete(struct editor *e);
 void do_backspace(struct editor *e);
 void do_find(struct editor *e, const char *q);
-void do_find_dir(struct editor *e, const char *q, int dir);
+int do_find_dir(struct editor *e, const char *q, int dir);
 
 /* Multi-buffer management (edit.c). The active buffer's per-file state lives
  * in the flat struct editor; these swap it with the saved buffers. */
@@ -236,6 +243,8 @@ void hex_inspect_line(char *out, size_t out_sz, const unsigned char *b,
 enum req vi_dispatch(struct editor *e, const struct tkbd_seq *seq);
 enum req vi_colon(struct editor *e);
 void vi_search(struct editor *e);
+int vi_search_cmd(struct editor *e, const char *typed, int dir);
+void vi_search_run(struct editor *e, const char *q, int dir);
 void vi_clamp(struct editor *e);
 void vi_reset_pending(struct editor *e);
 size_t vi_col_to_byte(struct editor *e, size_t y, int target_col);

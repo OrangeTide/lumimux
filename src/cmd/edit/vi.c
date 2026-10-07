@@ -1902,6 +1902,173 @@ vi_do_replace(struct editor *e, uint32_t ch)
 	return REQ_CONTINUE;
 }
 
+/* ---- search offsets ----
+ *
+ * A vi search may carry an offset after a second delimiter: "/pat/e" lands
+ * on the last character of the match, "/pat/e+2" and "/pat/s-1" shift from
+ * the match's end or start by that many characters (within the line), and
+ * "/pat/+3" or "/pat/-1" move that many whole lines and rest in column 0.
+ * The offset is kept with the search so n and N apply it again.
+ *
+ * An offset can leave the cursor before the match it came from, where the
+ * next n would find the same match forever, so the match start and the
+ * offset's landing place are both remembered: a repeat that starts from
+ * the landing place searches from the match start instead. */
+
+/* Parse a search offset. Returns 0 and fills kind/n, or -1 when malformed. */
+static int
+vi_offset_parse(const char *s, int *kind, long *n)
+{
+	char *end;
+
+	*kind = 0;
+	*n = 0;
+	if (!s[0])
+		return 0;
+	if (s[0] == 'e' || s[0] == 's' || s[0] == 'b') {
+		*kind = (s[0] == 'e') ? 'e' : 's';
+		s++;
+		if (!s[0])
+			return 0;
+		if (s[0] != '+' && s[0] != '-')
+			return -1;
+		if (!s[1]) {			/* a bare sign means one */
+			*n = (s[0] == '-') ? -1 : 1;
+			return 0;
+		}
+	} else {
+		*kind = 'l';
+		if (s[0] != '+' && s[0] != '-' && !(s[0] >= '0' && s[0] <= '9'))
+			return -1;
+		if ((s[0] == '+' || s[0] == '-') && !s[1]) {
+			*n = (s[0] == '-') ? -1 : 1;
+			return 0;
+		}
+	}
+	*n = strtol(s, &end, 10);
+	return *end ? -1 : 0;
+}
+
+/* Move cx by n characters along line y, stopping at either end. */
+static size_t
+vi_shift_chars(struct editor *e, size_t y, size_t cx, long n)
+{
+	size_t len = 0;
+	const char *s = text_line(e->t, y, &len);
+
+	if (!s)
+		return 0;
+	while (n > 0 && cx < len) {
+		cx += rune_len_at(s, len, cx);
+		n--;
+	}
+	while (n < 0 && cx > 0) {
+		cx -= prev_rune_len(s, cx);
+		n++;
+	}
+	return cx;
+}
+
+/* Apply the remembered offset to a match of q starting at the cursor. */
+static void
+vi_offset_apply(struct editor *e, const char *q)
+{
+	size_t nlines = text_lines(e->t);
+
+	switch (e->vi_off_kind) {
+	case 'l':
+		if (e->vi_off_n < 0 && (size_t)-e->vi_off_n > e->cy)
+			e->cy = 0;
+		else if (e->vi_off_n > 0 &&
+		    (size_t)e->vi_off_n >= nlines - e->cy)
+			e->cy = nlines - 1;
+		else
+			e->cy = (size_t)((long)e->cy + e->vi_off_n);
+		e->cx = 0;
+		break;
+	case 'e': {
+		size_t len = 0;
+		const char *s = text_line(e->t, e->cy, &len);
+		size_t end = e->cx + strlen(q);
+
+		if (s && end > e->cx)
+			e->cx = end - prev_rune_len(s, end);
+		e->cx = vi_shift_chars(e, e->cy, e->cx, e->vi_off_n);
+		break;
+	}
+	case 's':
+		e->cx = vi_shift_chars(e, e->cy, e->cx, e->vi_off_n);
+		break;
+	}
+}
+
+/* Search for q in direction dir and apply the current offset. */
+void
+vi_search_run(struct editor *e, const char *q, int dir)
+{
+	/* repeating from where the offset left us: resume from the match */
+	if (e->vi_match_valid && e->cy == e->vi_placed_cy &&
+	    e->cx == e->vi_placed_cx) {
+		e->cy = e->vi_match_cy;
+		e->cx = e->vi_match_cx;
+	}
+	if (!do_find_dir(e, q, dir)) {
+		e->vi_match_valid = 0;
+		vi_clamp(e);
+		return;
+	}
+	e->vi_match_cy = e->cy;
+	e->vi_match_cx = e->cx;
+	vi_offset_apply(e, q);
+	vi_clamp(e);
+	e->vi_placed_cy = e->cy;
+	e->vi_placed_cx = e->cx;
+	e->vi_match_valid = 1;
+}
+
+/* Run a typed search line, "pat", "pat/off", or "/off" (reusing the last
+ * pattern), where the delimiter is '/' forward and '?' backward and may be
+ * escaped inside the pattern. Returns 0, or -1 for a bad offset. */
+int
+vi_search_cmd(struct editor *e, const char *typed, int dir)
+{
+	char delim = dir < 0 ? '?' : '/';
+	char pat[256];
+	const char *off = "";
+	size_t i, o = 0;
+	int kind;
+	long n;
+
+	for (i = 0; typed[i] && o < sizeof(pat) - 1; i++) {
+		if (typed[i] == '\\' && typed[i + 1] == delim) {
+			pat[o++] = delim;
+			i++;
+		} else if (typed[i] == delim) {
+			off = typed + i + 1;
+			break;
+		} else {
+			pat[o++] = typed[i];
+		}
+	}
+	pat[o] = '\0';
+	if (vi_offset_parse(off, &kind, &n) < 0) {
+		snprintf(e->status, sizeof(e->status),
+		    "bad search offset: %.40s", off);
+		return -1;
+	}
+	if (pat[0])
+		snprintf(e->last_find, sizeof(e->last_find), "%s", pat);
+	else if (!e->last_find[0]) {
+		snprintf(e->status, sizeof(e->status), "no previous search");
+		return -1;
+	}
+	e->vi_off_kind = kind;
+	e->vi_off_n = n;
+	e->vi_search_dir = dir;
+	vi_search_run(e, e->last_find, dir);
+	return 0;
+}
+
 /* Search for the word under (or next on the line after) the cursor, in
  * direction dir (the vi '*' and '#'). The word is matched as a plain
  * substring; there are no word boundaries, so it also matches inside longer
@@ -1956,8 +2123,11 @@ vi_search_word(struct editor *e, int dir)
 	word[wl] = '\0';
 	snprintf(e->last_find, sizeof(e->last_find), "%s", word);
 	e->vi_search_dir = dir;
+	e->vi_off_kind = 0;			/* a word search has no offset */
+	e->vi_off_n = 0;
+	e->vi_match_valid = 0;
 	e->cx = start;				/* search from the word start */
-	do_find_dir(e, word, dir);
+	vi_search_run(e, word, dir);
 }
 
 static void vi_dot_replay(struct editor *e);
@@ -2401,7 +2571,7 @@ vi_normal_key(struct editor *e, const struct tkbd_seq *seq)
 			dir = -dir;
 		vi_reset_pending(e);
 		if (e->last_find[0])
-			do_find_dir(e, e->last_find, dir);
+			vi_search_run(e, e->last_find, dir);
 		else
 			snprintf(e->status, sizeof(e->status),
 			    "no previous search");
@@ -3556,7 +3726,8 @@ vi_colon(struct editor *e)
 	return vi_ex_exec(e, buf);
 }
 
-/* Read a vi '/' search pattern and jump to the next match. */
+/* Read a vi '/' or '?' search line, with an optional offset after a
+ * second delimiter, and jump to the match. */
 void
 vi_search(struct editor *e)
 {
@@ -3568,7 +3739,6 @@ vi_search(struct editor *e)
 		snprintf(e->status, sizeof(e->status), "search cancelled");
 		return;
 	}
-	snprintf(e->last_find, sizeof(e->last_find), "%s", q);
-	do_find_dir(e, q, dir);
+	vi_search_cmd(e, q, dir);
 }
 

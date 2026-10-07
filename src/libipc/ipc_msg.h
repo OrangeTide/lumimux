@@ -124,6 +124,12 @@
 /* 0x02xx: window / PTY management */
 #define IPC_MSG_PTY_FLAGS	0x0201	/* server -> client: PTY flags (1 byte) */
 #define IPC_MSG_WIN_RESIZE	0x0207	/* client -> server: resize PTY */
+#define IPC_MSG_TERM_COLORS	0x0208	/* client -> server: the hosting
+					 * terminal's default colors, two
+					 * NUL-terminated X11 color specs,
+					 * fg then bg, "" for unknown. The
+					 * window's VT answers OSC 10/11
+					 * queries from them. */
 
 /* IPC_MSG_PTY_FLAGS payload: single byte, bitmask */
 #define IPC_PTY_ECHO		0x01	/* PTY has ECHO enabled */

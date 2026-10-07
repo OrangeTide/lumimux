@@ -1,11 +1,13 @@
 # Drawing Abstraction (libdraw) Design
 
-Status: roadmap steps 1 through 3 have landed. libdraw (the surface, event
-queue, and a mock driver) and libdraw_term (the terminal driver) exist with a
-mock-driven test suite, and all three standalone apps (`edit`, `files`, and
-`splash`) are ported onto the surface. The remaining steps (the pad-stack
-migration and a graphical backend) are design only, and this document is the
-plan of record for that work.
+Status: roadmap steps 1 through 3a have landed. libdraw (the surface, event
+queue, and a mock driver) and libdraw_term (the terminal driver) exist with
+test_draw and test_draw_term suites, and all three standalone apps (`edit`,
+`files`, and `splash`) are ported onto the surface. Step 3a consolidated signal
+handling into libdraw_term. Step 4 is partial: src/libtui_draw implements a
+tui_backend on a draw surface with a test_tui_draw suite, but attach's overlays
+still use tui_term_new(). The pad-stack migration and graphical backend remain
+design only, recorded in this document for later implementation.
 
 ## Motivation
 
@@ -17,14 +19,15 @@ and the same SGR-building logic is duplicated three times. The paths are:
   for the attach main pane. It builds escapes and writes them through `libtio`.
 - `libtui_term` (`src/libtui_term/tui_term.c`): the one concrete backend behind
   `struct tui_backend`. It turns cells into escapes (cell plus flush).
-- `libtui/tui_out` (`src/libtui/tui_out.c`): a frame buffer with escape helpers
-  used by the standalone full-screen subcommands (`edit`, `files`, `splash`).
-  Callers still pass raw escape strings through `tui_out_puts`.
+  Used by attach overlays; no longer used by edit, files, or splash.
+- `libtui/tui_out` (`src/libtui/tui_out.c`): a frame buffer with escape
+  helpers. `edit` and `files` still call its `tui_out_field` for
+  display-width-clipped text, but no app writes escapes through it any
+  more.
 
-Apps also inline escapes directly. `edit` has a `syn_sgr[]` palette and reverse
-video literals; `picker.c` builds its taskbar from literal SGR strings; alt
-screen, cursor shape, and OSC control strings are scattered across `attach`,
-`edit`, and `files`.
+Only attach inlines escapes directly now. The picker.c in attach builds its
+taskbar from literal SGR strings; alt screen, cursor shape, and OSC control
+strings remain in attach's overlay code.
 
 Three near-identical SGR emitters exist because `libtxl` deliberately keeps SGR
 out of the capability layer (each renderer must track incremental SGR state).
@@ -245,19 +248,19 @@ The first concrete driver, built entirely from existing libraries:
   of it (`tio_restore`, RMCUP, paste and mouse off). These are the sequences
   `edit` and `files` inline today, and both run again across a SIGTSTP suspend
   and resume, so an app never touches raw mode or these escapes directly.
-- `size` uses one shared `TIOCGWINSZ` helper. The ioctl is currently inlined in
-  about a dozen places; the driver is a good home for a single copy.
+- `size` uses one shared `TIOCGWINSZ` helper. The ioctl appears in several attach
+  files plus draw_term.c; the driver consolidates this into one canonical copy.
 - `present` forwards `f->cells` straight to `render_cells_diff`
   (`src/librender/render.h`) with no copy, because the surface stores its grid
   as the same flat `struct vt_cell` array `render` consumes, and passes
   `f->row_dirty` as `render`'s existing dirty hint. The diff engine and its one
   shadow buffer are reused, not rewritten; `present` is close to a one-line
   forward.
-- `set_clipboard` emits OSC 52, as `edit`'s `clip_osc52` and `selection.c` do.
+- `set_clipboard` emits OSC 52, as `edit`'s `clip_osc52` and `selection.c` did.
 - `poll` reads the fd and runs `tkbd_drain` (`src/libtermlib/tkbd.h`),
   dispatching each decoded `tkbd_seq`.
-- `set_title` (OSC 2) and `bell` (BEL) are trivial to add when the first app
-  needs them; the terminal driver leaves those slots NULL until then.
+- `set_title` (OSC 2) and `bell` (BEL) are implemented as term_set_title and
+  term_bell in draw_term.c. No app calls them yet.
 - Color down-conversion (RGB to 256 to 16) is a driver concern, but the reused
   renderer currently emits truecolor SGR directly (as it does for attach), so
   the terminal driver forwards `vt_color` values unchanged for now. Down-
@@ -265,17 +268,20 @@ The first concrete driver, built entirely from existing libraries:
   (`txl_has_rgb`, `txl_colors`), deferred so it lands once for both this driver
   and attach.
 
-A trivial mock or capture driver, mirroring the `mock_backend` in
-`src/libtui/test_tui.c`, records `present` cells for headless tests. It proves
-the seam is swappable and is what the eventual `test_draw` suite drives.
+A mock driver in src/libdraw/test_draw.c records `present` cells for headless
+tests. It proves the seam is swappable. test_draw and test_draw_term are the
+test suites driven by this mock.
 
-## Out of scope
+## Out of scope (as of this phase)
 
-- No implementation. This phase produces this document only.
+- The pad-stack migration and graphical backend. Steps 4 and 5 remain design
+  only, recorded here for future implementation.
 - The attach compositor keeps its `librender` fast path. It is not ported. The
   terminal driver reuses `librender`, so no rendering logic is duplicated.
 - The overlay pad stack and `struct tui_backend` stay as they are. A later step
-  re-expresses them in terms of `draw_driver`.
+  re-expresses them in terms of `draw_driver`. libtui_draw implements the
+  backend on a draw surface with test_tui_draw, but attach has not yet migrated
+  from tui_term_new.
 - No graphical backend is written. Only the seam is defined so one can be added.
 - Terminal-only protocol (graphics passthrough, keyboard protocol) has no ported
   consumer, so the `draw_raw` hatch and a capabilities query are deferred until
@@ -283,11 +289,11 @@ the seam is swappable and is what the eventual `test_draw` suite drives.
 
 ## Adoption roadmap
 
-Steps 1 and 2 have landed; the rest is documented for later.
+Steps 1 through 3a have landed; steps 4 and 5 remain design only.
 
 1. (Done) Land `libdraw` (surface, width logic, mock driver) and `libdraw_term`
-   (the terminal driver wrapping `librender`, `libtxl`, and `libtio`) with a
-   `test_draw` suite driven by the mock driver.
+   (the terminal driver wrapping `librender`, `libtxl`, and `libtio`) with
+   test_draw and test_draw_term suites driven by the mock driver.
 2. (Done) Port `edit`: `syn_sgr[]` became `vt_color` and attrs on `draw_cell`;
    reverse video became `VT_ATTR_REVERSE`; DECSCUSR became `draw_cursor_shape`;
    raw mode, alt screen, and paste became `draw_begin` and `draw_end`; OSC 52
@@ -308,13 +314,15 @@ Steps 1 and 2 have landed; the rest is documented for later.
    all of their per-app signal code, including `edit`'s earlier SIGTSTP one-off.
    Raw mode disables the terminal's own Ctrl-Z (it is a key), so the driver's
    SIGTSTP is one from job control or an explicit `kill -TSTP`.
-4. Re-express the pad-stack `tui_backend` on top of `draw_driver`, then migrate
-   attach's overlay apps. Note the model shift: `tui_backend` is per-cell
-   (`cell` called for each changed cell), while `draw_driver` is per-frame, so
-   the pad stack composites into a `draw` surface's grid and then calls
-   `draw_present`, rather than emitting cell by cell.
-5. Future: a graphical driver that implements `draw_driver` and synthesizes
-   `tkbd_seq`.
+4. (Design only) Re-express the pad-stack `tui_backend` on top of `draw_driver`,
+   then migrate attach's overlay apps. libtui_draw implements the backend on a
+   draw surface with test_tui_draw, but attach still uses tui_term_new. Note
+   the model shift: `tui_backend` is per-cell (`cell` called for each changed
+   cell), while `draw_driver` is per-frame, so the pad stack composites into a
+   `draw` surface's grid and then calls `draw_present`, rather than emitting
+   cell by cell.
+5. (Design only) Future: a graphical driver that implements `draw_driver` and
+   synthesizes `tkbd_seq`.
 
 ## Mapping from current escapes to libdraw
 

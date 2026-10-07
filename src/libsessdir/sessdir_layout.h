@@ -10,26 +10,38 @@
 /*
  * Layout file: <session>/layout  (dotenv format)
  *
- * Turbo mode stores per-window geometry keyed by window-order index:
+ * Turbo mode stores per-window geometry keyed by stable window number:
  *
  *   MODE=turbo
+ *   VERSION=2
  *   FOCUS=0
  *   WIN_0="2 2 40 12"
- *   WIN_1="4 3 40 12"
+ *   WIN_3="4 3 40 12"
  *
  * Screen mode stores the split tree as a preorder traversal:
  *
  *   MODE=screen
+ *   VERSION=2
  *   FOCUS=0
- *   TREE="v128 h128 0 1 2"
+ *   TREE="v128 h128 0 1 3"
  *
  * Tree tokens:  v<pos> = vertical split (split_pos/256)
  *               h<pos> = horizontal split
- *               <N>    = leaf with window-order index N
+ *               <N>    = leaf showing window number N
  *
- * Window-order indices correspond to WINDOW_ORDER in the state file.
- * PIDs change across restarts; indices provide a stable mapping.
+ * Window numbers are the stable, user-visible numbers the tab bar shows,
+ * the slot indices of WINDOW_NUMS in the state file. A number stays with
+ * its window for the window's whole life and is never reassigned when
+ * other windows close, so a saved layout keeps pointing at the windows it
+ * described however the window set changes in between; a number whose
+ * window has exited simply fails to resolve. (Version 1 files keyed
+ * panes by position in WINDOW_ORDER, which another file owns and which
+ * shifts when a window closes, so a pane could silently repoint at a
+ * different window or at none. They carry no VERSION line and are
+ * ignored.)
  */
+
+#define SESSDIR_LAYOUT_VERSION	2
 
 #define SESSDIR_LAYOUT_MAX_WINS	32
 
@@ -41,9 +53,10 @@ struct sessdir_turbo_win {
 };
 
 struct sessdir_turbo_layout {
-	int				focus;	/* window-order index, or -1 */
+	int				focus;	/* window number, or -1 */
 	struct sessdir_turbo_win	wins[SESSDIR_LAYOUT_MAX_WINS];
-	int				nwins;
+						/* indexed by window number */
+	int				nwins;	/* one past the highest valid slot */
 };
 
 /* ---- screen layout (split tree) ---- */
@@ -57,12 +70,12 @@ enum sessdir_tree_type {
 struct sessdir_tree_node {
 	enum sessdir_tree_type	type;
 	int			split_pos;	/* numerator/256 for splits */
-	int			win_index;	/* window-order index for leaves */
+	int			win_num;	/* window number for leaves */
 	struct sessdir_tree_node *a, *b;	/* children for splits */
 };
 
 struct sessdir_screen_layout {
-	int				focus;	/* window-order index, or -1 */
+	int				focus;	/* window number, or -1 */
 	struct sessdir_tree_node	*root;	/* caller must free via
 						   sessdir_tree_free() */
 };
@@ -78,16 +91,18 @@ enum sessdir_layout_mode {
 };
 
 /* probe which mode the layout file contains.
- * returns SESSDIR_LAYOUT_NONE if no file or unrecognized. */
+ * returns SESSDIR_LAYOUT_NONE if no file, unrecognized, or an old version. */
 enum sessdir_layout_mode sessdir_layout_mode(const char *session);
 
 /* ---- load ---- */
 
-/* load turbo layout. returns 0 on success, -1 on error or wrong mode. */
+/* load turbo layout. returns 0 on success, -1 on error, wrong mode, or an
+ * old version. */
 int sessdir_layout_load_turbo(const char *session,
     struct sessdir_turbo_layout *out);
 
-/* load screen layout. returns 0 on success, -1 on error or wrong mode.
+/* load screen layout. returns 0 on success, -1 on error, wrong mode, or an
+ * old version.
  * caller must free out->root via sessdir_tree_free(). */
 int sessdir_layout_load_screen(const char *session,
     struct sessdir_screen_layout *out);

@@ -9,14 +9,13 @@ Status: partially implemented. Anchoring, client and server cursor
 accounting, cell-pixel plumbing, and screen-mode window-switch replay have
 shipped. See "As implemented" for what the code actually does and where it
 diverges from the fuller design below. The rest (the general placement
-table, image-number resolution, animation, turbo-mode clipping) remains
-design only.
+table and animation) remains design only.
 
 ## As implemented
 
-The shipped code follows the design's build order through step 6, but the
-replay is simpler than Strategy A/B describe, because testing turned up a
-fact the design did not account for.
+The shipped code follows the design's build order through step 8. The
+replay is Strategy A for images without an id and Strategy B1 for the rest,
+shaped by a fact the design did not account for.
 
 **ED deletes kitty images.** `render_cells_full` (`src/librender/render.c`)
 emits `\e[H\e[2J` (ED) before redrawing. Kitty ties an image's lifetime to
@@ -29,12 +28,24 @@ after *every* full render, not just on the switch itself.
 
 What exists in `src/cmd/attach/attach.c`:
 
-- **Per-window store.** `struct client_window` carries
-  `struct kgfx_img gfx[KGFX_MAX]` (`KGFX_MAX` = 32, oldest evicted), each
-  entry the raw APC bytes plus the `(row, col)` client cursor cell captured
-  when the command was parsed. This is the step-1 record store from the
-  build order, kept minimal; the general `kgfx_state` placement/xmit tables
-  in the design below were not built.
+- **Per-window store.** `struct client_window` carries a growable array of
+  `struct kgfx_img`, one per graphics command in arrival order: the raw APC
+  bytes, the `(row, col)` client cursor cell captured when the command was
+  parsed, the command's action, `i=` id, `I=` number, and `p=` placement
+  id, and the image group it belongs to. A command joins the group its id
+  or number names (a continuation chunk joins the transmit still open) or
+  starts a new one, so an image's transmit with all its chunks, its `a=f`
+  frames, its `a=a`/`a=c` animation control, and its placements stay
+  together. The store is capped by bytes (`KGFX_STORE_BYTES_MAX`, 16 MiB)
+  and evicts whole groups oldest first, never the newest. A query or delete
+  is kept only until it has been written, so it goes out in order with the
+  commands around it; a delete is applied to the store as it is written
+  (`win_gfx_delete`): a lowercase target drops a placement-only command or
+  marks a transmit-and-display one hidden (replayed as `a=t`), an uppercase
+  one drops the whole group, and targets by cell, column, row, or z-range
+  are passed to the host without touching the store. This replaces the
+  design's general `kgfx_state` placement/xmit tables, which were not
+  built.
 - **Anchoring.** `dcs_passthru` records the command via `win_gfx_add` and
   sets `need_render` instead of writing the image out at parse time.
   `pending_gfx_flush` emits queued images after the cells are drawn, at the
@@ -43,26 +54,64 @@ What exists in `src/cmd/attach/attach.c`:
   the cursor by the image footprint on both the client vt_state and, through
   `window_dcs_account` (`src/libsession/window.c`), the server vt_state.
   Kitty leaves the cursor on the image's *last* row, so the advance is
-  `rows - 1` index calls plus the column move, not `rows`.
+  `rows - 1` index calls plus the column move, not `rows`. The image pixel
+  size comes from `vt_kgfx_image_size`: the `s=`/`v=` keys, or for a PNG
+  sent without them the width and height in the PNG header, decoded from
+  the first bytes of a direct payload or read from the file a `t=f`/`t=t`
+  transfer names. The same helper feeds the turbo crop in `kgfx_emit`. A
+  compressed stream (`o=z`) hides the header and stays unsized.
 - **Cell-pixel plumbing.** The outer cell pixel size is read with
   `TIOCGWINSZ` on the client tty and carried to the server in both
   `ipc_attach` and `ipc_size` (tags 8/9, backward compatible), then set on
   the program's pty via `pty_resize` and stored on the window for
-  server-side accounting.
+  server-side accounting. When the winsize carries no pixel fields the
+  client asks the terminal with CSI 16 t (cell size) and CSI 14 t (text
+  area size) at startup, on a session switch, after roaming, and on
+  SIGWINCH; the reply is pulled off stdin by the same scanner that catches
+  OSC color replies (`term_cell_learn`), and a changed answer is pushed to
+  the mservers as a resize so their ptys carry it too.
 - **Replay.** On a full render, `tiled_render` re-emits the whole visible
   window's store (because ED just wiped it). On a diff render with a window
   change, it deletes all placements and re-queues the incoming window's
-  store. `gfx_shown_win` tracks which window's images are currently up. This
-  is effectively Strategy A (always re-transmit), which is mandatory anyway
-  for icat-style images that carry no id.
+  store. `gfx_shown_win` tracks which window's images are currently up.
+  A switch replays once: it saves the layout, which trips the session
+  directory watch, and the refresh that handles the watch used to force a
+  second full redraw (and so a second replay) although no window had come
+  or gone. `mconn_refresh` now redraws only on a roster change.
+  An image whose host id is known (its own `i=`, or an `I=` number the
+  host's reply resolved) is replayed lazily, Strategy B1 below: only its
+  placements are written again, as `a=p,i=<id>,q=1` without the data,
+  and its transmit, chunks, frames, and animation control are skipped.
+  The `q=1` makes the host answer only if it no longer holds the image;
+  such a re-placement is remembered in a small timed list (`kgfx_lazy`,
+  separate from the program's own pending replies), `stdin_kgfx_reply`
+  matches an error reply against it, marks the image's group `lost`, and
+  the next flush transmits the group in full again, quiet, under the
+  host's id. An image with no id (icat-style output) is always
+  re-transmitted, Strategy A. `attach.graphics-replay = full` turns the
+  lazy path off. A re-transmitted numbered image goes out under `i=<id>`
+  in place of its `I=`, so the host does not mint a second image.
 
 Divergences from the design below, and their reasons:
 
-- No image-id resolution, no `kgfx_state` tables, no Strategy B. The store
-  keys off raw bytes and cursor cell, which is enough for re-transmit replay
-  and needs none of the pending-FIFO / reply-routing machinery.
+- No `kgfx_state` tables. The store keys off raw bytes and cursor cell,
+  which is enough for both replay strategies. Image-number
+  resolution shipped on top of that store rather than the general table:
+  each `kgfx_img` carries the command's `I=` number and its `i=` id, a
+  small FIFO (`kgfx_pend`) remembers which window forwarded each command
+  that expects a reply (`q=` below 2), and the host's reply is picked out
+  of the client's stdin by the same scanner that catches OSC color replies
+  (`stdin_kgfx_reply`). The reply is routed to that window as input, in
+  the APC form the terminal used, and an `i=` it reports for an `I=`
+  number is recorded on the matching store entries. A reply nothing is
+  waiting for is dropped rather than typed into a window. Re-emissions on
+  replay are written with `q=2` substituted into the control section
+  (`kgfx_write_edited`), since the program already had its reply the first
+  time and would take a second one as the answer to its next command.
 - Replay re-emits on every full render, an ED consequence the design's
   switch-hook sketch (replay once, at the tail of the switch) missed.
+- Turbo mode is supported, not a dead end: see "Turbo mode" under the
+  known limits for how the top window's images are offset and cropped.
 
 The known limits below still apply, in particular coordinate drift: the
 stored cell is where the image was drawn, so it is wrong if that window
@@ -157,10 +206,11 @@ because the server does not know the outer terminal's cell pixel size. See
 |---------|--------------------|-----------------------------------------|
 | Minimal / single fullscreen pane | Works today | The existing DCS pass-through covers it. |
 | Screen | Feasible | One full-screen window at a time. Window rect equals host rect, so no clipping is needed. This is the target of this design. |
-| Turbo | Dead end (general case) | Overlapping windows. The protocol has no clip or occlusion primitive, so a window drawn on top cannot punch a hole in an image below. Only a non-overlapping tiled layout could be made to work, by cropping each image to its window rect. |
+| Turbo | Top window only (shipped) | Overlapping windows. The protocol has no occlusion primitive, so a window drawn on top cannot punch a hole in an image below; images are therefore drawn only for the focused window, which is on top, offset to its origin and cropped to its rectangle. |
 
-The rest of this document targets screen mode. Turbo is revisited only at
-the end.
+The rest of this document targets screen mode. Turbo mode reuses the same
+store and replay with an origin offset and a crop; see "Turbo mode" under
+the known limits.
 
 ## The tractable path
 
@@ -676,7 +726,7 @@ kgfx_replay(struct client_window *cw, int fd)
 }
 ```
 
-### Strategy B: trust host persistence, repair lazily
+### Strategy B: trust host persistence, repair lazily (B1 shipped)
 
 Switch out hides placements with lowercase `d=a`, which keeps the stored
 image data. Switch in only re-places, sending the placement with `q=0` so
@@ -840,22 +890,32 @@ Two things follow for this design:
   image id per cell, which the current `vt_cell` cannot hold. That cell
   model extension is the dividing line between "works for static images"
   and "works generally."
-- **Memory.** Cap total `xmit` bytes and evict oldest, evicting whole
-  chunk groups rather than single blocks.
-- **Animation.** `a=f` frames and `a=a`/`a=c` control are stored as raw
-  payload but not modeled, so a static replay shows the last composed
-  frame. Full animation replay needs a frame table.
-- **Turbo mode.** The same tables work, but a placement anchor must be
-  offset by the window origin and the source cropped to the window rect
-  (kitty placement source x/y/w/h). Occlusion by an overlapping window
-  cannot be expressed in the protocol, so replay is meaningful only for the
-  top window. Screen mode is where this design closes.
+- **Memory.** (done) The store is capped by bytes per window and evicts
+  whole image groups, oldest first.
+- **Animation.** (done) An image's `a=f` frames and `a=a`/`a=c` control are
+  kept in its group and replayed in order after the transmit, so the host
+  rebuilds and runs the animation as the program set it up. What is not
+  reproduced is elapsed time: a replay starts the animation from the state
+  the control commands left it in, not from the frame that happened to be
+  showing.
+- **Turbo mode.** (done) The focused window is the one on top, and only its
+  images are shown. `kgfx_emit` offsets the anchor by the window's content
+  origin and crops a display command to the window's content rectangle cut
+  to the screen: the source width/height (`w=`/`h=`, in image pixels) is
+  reduced, scaled proportionally when the image is displayed into `c=`/`r=`
+  cells, and the cell count is reduced alongside. An image whose pixel size
+  cannot be known (a compressed stream without `s=`/`v=`) cannot be
+  cropped and is squeezed into the visible cells with `c=`/`r=` instead.
+  Occlusion by an overlapping window still cannot be expressed in the
+  protocol, which is why only the top window's images are drawn; a move,
+  resize, or focus change is a full redraw and so re-emits the store at the
+  new place.
 
 ## Build order
 
-Steps 1, 2, 4, and 6 have shipped; see "As implemented". Step 3 shipped in
-the minimal form (the step-1 record store), not as the general table. Steps
-5, 7, and 8 remain.
+Steps 1, 2, 4, 5, 6, and 7 have shipped; see "As implemented". Step 3
+shipped in the minimal form (the step-1 record store), not as the general
+table. Step 8 shipped as B1 with a fallback to A.
 
 1. **Anchoring.** (done) Record the graphics command plus the client
    `vt_state` cursor at parse time in `dcs_passthru` instead of writing it
@@ -867,20 +927,25 @@ the minimal form (the step-1 record store), not as the general table. Steps
    the following output flows below the image. Kitty leaves the cursor on the
    image's last row, so advance `rows - 1`, not `rows`. Validate visually,
    not with DSR.
-3. Data model, `kgfx_parse` / `kgfx_apply`, table mutators, `kgfx_free`,
-   and the lifecycle plumbing (generalize the step-1 record store).
-   (Shipped only as the minimal per-window `gfx[]` store, not the general
-   table.)
+3. **Data model.** (done, in its own shape) The per-window store grew
+   into a grouped, byte-capped command log with delete handling, rather
+   than the separate placement and transmit tables; see "As implemented".
 4. **Switch hooks and Strategy A replay.** (done) Re-transmit; the only
    option for images with no client id. Note the ED consequence: re-emit the
-   store after every full render, not once per switch.
-5. Image-number resolution: pending FIFO, stdin DCS callback,
-   `kgfx_resolve`, reply routing. Only benefits clients that place by
-   number; icat does not.
+   store after every full render, not once per switch. A switch is one
+   full render since the watch-driven refresh stopped redrawing for
+   events that change no window.
+5. **Image-number resolution.** (done) Pending FIFO, reply capture on the
+   client's stdin, id recording on the store, reply routing, and quiet
+   re-emission on replay. Only benefits clients that expect replies; icat
+   does not.
 6. **Server-side accounting** (done) so DSR, reattach, and detached
    snapshots are correct (plumb outer pixel size to the server, or forward
    the cursor advance). See "Server-side accounting".
-7. Header parsing fallback for compressed images sent without `s=`/`v=`,
-   and CSI 14 t / 16 t if `TIOCGWINSZ` pixel fields are zero.
-8. Optional: Strategy B lazy replay, for id-bearing clients only, behind a
-   latency measurement.
+7. **Header parsing fallback.** (done) The PNG header sizes an image sent
+   without `s=`/`v=`, and CSI 16 t / 14 t supply the cell size when the
+   `TIOCGWINSZ` pixel fields are zero.
+8. **Lazy replay.** (done) Strategy B1 for id-bearing images, Strategy A
+   for the rest; `attach.graphics-replay = full` reverts to A. Measured
+   under GNU screen: a switch back to a window re-sends 15 bytes per
+   placement instead of every image's data.

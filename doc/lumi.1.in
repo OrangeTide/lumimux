@@ -1,7 +1,7 @@
 .\" lumi.1 : manual page for lumiMUX
 .\" Copyright (c) 2026 Jon Mayo
 .\" Licensed under MIT-0 OR PUBLIC DOMAIN
-.TH LUMI 1 "2026-10-05" "lumiMUX @VERSION@" "User Commands"
+.TH LUMI 1 "2026-10-06" "lumiMUX @VERSION@" "User Commands"
 .SH NAME
 lumi \- terminal multiplexer
 .SH SYNOPSIS
@@ -75,9 +75,14 @@ UI mode passed to
 Session name (default:
 .BR 0 ).
 .TP
-.I shell
-Shell command to run inside the new session.
-Uses the user's login shell if omitted.
+.I program
+Program to run inside the new session, executed directly (not through a
+shell), so it is a single word with no arguments.
+Defaults to
+.BR $SHELL ,
+or
+.B /bin/sh
+when that is unset.
 .SS lumi attach
 Attach to an existing session.
 .PP
@@ -490,12 +495,21 @@ which one is this client, and shows who is asking for it.
 .B Enter
 gives the keyboard to the selected client, or asks for it when this client
 does not have it,
+.B r
+asks for the keyboard,
 .B k
 asks the selected client to detach,
 .B d
 declines a pending request, and
 .B l
 closes or opens the session to further clients.
+.B Right
+acts like
+.BR Enter ;
+.B Left
+or
+.B Esc
+closes the menu.
 .SS lumi kill
 Terminate a session.
 .PP
@@ -524,7 +538,11 @@ Session name (default:
 .TP
 .IR command " [" args ...]
 Program and arguments to run in the new window, executed directly (not
-through a shell). With no command the window runs the user's login shell.
+through a shell). With no command the window runs
+.BR $SHELL ,
+or
+.B /bin/sh
+when that is unset.
 Option parsing stops at the command, so its own options are passed through
 unchanged.
 .SS lumi attr
@@ -569,11 +587,14 @@ One of
 .BR mountain ,
 or
 .BR beach .
-Chosen at random if omitted.
+Default:
+.BR space .
 .TP
 .I name
 Text displayed on the splash screen (default:
 .BR lumiMUX ).
+.PP
+The splash needs a terminal; any key dismisses it.
 .SS lumi files
 Browse the filesystem in a full-screen terminal UI.
 .PP
@@ -1025,27 +1046,49 @@ acts on the non-matching lines. Patterns are plain substrings, not regular
 expressions.
 Several files can be open at once:
 .BI e\  path
+(or
+.BR edit )
 opens a file in a new buffer (or switches to it when already open),
 .B e
-with no argument reloads the current file,
+with no argument reloads the current file
+.RB ( e!
+to discard changes),
+.BI w\  path
+writes the buffer to that file and renames the buffer to it
+.RB ( w! ,
+.BR x! ,
+and
+.B wq!
+force the write),
 .B enew
 starts an empty buffer,
 .B ls
+(or
+.BR buffers ", " files )
 lists the buffers,
 .B bn
 and
 .B bp
+.RB ( bnext ", " bprev ", " bprevious )
 step to the next and previous,
 .BI b\  N
+(or
+.BI buffer\  N )
 switches to buffer
 .IR N ,
 and
 .B bd
+(or
+.BR bdelete )
 closes the current one
 .RB ( bd!
 to discard changes), and
 .BI r\  path
-reads a file in below the current line. The
+(or
+.BR read )
+reads a file in below the current line. The quit family has long forms
+too:
+.BR qall ", " quitall ", " wqall ", " xall " (" xa "), and " cquit " (" cq "). The
 .RB [ F8 ]
 and
 .RB [ Shift+F8 ]
@@ -1067,6 +1110,27 @@ backward;
 repeats the last search in its own direction and
 .RB [ N ]
 in the opposite one.
+A second delimiter adds an offset that
+.B n
+and
+.B N
+keep:
+.B /pat/e
+lands on the last character of the match,
+.B /pat/e+2
+and
+.B /pat/s\-1
+shift from the match's end or start by that many characters within the
+line, and
+.B /pat/+3
+or
+.B ?pat?\-1
+move that many whole lines and rest in column 0. An empty pattern
+.RB ( //e )
+reuses the last one. A
+.B /
+in the pattern is written
+.BR \e/ .
 .RB [ * ]
 and
 .RB [ # ]
@@ -1202,7 +1266,8 @@ set per extension in
 .B [build]
 configuration section), and built-in defaults cover
 .BR make ,
-compiling C, and running a shell or BASIC file when the config is silent.
+compiling C and C++ (and a header on its own), and running a shell or
+BASIC file when the config is silent.
 .PP
 When run inside a
 .B lumi
@@ -1406,7 +1471,8 @@ the same way as
 Recognized key names (case-insensitive) are
 .BR Enter ", " Return ", " Tab ", " Escape ", " Space ", " BSpace ", "
 .BR Up ", " Down ", " Left ", " Right ", " Home ", " End ", " PPage ", "
-.BR NPage ", " IC ", " DC ", and " F1 " through " F12 .
+.BR NPage ", " PageUp ", " PageDown ", " IC ", " Insert ", " DC ", " Delete ", "
+.BR Esc ", " Backspace ", and " F1 " through " F12 .
 A key may be prefixed with
 .B C\-
 for Ctrl (on a single character) or
@@ -1450,6 +1516,7 @@ Inject raw bytes into a session window, as if they were typed.
 .BI \-i " index"
 |
 .BR \-o ]
+.RB [ \-\- ]
 .RI [ bytes ...]
 .PP
 The bytes come from the arguments, joined with single spaces, or from
@@ -1503,13 +1570,16 @@ not intended for direct use.
 .B lumi\-mserver
 .B \-s
 .I name
-.RI [ shell ]
+.RI [ command " [" args ...]]
 .TP
 .BI \-s " name"
 Session name (required).
 .TP
-.I shell
-Shell command to run.
+.IR command " [" args ...]
+Program and arguments to run, executed directly. Defaults to
+.B $SHELL
+or
+.BR /bin/sh .
 .SS lumi proxy
 Multiplexing proxy for remote session tunneling.
 Launched automatically by
@@ -1522,9 +1592,30 @@ and watches for new or removed windows.
 .B lumi proxy
 .B \-s
 .I session
+.br
+.B lumi proxy
+.B \-s
+.I session
+.B \-L
+.RB [ \-g
+.IR group ]
 .TP
 .BI \-s " session"
 Session name (required).
+.TP
+.B \-L
+Run as the cross-user broker instead: listen on
+.BI /tmp/lumi\-broker\- uid / session .sock
+and authorize each connecting peer against the session's
+.B access
+file before relaying. Started by
+.BR "lumi share \-u" " or " "lumi share \-G" .
+.TP
+.BI \-g " group"
+With
+.BR \-L ,
+give the socket that group and mode 0660 (and its directory mode 0710), so
+only members can connect.
 .SS lumi net-proxy
 Networked equivalent of
 .B lumi proxy
@@ -1556,6 +1647,15 @@ connect to it with
 .IR port ]
 .RB [ \-d ]
 .RB [ \-k ]
+.br
+.B lumi net-proxy
+.B \-s
+.I session
+.B \-L
+.B \-p
+.I port
+.RB [ \-b
+.IR addr ]
 .TP
 .BI \-s " session"
 Session name (required).
@@ -1679,23 +1779,27 @@ Press
 after the prefix to send a literal
 .B Ctrl\-A
 to the terminal.
+Pausing after the prefix (outside minimal mode) opens a menu listing the
+bindings, so the second key can be picked from it.
 .PP
 .TS
 l l.
 Key	Action
 _
+a	Send the prefix key itself to the window
 c, C	Create new window
 k, K	Kill current window
 n, Space, Ctrl\-Space, Ctrl\-N	Next window
 p, Ctrl\-P	Previous window
-Ctrl\-A	Last window (most recently used)
+Ctrl\-A (the prefix key twice)	Last window (most recently used; default prefix only)
 0\-9	Select window by number
 ,	Swap number with next lower window
 \&.	Swap number with next higher window
 d, D	Detach from session
 w, "	Window list
 s	Toggle taskbar
-q	Applications menu
+q	Applications menu: Calculator (c), Calendar (l), Dictionary (d), Emoji (e)
+*	Share menu (clients, keyboard handover)
 [, Escape	Enter scrollback mode
 h	Split pane horizontally
 v	Split pane vertically
@@ -1817,6 +1921,25 @@ Trailing blank lines are trimmed.
 Default: off; applications that toggle the alternate screen often can leave
 confusing partial history.
 .TP
+.B attach.keep-open
+When
+.BR true ", " yes ", or " 1 ,
+a window whose program has exited stays on screen marked dead instead of
+being removed, so its last output can still be read; close it with the
+usual kill binding.
+Default: off.
+.TP
+.B attach.graphics-replay
+How kitty graphics images are drawn again after a full redraw or a switch
+back to their window.
+.B lazy
+(the default) places an image the terminal already holds again by id
+without re-sending its data, and re-sends the data only when the terminal
+reports the image gone.
+.B full
+re-sends every image's data each time, for terminals that discard images
+silently.
+.TP
 .B keys.prefix
 Change the prefix key.
 Accepts
@@ -1826,10 +1949,23 @@ notation or a named key (see
 below).
 Default:
 .BR C\-a .
+With a custom prefix, pressing it twice sends the prefix to the window
+and the last-window action is left unbound; bind
+.B last\-window
+to another key if wanted.
 .TP
 .B taskbar.format
 Taskbar format string.
 Supports variable expansion and built-in functions.
+The variable is
+.BR ${window\-list} ;
+the scrollback bar also has
+.BR ${offset} " and " ${total} .
+Functions:
+.BR firstword ", " lastword ", " word ", " words ", " strip ", " truncate ", "
+.BR left ", " right ", " center ", " fill ", and " shell .
+Default:
+.BR ${window\-list} .
 .IP
 When the session directory watch is unavailable, the taskbar is
 prefixed with a fixed
@@ -1889,17 +2025,26 @@ Format of the presence marker described above.
 .B %w
 expands to the number of clients holding the keyboard,
 .B %v
-to the number watching, and
+to the number watching,
+.B %p
+to the number waiting for approval under an
+.B ask
+rule, and
 .B %n
 to the total.
+.B %P
+expands to
+.B +N?
+when N clients are waiting and to nothing otherwise, so a knock shows
+up without cluttering the marker when there is none.
 Default:
-.BR share:%ww+%vv .
+.BR share:%ww+%vv%P .
 .TP
 .B taskbar.position
 Taskbar position:
 .BR top " or " bottom .
 Default:
-.BR top .
+.BR bottom .
 .TP
 .B taskbar.shell_allow
 Comma-separated
@@ -1907,9 +2052,56 @@ Comma-separated
 patterns for shell commands allowed in taskbar
 .B $(shell ...)
 expansions.
+With no patterns no shell expansion runs at all.
 .TP
 .B ui.theme
-Name of the theme to use for turbo mode window decorations.
+Name of the theme used for turbo mode window decorations and for the
+overlay menus in every mode.
+Built-in themes:
+.BR ascii ", " thin ", " double ", " rounded ", " turbo ", " crimson ", "
+.BR acid ", " shade ", and " borderless ,
+plus any
+.B [theme "name"]
+section (see below).
+Default:
+.B thin
+when the locale is UTF\-8, else
+.BR ascii .
+.SS User themes
+A
+.BI "[theme \(dq" name \(dq]
+section defines a theme selectable through
+.B ui.theme
+(up to eight).
+.B base
+names a built-in theme to start from; the remaining keys override parts of
+it.
+Border pieces:
+.BR border.tl ", " border.t ", " border.tr ", " border.l ", " border.r ", "
+.BR border.bl ", " border.b ", and " border.br ;
+title and separator decorations:
+.BR title_l ", " title_r ", " sep_l ", " sep_fill ", " sep_r ", and " shadow .
+Colors, each
+.BR default ", a palette index " 0 - 255 ", or " #rrggbb :
+.BR border_fg ", " border_bg ", " focus_fg ", " focus_bg ", " unfocus_fg ", "
+.BR unfocus_bg ", " title_focus_fg ", " title_idle_fg ", " close_fg ", "
+.BR tool_fg ", " status_focus_fg ", " status_idle_fg ", " indicator_fg ", "
+.BR drag_fg ", " title_fg ", " content_fg ", " content_bg ", " sel_fg ", "
+.BR sel_bg ", " key_fg ", " sel_key_fg ", " shadow_fg ", and " shadow_bg .
+.PP
+.RS 4
+.nf
+[theme "night"]
+    base      = rounded
+    border_fg = 244
+    sel_bg    = #3355aa
+.fi
+.RE
+.PP
+.B ui.theme
+may then name it; the
+.B edit.theme
+key accepts built-in names only.
 .SS Environment defaults
 Keys in an
 .B [environment]
@@ -1984,8 +2176,11 @@ section can derive that palette from a named color theme instead:
 .fi
 .RE
 .PP
-The theme names are the same as the window themes used elsewhere, for example
-.BR turbo ", " thin ", " crimson ", or " acid .
+The theme names are the built-in window themes used elsewhere, for example
+.BR turbo ", " thin ", " crimson ", or " acid ;
+user-defined
+.B [theme "name"]
+sections are not available here.
 The editing area and frame take the theme's content and border colors; the
 bars invert the content colors. An unknown or missing name keeps the built-in
 default.
@@ -2051,6 +2246,10 @@ Key names used in
 and
 .B [bind]
 entries:
+Names are case-sensitive and lowercase; the
+.B C\-
+prefix may also be written
+.BR c\- .
 .TP
 .BI C\- x
 Control key.
@@ -2085,6 +2284,7 @@ l l.
 Action	Description
 _
 send\-prefix	Send literal prefix key
+last\-window	Last window (most recently used)
 new\-window	Create new window
 next\-window	Next window
 prev\-window	Previous window
@@ -2259,6 +2459,9 @@ daemon instead, when built with libgpm support.
 sets the host terminal's title to reflect the current window title.
 Title changes from child applications (via OSC 0 and OSC 2) are
 propagated to the outer terminal immediately.
+A client that does not hold the keyboard shows the same title with a
+.B [viewing]
+suffix, so a glance at the window list tells the roles apart.
 .PP
 Window layout (positions, sizes, z-order) is saved on detach and
 restored on reattach to the same session.
@@ -2266,8 +2469,9 @@ restored on reattach to the same session.
 The following terminal features are recognized and forwarded:
 .TP
 .B Kitty keyboard protocol
-The prefix key (Ctrl\-A) is recognized in kitty keyboard encoding
-(CSI 97;5u) in addition to the traditional byte encoding.
+The prefix key is recognized in kitty keyboard encoding (for the default
+Ctrl\-A, CSI 97;5u) and in SS3 encoding, in addition to the traditional
+byte encoding.
 .TP
 .B Keyboard enhancement protocols
 Enhancement flags (XTPUSHSGR, kitty progressive enhancement) set by
@@ -2277,6 +2481,28 @@ terminal.
 .B DCS pass-through
 SIXEL graphics and other DCS sequences are passed through to the
 outer terminal when a single pane is focused in screen mode.
+Kitty graphics commands are passed through the same way, and also in
+turbo mode for the focused window, where an image is placed at the
+window's position and cropped to the window's edges (a PNG whose pixel
+size the command does not state is measured from its header; an image
+that still has no known size is scaled to fit instead). The outer
+terminal's reply to a command is handed back to the window that sent it,
+so a program that waits for the acknowledgement is not left hanging and
+the reply never reaches the shell as typed text.
+When the terminal reports no cell pixel size through the tty, the client
+asks for it (CSI 16 t and 14 t) so that output following an image shown
+at natural size lands below it.
+When a window's images have to be drawn again (after a full redraw or a
+switch back to the window), an image the terminal knows by id is only
+placed again rather than sent again; if the terminal reports it gone, the
+image data is re-sent. See
+.B attach.graphics-replay
+in CONFIGURATION.
+.TP
+.B Bell
+A program's bell (BEL) rings the outer terminal when its window is on
+screen. When the window is hidden, a notice on the taskbar names the
+window instead, so a job finishing elsewhere is not missed.
 .TP
 .B Desktop notifications
 Notification escape sequences emitted by child applications
@@ -2291,7 +2517,23 @@ outer terminal, so copying inside a window (for example with
 reaches the system clipboard. Read requests
 .RB ( "OSC 52 ... ;?" )
 are not forwarded, since their reply has no window to route back to.
+Only the client that holds the keyboard forwards a copy; a view\-only
+client in a shared session keeps its own clipboard.
 The clipboard payload is capped at 256 KB.
+.TP
+.B Terminal colors (OSC 10/11)
+On startup, on a session switch, and after a network roam, the attach
+client asks the outer terminal for its default foreground and background
+colors and reports the answers to every window's micro\-server. A child
+application's OSC 10 or OSC 11 query
+.RB ( "OSC 11;?" )
+is then answered by the micro\-server itself, in order with the DA1 reply
+such programs send right after it, as a real terminal would. The query
+is not relayed to the outer terminal, whose late reply would otherwise
+land on the shell's command line. Until the colors are known (a
+detached session no client has reported to yet) the query goes
+unanswered, which programs treat as unsupported. Set requests are
+ignored.
 .TP
 .B Cursor shape
 DECSCUSR (CSI Ps SP q) cursor shape changes are forwarded.
@@ -2328,7 +2570,11 @@ All paths honor
 .BR XDG_CONFIG_HOME .
 .SS Cross-user access
 An mserver accepts a connection only from its own uid; a session directory
-is mode 0700.
+is mode 0700 under
+.I $XDG_RUNTIME_DIR/lumi
+or, without that variable,
+.BI /tmp/lumi\- uid
+(itself mode 0700).
 A different local user reaches a session only through the broker started by
 .B "lumi share \-u"
 or
@@ -2384,38 +2630,70 @@ rule.
 An approved connection is granted exactly the role the matching
 .B ask
 rule's role column named; nothing renegotiates a higher role afterward.
-.SH ENVIRONMENT
+.PP
+Note that
+.B lumi attach
+has no option yet to dial a broker socket directly: the broker is reached
+by a client speaking the proxy framing to that socket, which today means
+an
+.B ssh
+hop onto the owning host or a purpose-built client..SH ENVIRONMENT
 .TP
 .B XDG_CONFIG_HOME
 Base directory for
 .B lumi
 configuration
 .RI ( lumi.conf )
-and the network identity files
-.RI ( host_key ", " known_hosts ).
+and the network files
+.RI ( host_key ", " known_hosts ", " authorized_keys ", " passwd ", " id_netchan ).
 Defaults to
 .IR ~/.config .
 .TP
+.B XDG_RUNTIME_DIR
+Base of the runtime directory,
+.IR $XDG_RUNTIME_DIR/lumi ,
+which holds the session directories and sockets.
+When unset,
+.BI /tmp/lumi\- uid
+is used instead.
+.TP
 .B LUMI_SESSION
-Set inside an attached session to the current session name.
-Prevents recursive attach.
-Used by
-.B lumi attr
-as the default session name when
+Set by
+.B lumi\-mserver
+in every window to the session name.
+Prevents recursive attach, and is the default session for
+.BR "lumi attr" ", " "lumi send\-keys" ", and " "lumi send\-input"
+when
 .B \-s
 is not given.
+Its presence also enables the in-session features of
+.B lumi files
+(open in a new window),
+.B lumi edit
+(send to a window, run the build in a window), and
+.B lumi basic
+.RB ( SEND ).
 .TP
 .B LUMI_SEND_TARGET
-Process id of a window to prefer when
+Set by the user to the process id of a window to prefer when
 .B lumi send\-input \-o
 (and the
 .BR "lumi edit" / basic
 send bindings) pick a window other than the focused one.
+.B lumi
+never sets it itself.
 .TP
 .B LUMI_LIBEXEC_PATH
-Override the search path for
-.BI lumi- command
-executables.
+Colon-separated directories searched for
+.BI lumi\- command
+executables when
+.B lumi
+starts one of its own commands as a separate process (for example the
+micro-server), after the directory holding
+.B lumi
+itself and before
+.BR PATH .
+A built-in command is used when no such executable is found.
 .TP
 .B LUMI_DEBUG
 Set to a file path to enable debug tracing.
@@ -2432,23 +2710,93 @@ Program used by
 .B lumi files
 to edit a file (default:
 .BR vi ).
+.TP
+.B SHELL
+Program run in a new window when no command is given (default:
+.BR /bin/sh ).
+.TP
+.B TERM
+Set to
+.B xterm\-256color
+inside every window.
+The outer value selects the terminfo entry used for the host terminal;
+.BR TERMINFO ", " TERMINFO_DIRS ", and " ~/.terminfo
+are searched as usual.
+.TP
+.B COLORTERM
+When it is
+.B truecolor
+or
+.BR 24bit ,
+colors are sent to the host as RGB.
+.TP
+.BR LANG ", " LC_ALL
+A UTF\-8 locale selects the
+.B thin
+default theme; otherwise
+.B ascii
+is used.
+.TP
+.B UNICODE_VERSION
+Selects the character width table.
+.TP
+.B WAYLAND_DISPLAY
+When set,
+.B Ctrl\-A y
+copies to the system clipboard with
+.BR wl\-copy ;
+otherwise
+.BR xclip ", " xsel ", or " pbcopy
+is tried, in that order.
+.TP
+.BR USER ", " LOGNAME
+Default user name in a
+.B lumi://
+URL and in the client name shown to other clients.
+.TP
+.B TMPDIR
+Where
+.B lumi basic
+writes the temporary file for its
+.B EDIT
+command.
 .SH FILES
 .TP
 .I @PREFIX@/bin/lumi
 The multi-call binary.
 .TP
 .I @PREFIX@/bin/lumi\-*
-The per-command executables
-.RB ( lumi-attach ", " lumi-new ", " ...),
-found on
-.B PATH
-or through
-.BR LUMI_LIBEXEC_PATH .
+Per-command names
+.RB ( lumi\-attach ", " lumi\-new ", " ...),
+symbolic links to the multi-call binary created at install time.
+.TP
+.I @PREFIX@/share/man/man1/lumi.1
+This manual.
 .TP
 .I ~/.config/lumi/lumi.conf
 Per-user configuration
 .RB ( XDG_CONFIG_HOME
 is honored).
+.TP
+.IR ~/.config/lumi/ { host_key , known_hosts , authorized_keys , passwd , id_netchan }
+Network identity and authorization files; see
+.BR "lumi net\-keygen" ", " "lumi net\-passwd" ", and " "lumi net\-proxy" .
+.TP
+.IR $XDG_RUNTIME_DIR/lumi/ session /
+The session directory (mode 0700), holding each window's micro-server
+socket, the client roster, the layout and state files,
+.BR access ", " access.log ", " net\-addr ", " net\-key ", and " net\-hostkey .
+Without
+.B XDG_RUNTIME_DIR
+the base is
+.BI /tmp/lumi\- uid .
+.TP
+.BI /tmp/lumi\-broker\- uid / session .sock
+The cross-user broker socket, present only while
+.B "lumi share \-u"
+or
+.B \-G
+is running.
 .SH SEE ALSO
 .BR screen (1),
 .BR tmux (1),

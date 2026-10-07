@@ -532,6 +532,7 @@ msg_mutates(uint32_t type)
 	case IPC_MSG_ATTR_SET:
 	case IPC_MSG_ATTR_DELETE:
 	case IPC_MSG_ATTR_TXN_COMMIT:
+	case IPC_MSG_TERM_COLORS:
 		return 1;
 	}
 	return 0;
@@ -1039,6 +1040,20 @@ on_client_read(struct iox_loop *lp, int fd, unsigned events, void *arg)
 				mc->cell_ph = sz.cell_ph;
 				resize_to_fit();
 			}
+		}
+		break;
+
+	case IPC_MSG_TERM_COLORS:
+		/* the colors of whichever terminal reported last; a program
+		 * asking is almost always talking to the client typing */
+		{
+			const char *fg = buf;
+			const char *bg = memchr(buf, '\0', len);
+
+			if (bg && memchr(bg + 1, '\0',
+			    len - (size_t)(bg + 1 - buf)))
+				vt_state_set_term_colors(window_vt(win), fg,
+				    bg + 1);
 		}
 		break;
 

@@ -6,9 +6,15 @@
 #include "utf8.h"
 #include "xmalloc.h"
 
+#include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+
+#define OK 0
+#define ERR (-1)
 
 #define DEFAULT_SCROLLBACK 2000
 #define DEFAULT_TAB_WIDTH  8
@@ -62,6 +68,8 @@ vt_state_free(struct vt_state *st)
 	}
 	free(st->tabstops);
 	free(st->title);
+	free(st->term_fg);
+	free(st->term_bg);
 	{
 		int i;
 
@@ -76,6 +84,13 @@ void
 vt_state_set_reply_fd(struct vt_state *st, int fd)
 {
 	st->reply_fd = fd;
+}
+
+void
+vt_state_set_bell_cb(struct vt_state *st, void (*cb)(void *ctx), void *ctx)
+{
+	st->bell_cb = cb;
+	st->bell_ctx = ctx;
 }
 
 void
@@ -139,6 +154,15 @@ vt_state_set_title(struct vt_state *st, const char *title)
 {
 	free(st->title);
 	st->title = (title && title[0]) ? strdup(title) : NULL;
+}
+
+void
+vt_state_set_term_colors(struct vt_state *st, const char *fg, const char *bg)
+{
+	free(st->term_fg);
+	free(st->term_bg);
+	st->term_fg = (fg && fg[0]) ? strdup(fg) : NULL;
+	st->term_bg = (bg && bg[0]) ? strdup(bg) : NULL;
 }
 
 #define TITLE_STACK_MAX 16
@@ -363,6 +387,160 @@ vt_state_reverse_index(struct vt_state *st)
 		st->cursor_row--;
 }
 
+/* value of one base64 character, -1 for padding or anything else */
+static int
+b64_value(int ch)
+{
+	if (ch >= 'A' && ch <= 'Z')
+		return ch - 'A';
+	if (ch >= 'a' && ch <= 'z')
+		return ch - 'a' + 26;
+	if (ch >= '0' && ch <= '9')
+		return ch - '0' + 52;
+	if (ch == '+' || ch == '-')
+		return 62;
+	if (ch == '/' || ch == '_')
+		return 63;
+	return -1;
+}
+
+/* decode base64 text into out, up to cap bytes; returns the bytes
+ * decoded, stopping at padding or at the first byte that is not base64 */
+static size_t
+b64_decode(const char *in, size_t len, unsigned char *out, size_t cap)
+{
+	size_t i, n = 0;
+	unsigned long acc = 0;
+	int bits = 0;
+
+	for (i = 0; i < len && n < cap; i++) {
+		int v = b64_value((unsigned char)in[i]);
+
+		if (v < 0)
+			break;
+		acc = (acc << 6) | (unsigned long)v;
+		bits += 6;
+		if (bits >= 8) {
+			bits -= 8;
+			out[n++] = (unsigned char)((acc >> bits) & 0xff);
+		}
+	}
+	return n;
+}
+
+/* the first bytes of a PNG that carry its size: the signature, then the
+ * IHDR chunk's length, type, width, and height */
+#define PNG_HEAD_LEN 24
+
+/* width and height from the start of a PNG file; ERR if head/len does not
+ * begin a PNG or the size is not usable */
+static int
+png_head_size(const unsigned char *head, size_t len, int *pw, int *ph)
+{
+	static const unsigned char sig[8] = {
+		0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n',
+	};
+	unsigned long w, h;
+
+	if (len < PNG_HEAD_LEN || memcmp(head, sig, sizeof(sig)) != 0 ||
+	    memcmp(head + 12, "IHDR", 4) != 0)
+		return ERR;
+	w = ((unsigned long)head[16] << 24) | ((unsigned long)head[17] << 16) |
+	    ((unsigned long)head[18] << 8) | head[19];
+	h = ((unsigned long)head[20] << 24) | ((unsigned long)head[21] << 16) |
+	    ((unsigned long)head[22] << 8) | head[23];
+	if (w == 0 || h == 0 || w > INT_MAX / 2 || h > INT_MAX / 2)
+		return ERR;
+	*pw = (int)w;
+	*ph = (int)h;
+	return OK;
+}
+
+/* the PNG head of a file the command names by base64-encoded path */
+static int
+png_file_size(const char *b64, size_t len, int *pw, int *ph)
+{
+	unsigned char head[PNG_HEAD_LEN];
+	char path[4096];
+	size_t n;
+	ssize_t got;
+	int fd, rc = ERR;
+
+	n = b64_decode(b64, len, (unsigned char *)path, sizeof(path) - 1);
+	if (n == 0 || memchr(path, '\0', n) != NULL)
+		return ERR;
+	path[n] = '\0';
+	fd = open(path, O_RDONLY | O_NOFOLLOW | O_NOCTTY);
+	if (fd < 0)
+		return ERR;
+	got = read(fd, head, sizeof(head));
+	if (got == (ssize_t)sizeof(head))
+		rc = png_head_size(head, sizeof(head), pw, ph);
+	close(fd);
+	return rc;
+}
+
+int
+vt_kgfx_image_size(const char *data, size_t len, int *pw, int *ph)
+{
+	const char *p, *end;
+	int s = 0, v = 0, fmt = 32, medium = 'd', comp = 0;
+	unsigned char head[PNG_HEAD_LEN];
+	size_t plen;
+
+	if (len < 1 || data[0] != 'G')
+		return ERR;
+	p = data + 1;
+	end = p;
+	while (end < data + len && *end != ';')
+		end++;
+
+	while (p < end) {
+		int key = *p++;
+		int vch;
+		long val = 0;
+
+		if (p < end && *p == '=')
+			p++;
+		vch = (p < end && *p != ',') ? (unsigned char)*p : 0;
+		while (p < end && *p >= '0' && *p <= '9')
+			val = val * 10 + (*p++ - '0');
+		switch (key) {
+		case 's': s = (int)val;		break;
+		case 'v': v = (int)val;		break;
+		case 'f': fmt = (int)val;	break;
+		case 't': medium = vch;		break;
+		case 'o': comp = vch;		break;
+		}
+		while (p < end && *p != ',')
+			p++;
+		if (p < end && *p == ',')
+			p++;
+	}
+	if (s > 0 && v > 0) {
+		*pw = s;
+		*ph = v;
+		return OK;
+	}
+
+	/* raw pixel formats carry no header, and a compressed stream hides
+	 * the one a PNG has */
+	if (fmt != 100 || comp == 'z')
+		return ERR;
+	if (end >= data + len)
+		return ERR;
+	end++;
+	plen = (size_t)(data + len - end);
+	if (medium == 'd') {
+		if (b64_decode(end, plen, head, sizeof(head)) != sizeof(head))
+			return ERR;
+		return png_head_size(head, sizeof(head), pw, ph);
+	}
+	if (medium == 'f' || medium == 't')
+		return png_file_size(end, plen, pw, ph);
+	return ERR;
+}
+
 void
 vt_kgfx_account(struct vt_state *st, const char *data, size_t len,
     int cell_pw, int cell_ph)
@@ -375,7 +553,7 @@ vt_kgfx_account(struct vt_state *st, const char *data, size_t len,
 	/* data is the APC payload: "G" + comma-separated key=value control,
 	 * then an optional ";" and image payload.  Parse only the keys that
 	 * bear on the cursor: a= (action), C= (cursor policy), r=/c= (display
-	 * rows/cols), v=/s= (image pixel height/width). */
+	 * rows/cols); the image pixel size comes from vt_kgfx_image_size(). */
 	if (len < 1 || data[0] != 'G')
 		return;
 
@@ -406,8 +584,6 @@ vt_kgfx_account(struct vt_state *st, const char *data, size_t len,
 		case 'C': cmove = (int)val;  break;	/* 1 = keep cursor put */
 		case 'r': rows = (int)val;   break;	/* display rows */
 		case 'c': cols = (int)val;   break;	/* display cols */
-		case 'v': vpx = (int)val;    break;	/* image pixel height */
-		case 's': spx = (int)val;    break;	/* image pixel width */
 		}
 
 		while (p < end && *p != ',')
@@ -420,6 +596,8 @@ vt_kgfx_account(struct vt_state *st, const char *data, size_t len,
 		return;
 	if (cmove)				/* client keeps the cursor put */
 		return;
+	if (rows <= 0 || cols <= 0)
+		vt_kgfx_image_size(data, len, &spx, &vpx);
 
 	/* cells the image spans (explicit r=/c=, else ceil(px / cell)) */
 	if (rows > 0)

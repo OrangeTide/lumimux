@@ -74,7 +74,6 @@
 #include <unistd.h>
 
 static struct render *renderer;
-static struct vt_parse *stdin_osc_parser;	/* catches OSC replies on stdin */
 #define CLIENT_WIN_MAX 32
 
 static uint32_t watched_id;	/* window we're subscribed to */
@@ -94,6 +93,11 @@ struct mconn {
 
 static struct mconn mconns[CLIENT_WIN_MAX];
 static int mconn_count;
+
+/* report the hosting terminal's colors to one window's mserver; see
+ * term_fg below for why the client keeps them */
+static void term_colors_send(struct mconn *mc);
+
 static int sessdir_watch_fd = -1;
 int sessdir_watch_degraded;	/* nonzero: sessdir watch unavailable, so
 				 * new windows are not auto-discovered live */
@@ -318,6 +322,7 @@ mconn_add(struct iox_loop *lp, pid_t pid, int fd, const char *title)
 	memcpy(mc->deftitle, mc->title, strlen(mc->title) + 1);
 	if (lp)
 		iox_fd_add(lp, fd, IOX_READ, on_mserver_read, mc);
+	term_colors_send(mc);
 	return mc;
 }
 
@@ -405,6 +410,7 @@ msg_mutates(uint32_t type)
 	case IPC_MSG_ATTR_SET:
 	case IPC_MSG_ATTR_DELETE:
 	case IPC_MSG_ATTR_TXN_COMMIT:
+	case IPC_MSG_TERM_COLORS:
 		return 1;
 	}
 	return 0;
@@ -455,25 +461,22 @@ mconn_ipc_send_empty(struct mconn *mc, uint32_t type)
 	return mconn_ipc_send(mc, type, NULL, 0);
 }
 
+static void outer_cell_px(int *pw, int *ph);
+
 static int
 mconn_ipc_send_size(struct mconn *mc, uint32_t type, int rows, int cols)
 {
 	struct ipc_size sz;
 	uint8_t buf[24];
-	struct winsize ws;
-	int n;
+	int n, cpw, cph;
 
 	sz.rows = (uint16_t)rows;
 	sz.cols = (uint16_t)cols;
-	sz.cell_pw = 0;
-	sz.cell_ph = 0;
 	/* include the outer terminal's cell pixel size so the server can set
 	 * the pty pixel dimensions and do graphics cursor accounting */
-	if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0 &&
-	    ws.ws_row > 0 && ws.ws_col > 0) {
-		sz.cell_pw = (uint16_t)(ws.ws_xpixel / ws.ws_col);
-		sz.cell_ph = (uint16_t)(ws.ws_ypixel / ws.ws_row);
-	}
+	outer_cell_px(&cpw, &cph);
+	sz.cell_pw = (uint16_t)cpw;
+	sz.cell_ph = (uint16_t)cph;
 	n = ipc_size_encode(&sz, buf, sizeof(buf));
 	if (n < 0)
 		return -1;
@@ -590,16 +593,35 @@ struct win_layout {
 	int		valid;		/* nonzero if populated */
 };
 
-/* A kitty graphics image: the raw APC bytes to emit, and the screen cell to
- * emit them at.  Kept per window so images can be redrawn when switching
- * back to a window, since the outer terminal's image layer is cleared on
- * switch-out. */
-#define KGFX_MAX 32
+/* A kitty graphics command as a window's store keeps it: the raw APC bytes
+ * to emit, and for a display command the window cell to emit them at.  The
+ * store holds every command of an image in arrival order, grouped by the
+ * image it belongs to (grp): the transmit and all its chunks, the frames
+ * and animation control that build on it, and its placements, so a replay
+ * rebuilds the image on the host as the program did, animation included.
+ * Eviction drops whole groups, oldest first, by byte count. */
 struct kgfx_img {
 	char	*raw;		/* full "\e <intro> ... \e\\" bytes */
 	size_t	 len;
-	int	 row, col;	/* screen cell of the image top-left */
+	int	 row, col;	/* window cell of the image top-left */
+	uint32_t num;		/* the command's image number (I=), 0 none */
+	uint32_t id;		/* the host-assigned image id, once its reply
+				 * resolved num; or the command's own i= */
+	uint32_t plc;		/* placement id (p=), 0 none */
+	uint32_t grp;		/* the image this command belongs to */
+	uint32_t win;		/* the window it belongs to */
+	int	 action;	/* the command's a= letter, 0 none */
+	unsigned placed:1;	/* a display command (a=T or a=p): anchored */
+	unsigned hidden:1;	/* its placement was deleted; replay as data */
+	unsigned sent:1;	/* written to the host at least once */
+	unsigned once:1;	/* a query or delete: send once, then forget */
+	unsigned lost:1;	/* the host reported its image gone: the next
+				 * emission sends the data again */
 };
+
+/* bytes of commands one window keeps for replay; the newest image may push
+ * the store past this, older ones are evicted to make room */
+#define KGFX_STORE_BYTES_MAX	(16u << 20)
 
 struct client_window {
 	uint32_t	id;
@@ -613,8 +635,11 @@ struct client_window {
 	struct win_layout layout;	/* current mode's placement */
 	struct win_layout prev_layout;	/* saved from previous mode */
 	char		title_override[128];	/* :title override, "" = none */
-	struct kgfx_img	gfx[KGFX_MAX];	/* recorded images, for switch replay */
-	int		gfx_n;
+	struct kgfx_img	*gfx;		/* recorded graphics, for replay */
+	int		gfx_n, gfx_cap;
+	size_t		gfx_bytes;	/* raw bytes held in gfx */
+	uint32_t	gfx_grp_next;	/* last image group number handed out */
+	uint32_t	gfx_open_grp;	/* image whose chunked transmit is open */
 };
 
 static struct client_window cwins[CLIENT_WIN_MAX];
@@ -746,8 +771,15 @@ cwin_focused(void)
 	return NULL;
 }
 
-/* cell pixel size of the outer terminal; each out param is 0 when it cannot
- * be determined (winsize carries no pixel dimensions). */
+/* The outer terminal's cell pixel size as it answered CSI 16 t (cell size)
+ * or CSI 14 t (text area size), for terminals whose winsize carries no
+ * pixel dimensions.  term_cell_src is the report it came from, 6 or 4, or
+ * 0 while unknown; a text-area report never overrides a cell-size one. */
+static int term_cell_pw, term_cell_ph, term_cell_src;
+
+/* cell pixel size of the outer terminal, from its winsize or, failing
+ * that, from its answer to the cell-size query; each out param is 0 when
+ * neither knows */
 static void
 outer_cell_px(int *pw, int *ph)
 {
@@ -755,12 +787,15 @@ outer_cell_px(int *pw, int *ph)
 
 	*pw = 0;
 	*ph = 0;
-	if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) != 0)
-		return;
-	if (ws.ws_row == 0 || ws.ws_col == 0)
-		return;
-	*pw = ws.ws_xpixel / ws.ws_col;
-	*ph = ws.ws_ypixel / ws.ws_row;
+	if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0 &&
+	    ws.ws_row > 0 && ws.ws_col > 0) {
+		*pw = ws.ws_xpixel / ws.ws_col;
+		*ph = ws.ws_ypixel / ws.ws_row;
+	}
+	if (*pw == 0 || *ph == 0) {
+		*pw = term_cell_pw;
+		*ph = term_cell_ph;
+	}
 }
 
 /* Graphics images recorded during a parse, to be emitted at render time.
@@ -769,34 +804,542 @@ outer_cell_px(int *pw, int *ph)
  * cursor, because rendering is deferred.  Recording the image with its cell
  * position and emitting it after the renderer has drawn and positioned the
  * cells anchors it to the content. */
-/* Per-frame emit queue.  Entries reference raw bytes owned by a window's
- * persistent store (client_window.gfx), so the queue never frees them; it
- * only records what to draw after the cells have been rendered. */
-#define PENDING_GFX_MAX 64
-static struct kgfx_img pending_gfx[PENDING_GFX_MAX];
-static int pending_gfx_n;
+/* The keys of a kitty graphics command's control section that matter for
+ * reply routing: its action, image id (i=), image number (I=), and quiet
+ * level (q=: 0 all replies, 1 errors only, 2 none).  ctl_len is the length
+ * of the control section after the leading 'G', up to the ';' or the end. */
+struct kgfx_ctl {
+	int		action;
+	uint32_t	img;
+	uint32_t	num;
+	int		quiet;
+	int		s, v;		/* image pixel width/height, 0 unknown */
+	int		x, y, w, h;	/* source rectangle in pixels, 0 unset */
+	int		c, r;		/* display cells, 0 unset */
+	uint32_t	plc;		/* placement id (p=), 0 unset */
+	int		more;		/* m=1: more chunks follow */
+	int		del;		/* d= target letter, 0 unset */
+	size_t		ctl_len;
+};
+
+static void
+kgfx_ctl_parse(const char *data, size_t len, struct kgfx_ctl *c)
+{
+	const char *p, *end;
+
+	memset(c, 0, sizeof(*c));
+	if (len < 1 || data[0] != 'G')
+		return;
+	p = data + 1;
+	end = p;
+	while (end < data + len && *end != ';')
+		end++;
+	c->ctl_len = (size_t)(end - p);
+
+	while (p < end) {
+		int key = *p++;
+		int vch;
+		unsigned long val = 0;
+
+		if (p < end && *p == '=')
+			p++;
+		vch = (p < end && *p != ',') ? (unsigned char)*p : 0;
+		while (p < end && *p >= '0' && *p <= '9')
+			val = val * 10 + (unsigned long)(*p++ - '0');
+		switch (key) {
+		case 'a': c->action = vch;		break;
+		case 'i': c->img = (uint32_t)val;	break;
+		case 'I': c->num = (uint32_t)val;	break;
+		case 'q': c->quiet = (int)val;		break;
+		case 's': c->s = (int)val;			break;
+		case 'v': c->v = (int)val;			break;
+		case 'x': c->x = (int)val;			break;
+		case 'y': c->y = (int)val;			break;
+		case 'w': c->w = (int)val;			break;
+		case 'h': c->h = (int)val;			break;
+		case 'c': c->c = (int)val;			break;
+		case 'r': c->r = (int)val;			break;
+		case 'p': c->plc = (uint32_t)val;	break;
+		case 'm': c->more = (int)val;		break;
+		case 'd': c->del = vch;			break;
+		}
+		while (p < end && *p != ',')
+			p++;
+		if (p < end && *p == ',')
+			p++;
+	}
+}
+
+/* Graphics commands forwarded to the outer terminal that still await its
+ * reply, oldest first.  The reply names the image by number (I=) when the
+ * command did, or by id (i=), and is routed back to the window that sent
+ * the command; a reply that names neither answers the oldest.  Only the
+ * visible window forwards, so numbers cannot collide across windows here.
+ * A window that closes takes its entries with it. */
+#define KGFX_PEND_MAX 64
+struct kgfx_pending {
+	uint32_t win, num, img;
+};
+static struct kgfx_pending kgfx_pend[KGFX_PEND_MAX];
+static int kgfx_pend_n;
+
+static void
+kgfx_pend_push(uint32_t win, uint32_t num, uint32_t img)
+{
+	if (kgfx_pend_n >= KGFX_PEND_MAX) {
+		memmove(kgfx_pend, kgfx_pend + 1,
+		    (KGFX_PEND_MAX - 1) * sizeof(kgfx_pend[0]));
+		kgfx_pend_n = KGFX_PEND_MAX - 1;
+	}
+	kgfx_pend[kgfx_pend_n].win = win;
+	kgfx_pend[kgfx_pend_n].num = num;
+	kgfx_pend[kgfx_pend_n].img = img;
+	kgfx_pend_n++;
+}
+
+/* remove entry i and return its window */
+static uint32_t
+kgfx_pend_pop(int i)
+{
+	uint32_t win = kgfx_pend[i].win;
+
+	memmove(kgfx_pend + i, kgfx_pend + i + 1,
+	    (size_t)(kgfx_pend_n - i - 1) * sizeof(kgfx_pend[0]));
+	kgfx_pend_n--;
+	return win;
+}
+
+/* the window a reply naming num and/or img belongs to, taking the entry;
+ * 0 when nothing is waiting */
+static uint32_t
+kgfx_pend_take(uint32_t num, uint32_t img)
+{
+	int i;
+
+	if (kgfx_pend_n == 0)
+		return 0;
+	for (i = 0; i < kgfx_pend_n; i++) {
+		if ((num && kgfx_pend[i].num == num) ||
+		    (!num && img && kgfx_pend[i].img == img))
+			return kgfx_pend_pop(i);
+	}
+	if (num || img)
+		return 0;		/* named, but nothing matches */
+	return kgfx_pend_pop(0);
+}
+
+static void
+kgfx_pend_drop_win(uint32_t win)
+{
+	int i = 0;
+
+	while (i < kgfx_pend_n) {
+		if (kgfx_pend[i].win == win)
+			kgfx_pend_pop(i);
+		else
+			i++;
+	}
+}
+
+/* Lazy replay: on a redraw an image the host already holds is only placed
+ * again, by id, instead of being transmitted again.  The placement goes
+ * out with q=1, so the host answers only if it has dropped the image, and
+ * that answer is the client's business, not the program's: entries here
+ * are what such a reply may be answering.  A host that keeps the image
+ * says nothing, so entries lapse after a short while.  A reply marks the
+ * image lost and the next flush transmits it again. */
+struct kgfx_lazy {
+	uint32_t win;
+	uint32_t img;
+	time_t at;
+};
+#define KGFX_LAZY_MAX 64
+#define KGFX_LAZY_WAIT_SEC 3
+static struct kgfx_lazy kgfx_lazy[KGFX_LAZY_MAX];
+static int kgfx_lazy_n;
+
+/* attach.graphics-replay: lazy (default) re-places images the host holds,
+ * full transmits every image again */
+static int gfx_replay_lazy = 1;
+
+static void
+kgfx_lazy_pop(int i)
+{
+	memmove(kgfx_lazy + i, kgfx_lazy + i + 1,
+	    (size_t)(kgfx_lazy_n - i - 1) * sizeof(kgfx_lazy[0]));
+	kgfx_lazy_n--;
+}
+
+/* forget re-placements old enough that the host would have complained */
+static void
+kgfx_lazy_expire(void)
+{
+	time_t now = time(NULL);
+
+	while (kgfx_lazy_n > 0 && now - kgfx_lazy[0].at > KGFX_LAZY_WAIT_SEC)
+		kgfx_lazy_pop(0);
+}
+
+static void
+kgfx_lazy_push(uint32_t win, uint32_t img)
+{
+	kgfx_lazy_expire();
+	if (kgfx_lazy_n >= KGFX_LAZY_MAX)
+		kgfx_lazy_pop(0);
+	kgfx_lazy[kgfx_lazy_n].win = win;
+	kgfx_lazy[kgfx_lazy_n].img = img;
+	kgfx_lazy[kgfx_lazy_n].at = time(NULL);
+	kgfx_lazy_n++;
+}
+
+/* the window whose re-placement of image img is waiting, taking the entry;
+ * 0 when none is */
+static uint32_t
+kgfx_lazy_take(uint32_t img)
+{
+	int i;
+
+	kgfx_lazy_expire();
+	for (i = 0; i < kgfx_lazy_n; i++) {
+		if (kgfx_lazy[i].img == img) {
+			uint32_t win = kgfx_lazy[i].win;
+
+			kgfx_lazy_pop(i);
+			return win;
+		}
+	}
+	return 0;
+}
+
+/* a re-placement went out recently enough that the host may still answer */
+static int
+kgfx_lazy_expected(void)
+{
+	kgfx_lazy_expire();
+	return kgfx_lazy_n > 0;
+}
+
+static void
+kgfx_lazy_drop_win(uint32_t win)
+{
+	int i = 0;
+
+	while (i < kgfx_lazy_n) {
+		if (kgfx_lazy[i].win == win)
+			kgfx_lazy_pop(i);
+		else
+			i++;
+	}
+}
+
+/* Write a stored kitty command with some control keys replaced: every key
+ * whose letter is in drop is left out, and add (comma-separated key=value
+ * text, or "") goes on the end of the control section.  The payload after
+ * the ';' is written untouched, or left out when payload is 0. */
+static void
+kgfx_write_edited(const char *raw, size_t len, const char *drop,
+    const char *add, int payload)
+{
+	const char *ctl = raw + 3;		/* after ESC _ G */
+	const char *end = ctl, *p;
+	char out[512];
+	size_t n = 0, alen = strlen(add);
+
+	if (len < 5)
+		return;
+	while (end < raw + len - 2 && *end != ';')
+		end++;
+	if ((size_t)(end - ctl) + alen + 2 > sizeof(out)) {
+		tio_write(STDOUT_FILENO, raw, len);	/* too long to edit */
+		return;
+	}
+	for (p = ctl; p < end;) {
+		const char *k = p;
+
+		while (p < end && *p != ',')
+			p++;
+		if (!(k + 1 < p && k[1] == '=' && strchr(drop, k[0]))) {
+			if (n > 0)
+				out[n++] = ',';
+			memcpy(out + n, k, (size_t)(p - k));
+			n += (size_t)(p - k);
+		}
+		if (p < end)
+			p++;
+	}
+	if (alen > 0) {
+		if (n > 0)
+			out[n++] = ',';
+		memcpy(out + n, add, alen);
+		n += alen;
+	}
+	tio_write(STDOUT_FILENO, raw, 3);
+	tio_write(STDOUT_FILENO, out, n);
+	if (payload)
+		tio_write(STDOUT_FILENO, end, (size_t)(raw + len - end));
+	else
+		tio_write(STDOUT_FILENO, "\033\\", 2);
+}
+
+/* The screen rectangle an image of window id may occupy, and that window's
+ * content origin.  In screen mode the single visible pane is the whole
+ * content area.  In turbo mode it is the window's content rectangle cut to
+ * the screen; the window must be the one on top, since the protocol has no
+ * way to hide the part of an image another window covers.  Returns 0 when
+ * the window has nowhere to draw. */
+static int
+gfx_window_rect(uint32_t id, int *ox, int *oy, int *right, int *bottom)
+{
+	*ox = 0;
+	*oy = 0;
+	*right = content_cols;
+	*bottom = content_rows;
+	if (client_mode != CLIENT_MODE_TURBO)
+		return 1;
+	if (wmgr) {
+		struct wm_window *win = wm_find(wmgr, id);
+
+		if (!win || win->minimized || !win->focused)
+			return 0;
+		*ox = win->x;
+		*oy = win->y;
+		if (win->x + win->w < *right)
+			*right = win->x + win->w;
+		if (win->y + win->h < *bottom)
+			*bottom = win->y + win->h;
+		return *right > 0 && *bottom > 0;
+	}
+	return 0;
+}
+
+/* Emit one stored command.  A display command goes at its cell, offset by
+ * its window's origin and cropped to the rectangle the window may draw in:
+ * a footprint that runs past that edge is written with a smaller source
+ * rectangle (w=/h=, in image pixels), or a smaller cell count when it is
+ * scaled into cells (c=/r=), so the part that would land on another window
+ * or off the screen is never drawn.  The pixel size of a PNG sent
+ * without s=/v= is read from its header; an image whose size still cannot
+ * be known is not cropped but squeezed into the visible cells.  A command
+ * that places nothing (a transmit, a frame, animation control) is written
+ * where the cursor is.
+ *
+ * Anything already sent once is a re-emission and goes out quiet.  An image
+ * the program named by number is re-sent under the id the host gave it, so
+ * the host does not mint a second image the program never hears of.  With
+ * lazy set, the host is trusted to still hold an image it was sent: only
+ * its placement is written again, as a placement by id without the data,
+ * asking for a reply on error (q=1) so a dropped image is found out and
+ * transmitted again (see kgfx_lazy); its data, frames, and control
+ * commands are skipped.  A lazy emission needs an id to place by. */
+static void
+kgfx_emit(struct kgfx_img *g, int lazy)
+{
+	struct kgfx_ctl c;
+	int ox, oy, right, bottom, row = 0, col = 0;
+	int cpw, cph, sw, sh, cols = 0, rows = 0, vcols, vrows;
+	char add[128], drop[16];
+	size_t n = 0;
+	int quiet = g->sent && !g->once;
+	int payload = 1;
+
+	strcpy(drop, quiet ? "q" : "");
+	if (quiet && g->num && g->id) {
+		strcat(drop, "I");
+		n += (size_t)snprintf(add + n, sizeof(add) - n, "i=%u,", g->id);
+	}
+	if (lazy && (!g->placed || g->hidden))
+		return;			/* the host has the data already */
+	if (!g->placed)
+		goto emit;			/* nothing is placed */
+	if (!gfx_window_rect(g->win, &ox, &oy, &right, &bottom))
+		return;
+	if (g->hidden) {
+		/* the program deleted this placement but kept the image:
+		 * replay carries the data only */
+		strcat(drop, "a");
+		n += (size_t)snprintf(add + n, sizeof(add) - n, "a=t,");
+		goto emit;
+	}
+	row = oy + g->row;
+	col = ox + g->col;
+	if (row < 0 || col < 0 || row >= bottom || col >= right)
+		return;
+
+	kgfx_ctl_parse(g->raw + 2, g->len - 4, &c);
+	if (!c.s || !c.v)		/* a PNG sent without s=/v= */
+		vt_kgfx_image_size(g->raw + 2, g->len - 4, &c.s, &c.v);
+	outer_cell_px(&cpw, &cph);
+	sw = c.w ? c.w : (c.s > c.x ? c.s - c.x : 0);
+	sh = c.h ? c.h : (c.v > c.y ? c.v - c.y : 0);
+	if (c.c)
+		cols = c.c;
+	else if (sw && cpw)
+		cols = (sw + cpw - 1) / cpw;
+	if (c.r)
+		rows = c.r;
+	else if (sh && cph)
+		rows = (sh + cph - 1) / cph;
+	vcols = right - col;
+	vrows = bottom - row;
+	if (cols > vcols) {
+		if (sw) {
+			int nw = c.c ? sw * vcols / cols : vcols * cpw;
+
+			if (nw > sw)
+				nw = sw;
+			n += (size_t)snprintf(add + n, sizeof(add) - n,
+			    "w=%d,", nw);
+			strcat(drop, "w");
+		}
+		if (c.c || !sw) {
+			n += (size_t)snprintf(add + n, sizeof(add) - n,
+			    "c=%d,", vcols);
+			strcat(drop, "c");
+		}
+	}
+	if (rows > vrows) {
+		if (sh) {
+			int nh = c.r ? sh * vrows / rows : vrows * cph;
+
+			if (nh > sh)
+				nh = sh;
+			n += (size_t)snprintf(add + n, sizeof(add) - n,
+			    "h=%d,", nh);
+			strcat(drop, "h");
+		}
+		if (c.r || !sh) {
+			n += (size_t)snprintf(add + n, sizeof(add) - n,
+			    "r=%d,", vrows);
+			strcat(drop, "r");
+		}
+	}
+	if (lazy) {
+		/* a placement by id: the transmission keys and the data go */
+		strcat(drop, "aftsvSOomi");
+		if (g->action == 'T')
+			payload = 0;
+		if (!(quiet && g->num))	/* not already added above */
+			n += (size_t)snprintf(add + n, sizeof(add) - n,
+			    "i=%u,", g->id);
+		n += (size_t)snprintf(add + n, sizeof(add) - n, "a=p,q=1,");
+		kgfx_lazy_push(g->win, g->id);
+	}
+	render_move_cursor(renderer, STDOUT_FILENO, row, col);
+emit:
+	if (n > 0 && n < sizeof(add))
+		add[--n] = '\0';		/* the trailing comma */
+	else
+		add[0] = '\0';
+	if (quiet && !lazy) {
+		if (n > 0)
+			strcat(add, ",");
+		strcat(add, "q=2");
+	}
+	if (drop[0] || add[0])
+		kgfx_write_edited(g->raw, g->len, drop, add, payload);
+	else
+		tio_write(STDOUT_FILENO, g->raw, g->len);
+	g->sent = 1;
+	if (!lazy)
+		g->lost = 0;
+}
 
 /* window whose images are currently drawn on the outer terminal, so a switch
  * can clear them and redraw the incoming window's */
 static uint32_t gfx_shown_win;
 
-static void
-pending_gfx_push(const struct kgfx_img *g)
+/* what pending_gfx_flush() owes the host after this frame's cells: the
+ * commands recorded since the last flush, or the visible window's whole
+ * store again after a full redraw wiped the images */
+static int gfx_emit_new;
+static int gfx_emit_all;
+
+/* the group an image id or number belongs to in a window's store, 0 if
+ * the store has not seen it */
+static uint32_t
+win_gfx_group_find(const struct client_window *cw, uint32_t img,
+    uint32_t num)
 {
-	if (pending_gfx_n >= PENDING_GFX_MAX)
-		return;
-	pending_gfx[pending_gfx_n++] = *g;	/* shares g->raw, does not own it */
+	int i;
+
+	for (i = cw->gfx_n - 1; i >= 0; i--) {
+		const struct kgfx_img *g = &cw->gfx[i];
+
+		if ((img && g->id == img) || (num && g->num == num))
+			return g->grp;
+	}
+	return 0;
 }
 
-/* Append an image to a window's persistent store, evicting the oldest when
- * full, and queue it for emission this frame.  The store owns the bytes. */
+/* the host's id for an image in a window's store, 0 while unknown; the
+ * command that opened it carries the id, its continuation chunks none */
+static uint32_t
+win_gfx_group_id(const struct client_window *cw, uint32_t grp)
+{
+	int i;
+
+	for (i = 0; i < cw->gfx_n; i++)
+		if (cw->gfx[i].grp == grp && cw->gfx[i].id)
+			return cw->gfx[i].id;
+	return 0;
+}
+
+/* drop every command of one image from a window's store */
+static void
+win_gfx_drop_group(struct client_window *cw, uint32_t grp)
+{
+	int i = 0, k = 0;
+
+	for (i = 0; i < cw->gfx_n; i++) {
+		if (cw->gfx[i].grp == grp) {
+			cw->gfx_bytes -= cw->gfx[i].len;
+			free(cw->gfx[i].raw);
+		} else {
+			cw->gfx[k++] = cw->gfx[i];
+		}
+	}
+	cw->gfx_n = k;
+	if (cw->gfx_open_grp == grp)
+		cw->gfx_open_grp = 0;
+}
+
+/* drop the i'th command alone (a placement, or a query or delete already
+ * sent) */
+static void
+win_gfx_drop_at(struct client_window *cw, int i)
+{
+	cw->gfx_bytes -= cw->gfx[i].len;
+	free(cw->gfx[i].raw);
+	memmove(cw->gfx + i, cw->gfx + i + 1,
+	    (size_t)(cw->gfx_n - i - 1) * sizeof(cw->gfx[0]));
+	cw->gfx_n--;
+}
+
+/* Append a command to a window's store and have it sent after this
+ * frame's cells.  The store owns the bytes.  A continuation chunk (m=1
+ * follow-ups carry no action, id, or number) joins the image whose
+ * transmit is still open; anything else joins the image its id or number
+ * names, or starts a new one.  Older images are evicted past the byte cap,
+ * the newest never, so a large image still shows at least once. */
 static void
 win_gfx_add(struct client_window *cw, int row, int col, int introducer,
-    const char *data, size_t len)
+    const char *data, size_t len, const struct kgfx_ctl *c)
 {
 	struct kgfx_img *g;
 	char *raw;
+	uint32_t grp;
+	int cont = !c->action && !c->img && !c->num && cw->gfx_open_grp;
 
+	if (cw->gfx_n >= cw->gfx_cap) {
+		int ncap = cw->gfx_cap ? cw->gfx_cap * 2 : 64;
+		struct kgfx_img *ng = realloc(cw->gfx,
+		    (size_t)ncap * sizeof(*ng));
+
+		if (!ng)
+			return;
+		cw->gfx = ng;
+		cw->gfx_cap = ncap;
+	}
 	raw = malloc(len + 4);
 	if (!raw)
 		return;
@@ -806,18 +1349,81 @@ win_gfx_add(struct client_window *cw, int row, int col, int introducer,
 	raw[len + 2] = '\033';
 	raw[len + 3] = '\\';
 
-	if (cw->gfx_n >= KGFX_MAX) {
-		free(cw->gfx[0].raw);
-		memmove(cw->gfx, cw->gfx + 1,
-		    (KGFX_MAX - 1) * sizeof(cw->gfx[0]));
-		cw->gfx_n = KGFX_MAX - 1;
-	}
+	if (cont)
+		grp = cw->gfx_open_grp;
+	else if ((grp = win_gfx_group_find(cw, c->img, c->num)) == 0)
+		grp = ++cw->gfx_grp_next;
+	cw->gfx_open_grp = c->more ? grp : 0;
+
 	g = &cw->gfx[cw->gfx_n++];
+	memset(g, 0, sizeof(*g));
 	g->raw = raw;
 	g->len = len + 4;
 	g->row = row;
 	g->col = col;
-	pending_gfx_push(g);
+	g->num = c->num;
+	g->id = c->img;
+	g->plc = c->plc;
+	g->grp = grp;
+	g->win = cw->id;
+	g->action = c->action;
+	g->placed = (c->action == 'T' || c->action == 'p');
+	g->once = (c->action == 'q' || c->action == 'd');
+	cw->gfx_bytes += g->len;
+	gfx_emit_new = 1;
+
+	while (cw->gfx_bytes > KGFX_STORE_BYTES_MAX && cw->gfx[0].grp != grp)
+		win_gfx_drop_group(cw, cw->gfx[0].grp);
+}
+
+/* Apply a delete command (a=d) to the commands before index upto in a
+ * window's store, so a replay does not bring back what the program
+ * removed.  It runs as the delete is written to the host, so everything it
+ * touches has been sent and the host sees the same order the program
+ * produced.  Returns how many entries it removed.  A lowercase target removes
+ * placements and keeps the image data: a placement-only command goes, a
+ * transmit-and-display one stays as data.  An uppercase target frees the
+ * image, so its whole group goes.  Targets by cell, column, row, or
+ * z-range are not modelled; the host still gets the command. */
+static int
+win_gfx_delete(struct client_window *cw, const struct kgfx_ctl *c, int upto)
+{
+	int tgt = c->del ? c->del : 'a';
+	int lower = (tgt >= 'a' && tgt <= 'z');
+	int sel = lower ? tgt : tgt - 'A' + 'a';
+	int i = 0, before = cw->gfx_n;
+
+	if (sel != 'a' && sel != 'i' && sel != 'n' && sel != 'p')
+		return 0;
+	while (i < upto) {
+		struct kgfx_img *g = &cw->gfx[i];
+		int hit;
+
+		switch (sel) {
+		case 'a': hit = 1;					break;
+		case 'i': hit = (g->id == c->img);			break;
+		case 'n': hit = (g->num == c->num);			break;
+		default:  hit = (g->id == c->img && g->plc == c->plc);	break;
+		}
+		if (!hit || g->once) {
+			i++;
+		} else if (!lower) {
+			int n = cw->gfx_n;
+
+			win_gfx_drop_group(cw, g->grp);
+			upto -= n - cw->gfx_n;
+			i = 0;
+		} else if (!g->placed) {
+			i++;
+		} else if (g->action == 'T' && (g->id || g->num)) {
+			g->hidden = 1;		/* re-placeable by id: keep data */
+			i++;
+		} else {
+			win_gfx_drop_at(cw, i);	/* placement only, or anonymous */
+			upto--;
+		}
+	}
+	return before - cw->gfx_n;
 }
 
 static void
@@ -827,7 +1433,12 @@ win_gfx_free(struct client_window *cw)
 
 	for (i = 0; i < cw->gfx_n; i++)
 		free(cw->gfx[i].raw);
+	free(cw->gfx);
+	cw->gfx = NULL;
 	cw->gfx_n = 0;
+	cw->gfx_cap = 0;
+	cw->gfx_bytes = 0;
+	cw->gfx_open_grp = 0;
 }
 
 /* DCS passthrough: forward SIXEL and other DCS sequences to the outer
@@ -841,26 +1452,38 @@ dcs_passthru(void *ctx, int introducer, const char *data, size_t len)
 	struct client_window *cw = cwin_find(id);
 	char intro[2];
 
-	/* only pass through when a single pane is visible */
-	if (!tilemgr || tile_pane_count(tilemgr) != 1)
-		return;
+	int single = tilemgr && tile_pane_count(tilemgr) == 1;
+	int turbo = client_mode == CLIENT_MODE_TURBO && wmgr != NULL;
+
 	if (!watching)
 		return;
 
-	/* kitty graphics from the visible window: record for render-time
+	/* kitty graphics from the focused window: record for render-time
 	 * emission at the current cell, then advance the cursor past the
-	 * image so the following output flows below it. */
-	if (introducer == '_' && len >= 1 && data[0] == 'G' &&
-	    cw && watched_id == id) {
+	 * image so the following output flows below it.  In turbo mode the
+	 * focused window is the one on top, and kgfx_emit() crops the image
+	 * to it; other DCS content has no crop, so it still needs the single
+	 * fullscreen pane below. */
+	if ((single || turbo) && introducer == '_' && len >= 1 &&
+	    data[0] == 'G' && cw && watched_id == id) {
+		struct kgfx_ctl c;
 		int cpw, cph;
 
+		kgfx_ctl_parse(data, len, &c);
 		outer_cell_px(&cpw, &cph);
 		win_gfx_add(cw, cw->vt->cursor_row, cw->vt->cursor_col,
-		    introducer, data, len);
+		    introducer, data, len, &c);
 		vt_kgfx_account(cw->vt, data, len, cpw, cph);
+		/* the host answers unless told not to; remember who asked
+		 * so stdin_kgfx_reply() can hand the answer back */
+		if (c.quiet < 2)
+			kgfx_pend_push(id, c.num, c.img);
 		need_render = 1;
 		return;
 	}
+
+	if (!single)
+		return;
 
 	/* other DCS/APC (SIXEL, etc.): forward verbatim as before */
 	intro[0] = '\033';
@@ -870,33 +1493,160 @@ dcs_passthru(void *ctx, int introducer, const char *data, size_t len)
 	tio_write(STDOUT_FILENO, "\033\\", 2);
 }
 
-/* A window's OSC 10/11 (foreground/background color) query that has been
- * forwarded to the outer terminal, awaiting that terminal's reply so it can
- * be routed back to the window that asked. 0 means none outstanding.
+/* The hosting terminal's default foreground and background, as the X11
+ * color specs it reported ("rgb:rrrr/gggg/bbbb"), or "" while unknown.
  *
- * Without this, a query like this has nowhere to go: the client's own
- * renderer regenerates escape sequences from its cell buffer rather than
- * passing PTY bytes through verbatim, so an unhandled query is silently
- * absorbed and the asking program never hears back -- it then guesses a
- * background it thinks is likely, and any color chosen assuming the wrong
- * one (a muted foreground meant to sit on a light background, say) can end
- * up unreadable against the real, differently-colored terminal. Only one
- * query is tracked at a time; a second one before the first answers simply
- * replaces it, which just means the first asker never hears back -- the
- * same outcome as today, not a new failure mode. */
-static uint32_t osc_color_query_pending_id;
-static int osc_color_query_pending_num;
+ * Programs ask for these with OSC 10/11 queries, and they expect the
+ * answer in order with the DA1 reply they send right after as a sentinel.
+ * The client cannot keep that order by relaying the question to the
+ * terminal: the mserver's VT answers DA1 at once, and the relayed reply
+ * arrives after the program has stopped listening, landing on the shell's
+ * command line as "^[]11;rgb:...". So the client asks the terminal at
+ * startup, again on a session switch and after roaming, and reports the
+ * answers to every mserver, whose VT then answers such queries itself
+ * (IPC_MSG_TERM_COLORS). A window's own OSC 10/11 query
+ * is dropped here rather than relayed. */
+static char term_fg[64];
+static char term_bg[64];
+static time_t term_reply_asked;	/* when the startup query went out, else 0 */
+
+/* how long after asking the terminal its replies are still expected */
+#define TERM_COLOR_WAIT_SEC 3
+
+/* a terminal reply to the startup color query is on its way: a partial
+ * one at the tail of stdin may be held for its remaining bytes */
+static int
+term_reply_expected(void)
+{
+	return term_reply_asked != 0 &&
+	    time(NULL) - term_reply_asked <= TERM_COLOR_WAIT_SEC;
+}
+
+static void
+term_colors_send(struct mconn *mc)
+{
+	char payload[sizeof(term_fg) + sizeof(term_bg)];
+	size_t fl = strlen(term_fg) + 1;
+	size_t bl = strlen(term_bg) + 1;
+
+	if (!term_fg[0] && !term_bg[0])
+		return;
+	memcpy(payload, term_fg, fl);
+	memcpy(payload + fl, term_bg, bl);
+	mconn_ipc_send(mc, IPC_MSG_TERM_COLORS, payload, (uint32_t)(fl + bl));
+}
+
+static void
+term_colors_send_all(void)
+{
+	int i;
+
+	for (i = 0; i < mconn_count; i++)
+		term_colors_send(&mconns[i]);
+}
+
+/* an OSC reply from the terminal, as the payload between ESC ] and the
+ * terminator: keep a color answer and pass it on to the mservers */
+static void
+term_color_learn(const char *data, size_t len)
+{
+	int num = 0;
+	size_t i;
+	char *dst;
+
+	for (i = 0; i < len && data[i] >= '0' && data[i] <= '9'; i++)
+		num = num * 10 + (data[i] - '0');
+	if (i == 0 || i >= len || data[i] != ';')
+		return;
+	if (num == 10)
+		dst = term_fg;
+	else if (num == 11)
+		dst = term_bg;
+	else
+		return;
+	i++;
+	if (len - i == 0 || len - i >= sizeof(term_fg))
+		return;
+	memcpy(dst, data + i, len - i);
+	dst[len - i] = '\0';
+	term_colors_send_all();
+}
+
+/* ask the terminal for its default colors; the replies arrive on stdin
+ * and are picked out by stdin_osc_extract() */
+static void
+term_colors_query(void)
+{
+	tio_write(STDOUT_FILENO, "\033]10;?\033\\\033]11;?\033\\", 16);
+	term_reply_asked = time(NULL);
+}
+
+/* Ask the terminal its cell pixel size when its winsize does not say:
+ * CSI 16 t reports the cell size and CSI 14 t the text area size, which
+ * divided by the row and column count gives the same.  Both are sent;
+ * a terminal that knows neither stays silent.  Kitty graphics need the
+ * size to place the cursor below an image shown at natural size. */
+static void
+term_cell_px_query(void)
+{
+	struct winsize ws;
+
+	if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0 &&
+	    ws.ws_xpixel > 0 && ws.ws_ypixel > 0)
+		return;
+	tio_write(STDOUT_FILENO, "\033[16t\033[14t", 10);
+	term_reply_asked = time(NULL);
+}
+
+/* the terminal's answer to a size query, as the CSI parameters before the
+ * final t ("6;h;w" for a cell size, "4;h;w" for the text area): keep the
+ * cell size and, when it changed, tell the mservers so their ptys carry
+ * the new pixel dimensions */
+static void
+term_cell_learn(const char *data, size_t len)
+{
+	int n[3] = { 0, 0, 0 };
+	int k = 0, pw, ph;
+	size_t i;
+
+	for (i = 0; i < len && k < 3; i++) {
+		if (data[i] == ';')
+			k++;
+		else if (data[i] >= '0' && data[i] <= '9')
+			n[k] = n[k] * 10 + (data[i] - '0');
+		else
+			return;
+	}
+	if (n[0] == 6) {
+		ph = n[1];
+		pw = n[2];
+	} else if (n[0] == 4 && term_cell_src != 6 &&
+	    content_rows > 0 && content_cols > 0) {
+		ph = n[1] / content_rows;
+		pw = n[2] / content_cols;
+	} else {
+		return;
+	}
+	if (pw <= 0 || ph <= 0)
+		return;
+	term_cell_src = n[0];
+	if (pw == term_cell_pw && ph == term_cell_ph)
+		return;
+	term_cell_pw = pw;
+	term_cell_ph = ph;
+	micro_resize_all(content_rows, content_cols);
+}
 
 /* OSC passthrough: forward desktop-notification OSCs (kitty OSC 99, the
- * simple OSC 9 form, OSC 777 "notify") and OSC 10/11 (foreground/background
- * color queries) from any window to the outer terminal. Notifications need
- * no answer; a color query does, and stdin_osc_reply() below routes the
- * terminal's reply back to whichever window asked. */
+ * simple OSC 9 form, OSC 777 "notify") and OSC 52 clipboard writes from any
+ * window to the outer terminal. None of these expects an answer. */
 static void
 osc_passthru(void *ctx, const char *data, size_t len)
 {
 	int num = 0;
 	size_t i;
+
+	(void)ctx;
 
 	/* parse the leading "N;" selector */
 	for (i = 0; i < len && data[i] >= '0' && data[i] <= '9'; i++)
@@ -904,12 +1654,7 @@ osc_passthru(void *ctx, const char *data, size_t len)
 	if (i == 0 || i >= len || data[i] != ';')
 		return;
 
-	if (num == 10 || num == 11) {
-		/* only a query ("?") expects an answer; a set request (an
-		 * actual color spec) has nothing to route back */
-		if (len - i - 1 != 1 || data[i + 1] != '?')
-			return;
-	} else if (num == 52) {
+	if (num == 52) {
 		/* OSC 52 set-clipboard, "52;<sel>;<b64>": forward a window's
 		 * copy to the outer terminal's system clipboard. A read
 		 * request ("52;<sel>;?") would make the terminal reply to our
@@ -922,6 +1667,11 @@ osc_passthru(void *ctx, const char *data, size_t len)
 		dlen = (size_t)(data + len - (semi2 + 1));
 		if (dlen == 1 && semi2[1] == '?')
 			return;			/* read request */
+		/* a viewer does not want its clipboard replaced by what
+		 * someone else copied: only the client holding the keyboard
+		 * passes a copy on to its terminal */
+		if (client_role != IPC_ROLE_WRITE)
+			return;
 	} else if (num != 9 && num != 99 && num != 777) {
 		return;
 	}
@@ -929,53 +1679,13 @@ osc_passthru(void *ctx, const char *data, size_t len)
 	if (!watching)
 		return;
 
-	/* only arm the pending-reply state once the query is actually
-	 * forwarded below -- doing this earlier would leave a stale
-	 * pending window id for a query that never reached the outer
-	 * terminal (e.g. during startup, before a window is watched) */
-	if (num == 10 || num == 11) {
-		osc_color_query_pending_id = (uint32_t)(uintptr_t)ctx;
-		osc_color_query_pending_num = num;
-	}
-
 	/* re-wrap as ESC ] <data> ST for the host terminal */
 	tio_write(STDOUT_FILENO, "\033]", 2);
 	tio_write(STDOUT_FILENO, data, len);
 	tio_write(STDOUT_FILENO, "\033\\", 2);
 }
 
-/* the outer terminal's reply to a color query forwarded by osc_passthru()
- * above: route it back to the window that asked, as raw input, in the same
- * OSC form a real terminal would have sent it directly. */
-static void
-stdin_osc_reply(void *ctx, const char *data, size_t len)
-{
-	int num = 0;
-	size_t i;
-	struct mconn *mc;
-	char out[320];
-	int n;
-
-	(void)ctx;
-
-	if (!osc_color_query_pending_id)
-		return;
-
-	for (i = 0; i < len && data[i] >= '0' && data[i] <= '9'; i++)
-		num = num * 10 + (data[i] - '0');
-	if (i == 0 || i >= len || data[i] != ';' || num != osc_color_query_pending_num)
-		return;
-
-	mc = mconn_find_by_pid((pid_t)osc_color_query_pending_id);
-	osc_color_query_pending_id = 0;
-	if (!mc)
-		return;
-
-	n = snprintf(out, sizeof(out), "\033]%.*s\033\\",
-	    (int)len, data);
-	if (n > 0 && n < (int)sizeof(out))
-		mconn_ipc_send(mc, IPC_MSG_INPUT, out, (uint32_t)n);
-}
+static void window_bell(void *ctx);
 
 static struct client_window *
 cwin_add_sized(uint32_t id, int rows, int cols)
@@ -997,12 +1707,18 @@ cwin_add_sized(uint32_t id, int rows, int cols)
 	}
 	vt_parse_set_dcs_cb(cw->parser, dcs_passthru, (void *)(uintptr_t)id);
 	vt_parse_set_osc_cb(cw->parser, osc_passthru, (void *)(uintptr_t)id);
+	vt_state_set_bell_cb(cw->vt, window_bell, (void *)(uintptr_t)id);
 	cw->pred = predict_new();
 	cw->keep_open = -1;	/* inherit global default */
 	cw->dead = 0;
 	cw->scroll_lock = 0;
 	cw->input_lock = 0;
-	cw->gfx_n = 0;		/* no recorded images yet (reused slot) */
+	cw->gfx = NULL;		/* no recorded graphics yet (reused slot) */
+	cw->gfx_n = 0;
+	cw->gfx_cap = 0;
+	cw->gfx_bytes = 0;
+	cw->gfx_grp_next = 0;
+	cw->gfx_open_grp = 0;
 	cwin_count++;
 	return cw;
 }
@@ -1037,6 +1753,8 @@ cwin_remove(uint32_t id)
 				    "\033_Ga=d,d=a\033\\", 12);
 				gfx_shown_win = 0;
 			}
+			kgfx_pend_drop_win(id);
+			kgfx_lazy_drop_win(id);
 			win_gfx_free(&cwins[i]);
 			cwins[i] = cwins[--cwin_count];
 			return;
@@ -1374,6 +2092,75 @@ turbo_cursor(int *row, int *col, int *vis)
 	*vis = 0;
 }
 
+/* emit graphics commands recorded during parsing, after the cells have been
+ * drawn and the cursor positioned: the new ones, or the visible window's
+ * whole store again when a full redraw wiped the images.  Each display
+ * command is written at its cell offset by its window's origin and cropped
+ * to the window (kgfx_emit); the writes move the outer cursor, so tracking
+ * is invalidated and the cursor is put back where the rendered content
+ * expects it (crow/ccol).  A query or delete is forgotten once sent.  An
+ * image the host already holds is only placed again when lazy replay is
+ * on, unless the host said it lost it; one it has not seen, or one whose
+ * id is unknown, is transmitted in full. */
+static void
+pending_gfx_flush(int crow, int ccol)
+{
+	struct client_window *cw;
+	int i, moved = 0;
+
+	if (!gfx_emit_new && !gfx_emit_all)
+		return;
+	cw = cwin_find(watched_id);
+	if (cw) {
+		for (i = 0; i < cw->gfx_n; i++) {
+			struct kgfx_img *g = &cw->gfx[i];
+
+			if (!gfx_emit_all && g->sent && !g->lost)
+				continue;
+			kgfx_emit(g, gfx_replay_lazy && g->sent && !g->lost &&
+			    win_gfx_group_id(cw, g->grp) != 0);
+			moved |= g->placed;
+			if (g->action == 'd') {
+				struct kgfx_ctl c;
+
+				kgfx_ctl_parse(g->raw + 2, g->len - 4, &c);
+				i -= win_gfx_delete(cw, &c, i);
+			}
+		}
+		i = 0;
+		while (i < cw->gfx_n) {
+			if (cw->gfx[i].once && cw->gfx[i].sent)
+				win_gfx_drop_at(cw, i);
+			else
+				i++;
+		}
+	}
+	gfx_emit_new = 0;
+	gfx_emit_all = 0;
+	if (moved) {
+		render_invalidate_cursor(renderer);
+		render_move_cursor(renderer, STDOUT_FILENO, crow, ccol);
+	}
+}
+
+/* Have the visible window's image store re-emitted.  After a full redraw
+ * this is mandatory: it emitted ED, which the outer terminal treats as
+ * deleting every image (each is anchored to a now-cleared cell).  On a
+ * diff redraw it is needed only when the visible window changed without
+ * one, in which case the old window's images are deleted first. */
+static void
+gfx_replay_queue(int full)
+{
+	if (!full) {
+		if (watched_id == gfx_shown_win)
+			return;
+		tio_write(STDOUT_FILENO, "\033_Ga=d,d=a\033\\", 12);
+		render_invalidate_cursor(renderer);
+	}
+	gfx_emit_all = 1;
+	gfx_shown_win = watched_id;
+}
+
 static void
 turbo_render(void)
 {
@@ -1393,11 +2180,14 @@ turbo_render(void)
 		    wm_screen(wmgr), wm_rows(wmgr), wm_cols(wmgr),
 		    crow, ccol, cvis);
 		turbo_need_full = 0;
+		gfx_replay_queue(1);
 	} else {
+		gfx_replay_queue(0);
 		render_cells_diff(renderer, STDOUT_FILENO,
 		    wm_screen(wmgr), wm_rows(wmgr), wm_cols(wmgr),
 		    crow, ccol, cvis, wm_row_dirty(wmgr));
 	}
+	pending_gfx_flush(crow, ccol);
 }
 
 /* callback for overlay_pop in turbo mode -- recomposite the full
@@ -1422,28 +2212,6 @@ turbo_repaint(void)
 
 /* ---- tiled mode helpers ---- */
 
-/* emit graphics images recorded during parsing, after the cells have been
- * drawn and the cursor positioned.  Each image is written at its recorded
- * cell; the writes move the outer cursor, so tracking is invalidated and the
- * cursor is put back where the rendered content expects it (crow/ccol). */
-static void
-pending_gfx_flush(int crow, int ccol)
-{
-	int i;
-
-	if (pending_gfx_n == 0)
-		return;
-	for (i = 0; i < pending_gfx_n; i++) {
-		render_move_cursor(renderer, STDOUT_FILENO,
-		    pending_gfx[i].row, pending_gfx[i].col);
-		tio_write(STDOUT_FILENO, pending_gfx[i].raw,
-		    pending_gfx[i].len);
-	}
-	pending_gfx_n = 0;	/* raw is owned by each window's store */
-	render_invalidate_cursor(renderer);
-	render_move_cursor(renderer, STDOUT_FILENO, crow, ccol);
-}
-
 static void
 tiled_render(void)
 {
@@ -1462,37 +2230,9 @@ tiled_render(void)
 		    tile_cols(tilemgr), crow, ccol, cvis);
 		tile_need_full = 0;
 
-		/* A full redraw emits ED, which the outer terminal treats as
-		 * deleting every image (each is anchored to a now-cleared
-		 * cell).  Redraw the whole visible window's image store. */
-		{
-			struct client_window *cw = cwin_find(watched_id);
-			int i;
-
-			pending_gfx_n = 0;	/* store re-emit supersedes queue */
-			if (cw)
-				for (i = 0; i < cw->gfx_n; i++)
-					pending_gfx_push(&cw->gfx[i]);
-			gfx_shown_win = watched_id;
-		}
+		gfx_replay_queue(1);
 	} else {
-		/* Diff redraw keeps images in place.  If the visible window
-		 * changed without a full redraw (no ED ran), clear the old
-		 * window's images and queue the new window's; otherwise the
-		 * queue already holds any images drawn this frame. */
-		if (watched_id != gfx_shown_win) {
-			struct client_window *cw = cwin_find(watched_id);
-			int i;
-
-			tio_write(STDOUT_FILENO, "\033_Ga=d,d=a\033\\", 12);
-			render_invalidate_cursor(renderer);
-			pending_gfx_n = 0;
-			if (cw)
-				for (i = 0; i < cw->gfx_n; i++)
-					pending_gfx_push(&cw->gfx[i]);
-			gfx_shown_win = watched_id;
-		}
-
+		gfx_replay_queue(0);
 		render_cells_diff(renderer, STDOUT_FILENO,
 		    tile_screen(tilemgr), tile_rows(tilemgr),
 		    tile_cols(tilemgr), crow, ccol, cvis,
@@ -2205,15 +2945,19 @@ sync_host_title(const char *title)
 	 * that says the session is being watched. */
 	const char *shared = (share_marker[0] && !taskbar_visible)
 	    ? " [shared]" : "";
+	/* a viewer sees the same session as the writer, so it gets the same
+	 * title, marked so a glance at the window list tells the roles apart */
+	const char *viewing = client_role == IPC_ROLE_VIEW ? " [viewing]" : "";
 
 	if (title && title[0])
 		len = snprintf(buf, sizeof(buf),
-		    "\033]2;lumi - %s:%s%s\033\\",
-		    session_name ? session_name : "", title, shared);
+		    "\033]2;lumi - %s:%s%s%s\033\\",
+		    session_name ? session_name : "", title, viewing,
+		    shared);
 	else
 		len = snprintf(buf, sizeof(buf),
-		    "\033]2;lumi - %s%s\033\\",
-		    session_name ? session_name : "", shared);
+		    "\033]2;lumi - %s%s%s\033\\",
+		    session_name ? session_name : "", viewing, shared);
 	if (len > 0 && len < (int)sizeof(buf)) {
 		tio_write(STDOUT_FILENO, buf, (size_t)len);
 		tio_flush(STDOUT_FILENO);
@@ -2368,10 +3112,11 @@ turbo_sync_windows(void)
 	}
 }
 
-/* map window-order index to PID using sessdir state.
- * fills order[] with up to max PIDs, returns count. */
+/* the session's window-number slot map from the state file: nums[n] is
+ * the server pid of window number n, 0 a spare number. a saved layout
+ * names windows by these numbers. returns the slot count, 0 on error. */
 static int
-layout_get_order(const char *session, pid_t *order, int max)
+layout_get_nums(const char *session, pid_t *nums, int max)
 {
 	struct sessdir_state *st;
 	int n;
@@ -2379,9 +3124,31 @@ layout_get_order(const char *session, pid_t *order, int max)
 	st = sessdir_state_open(session);
 	if (!st)
 		return 0;
-	n = sessdir_state_order(st, order, max);
+	n = sessdir_state_nums(st, nums, max);
 	sessdir_state_close(st);
 	return (n > 0) ? n : 0;
+}
+
+/* the stable window number of a server pid in a slot map, or -1 */
+static int
+layout_num_of(const pid_t *nums, int nnums, uint32_t id)
+{
+	int i;
+
+	for (i = 0; i < nnums; i++)
+		if (nums[i] != 0 && (uint32_t)nums[i] == id)
+			return i;
+	return -1;
+}
+
+/* the server pid holding window number num in a slot map, or 0 when the
+ * number is out of range or spare (its window has exited) */
+static uint32_t
+layout_pid_of(const pid_t *nums, int nnums, int num)
+{
+	if (num < 0 || num >= nnums)
+		return 0;
+	return (uint32_t)nums[num];
 }
 
 /* apply turbo layout: reposition wm windows from saved geometry.
@@ -2390,23 +3157,26 @@ static void
 turbo_apply_layout(const char *session)
 {
 	struct sessdir_turbo_layout layout;
-	pid_t order[SESSDIR_LAYOUT_MAX_WINS];
-	int norder, i;
+	pid_t nums[SESSDIR_LAYOUT_MAX_WINS];
+	int nnums, i;
 
 	if (sessdir_layout_load_turbo(session, &layout) < 0)
 		return;
 
-	norder = layout_get_order(session, order, SESSDIR_LAYOUT_MAX_WINS);
-	if (norder == 0)
+	nnums = layout_get_nums(session, nums, SESSDIR_LAYOUT_MAX_WINS);
+	if (nnums == 0)
 		return;
 
-	for (i = 0; i < layout.nwins && i < norder; i++) {
+	for (i = 0; i < layout.nwins; i++) {
 		struct wm_window *win;
 		struct client_window *cw;
+		uint32_t id;
 
 		if (!layout.wins[i].valid)
 			continue;
-		win = wm_find(wmgr, (uint32_t)order[i]);
+		/* a number whose window has exited is simply skipped */
+		id = layout_pid_of(nums, nnums, i);
+		win = id ? wm_find(wmgr, id) : NULL;
 		if (!win)
 			continue;
 
@@ -2430,9 +3200,10 @@ turbo_apply_layout(const char *session)
 		}
 	}
 
-	/* apply saved focus */
-	if (layout.focus >= 0 && layout.focus < norder) {
-		uint32_t fid = (uint32_t)order[layout.focus];
+	/* apply saved focus, if that window is still here */
+	if (layout_pid_of(nums, nnums, layout.focus) != 0 &&
+	    wm_find(wmgr, layout_pid_of(nums, nnums, layout.focus))) {
+		uint32_t fid = layout_pid_of(nums, nnums, layout.focus);
 
 		wm_focus(wmgr, fid);
 		watched_id = fid;
@@ -2472,7 +3243,7 @@ screen_tile_tree_free(struct tile_node *tn)
  * session's foreground window. */
 static struct tile_node *
 screen_build_tile_tree(const struct sessdir_tree_node *sn,
-    const pid_t *order, int norder,
+    const pid_t *nums, int nnums,
     struct client_window *(*find_cw)(uint32_t))
 {
 	struct tile_node *tn;
@@ -2484,10 +3255,8 @@ screen_build_tile_tree(const struct sessdir_tree_node *sn,
 		uint32_t id;
 		struct client_window *cw;
 
-		if (sn->win_index < 0 || sn->win_index >= norder)
-			return NULL;
-		id = (uint32_t)order[sn->win_index];
-		cw = find_cw(id);
+		id = layout_pid_of(nums, nnums, sn->win_num);
+		cw = id ? find_cw(id) : NULL;
 		if (!cw)
 			return NULL;
 
@@ -2502,8 +3271,8 @@ screen_build_tile_tree(const struct sessdir_tree_node *sn,
 	tn->type = (sn->type == SESSDIR_TREE_SPLIT_H)
 	    ? TILE_SPLIT_H : TILE_SPLIT_V;
 	tn->split_pos = sn->split_pos;
-	tn->a = screen_build_tile_tree(sn->a, order, norder, find_cw);
-	tn->b = screen_build_tile_tree(sn->b, order, norder, find_cw);
+	tn->a = screen_build_tile_tree(sn->a, nums, nnums, find_cw);
+	tn->b = screen_build_tile_tree(sn->b, nums, nnums, find_cw);
 
 	if (!tn->a || !tn->b) {
 		/* collapse the split onto whichever side survived */
@@ -2533,21 +3302,21 @@ static int
 screen_apply_layout(const char *session)
 {
 	struct sessdir_screen_layout layout;
-	pid_t order[SESSDIR_LAYOUT_MAX_WINS];
-	int norder;
+	pid_t nums[SESSDIR_LAYOUT_MAX_WINS];
+	int nnums;
 	struct tile_node *root;
 	int made_new;
 
 	if (sessdir_layout_load_screen(session, &layout) < 0)
 		return -1;
 
-	norder = layout_get_order(session, order, SESSDIR_LAYOUT_MAX_WINS);
-	if (norder == 0) {
+	nnums = layout_get_nums(session, nums, SESSDIR_LAYOUT_MAX_WINS);
+	if (nnums == 0) {
 		sessdir_tree_free(layout.root);
 		return -1;
 	}
 
-	root = screen_build_tile_tree(layout.root, order, norder, cwin_find);
+	root = screen_build_tile_tree(layout.root, nums, nnums, cwin_find);
 	sessdir_tree_free(layout.root);
 
 	if (!root)
@@ -2581,10 +3350,10 @@ screen_apply_layout(const char *session)
 
 	/* apply the saved focus, then read back what took effect.
 	 * tile_focus() ignores an id that is not a pane in this tree, so
-	 * a stale saved index would otherwise leave the client watching
+	 * a stale saved number would otherwise leave the client watching
 	 * (and the taskbar highlighting) a window that no pane shows. */
-	if (layout.focus >= 0 && layout.focus < norder)
-		tile_focus(tilemgr, (uint32_t)order[layout.focus]);
+	if (layout_pid_of(nums, nnums, layout.focus) != 0)
+		tile_focus(tilemgr, layout_pid_of(nums, nnums, layout.focus));
 	if (tile_focused_id(tilemgr) == 0) {
 		uint32_t first = 0;
 
@@ -2610,20 +3379,21 @@ static void
 turbo_save_layout(const char *session)
 {
 	struct sessdir_turbo_layout layout;
-	pid_t order[SESSDIR_LAYOUT_MAX_WINS];
-	int norder, i;
+	pid_t nums[SESSDIR_LAYOUT_MAX_WINS];
+	int nnums, i;
 
-	norder = layout_get_order(session, order, SESSDIR_LAYOUT_MAX_WINS);
-	if (norder == 0)
+	nnums = layout_get_nums(session, nums, SESSDIR_LAYOUT_MAX_WINS);
+	if (nnums == 0)
 		return;
 
 	memset(&layout, 0, sizeof(layout));
 	layout.focus = -1;
 
-	for (i = 0; i < norder; i++) {
+	/* one slot per window number; a spare number stays invalid */
+	for (i = 0; i < nnums; i++) {
 		struct wm_window *win;
 
-		win = wm_find(wmgr, (uint32_t)order[i]);
+		win = nums[i] ? wm_find(wmgr, (uint32_t)nums[i]) : NULL;
 		if (!win)
 			continue;
 		layout.wins[i].x = win->x;
@@ -2642,36 +3412,29 @@ turbo_save_layout(const char *session)
 
 /* recursively convert tile_node to sessdir_tree_node.
  *
- * a pane holding a window that is not in the session's window order
- * (an empty pane, or one whose window has exited) cannot be described
- * by an index, and a leaf saved with index -1 restores as a blank pane
- * on the next attach.  return NULL for such a pane so the layout is
- * saved without a tree instead. */
+ * a pane holding a window that has no window number (an empty pane, or
+ * one whose window has exited) cannot be described, and a leaf saved
+ * with number -1 would restore as a blank pane on the next attach.
+ * return NULL for such a pane so the layout is saved without a tree
+ * instead. */
 static struct sessdir_tree_node *
 screen_export_tree(const struct tile_node *tn,
-    const pid_t *order, int norder)
+    const pid_t *nums, int nnums)
 {
 	struct sessdir_tree_node *sn;
-	int i;
 
 	if (!tn)
 		return NULL;
 
 	if (tn->type == TILE_LEAF) {
-		int idx = -1;
+		int num = layout_num_of(nums, nnums, tn->window_id);
 
-		for (i = 0; i < norder; i++) {
-			if ((uint32_t)order[i] == tn->window_id) {
-				idx = i;
-				break;
-			}
-		}
-		if (idx < 0)
+		if (num < 0)
 			return NULL;
 
 		sn = xcalloc(1, sizeof(*sn));
 		sn->type = SESSDIR_TREE_LEAF;
-		sn->win_index = idx;
+		sn->win_num = num;
 		return sn;
 	}
 
@@ -2679,8 +3442,8 @@ screen_export_tree(const struct tile_node *tn,
 	sn->type = (tn->type == TILE_SPLIT_H)
 	    ? SESSDIR_TREE_SPLIT_H : SESSDIR_TREE_SPLIT_V;
 	sn->split_pos = tn->split_pos;
-	sn->a = screen_export_tree(tn->a, order, norder);
-	sn->b = screen_export_tree(tn->b, order, norder);
+	sn->a = screen_export_tree(tn->a, nums, nnums);
+	sn->b = screen_export_tree(tn->b, nums, nnums);
 
 	if (!sn->a || !sn->b) {
 		/* one side is unrepresentable -- drop the whole split */
@@ -2696,30 +3459,21 @@ screen_save_layout(const char *session)
 {
 	struct sessdir_screen_layout layout;
 	struct tile_node *root;
-	pid_t order[SESSDIR_LAYOUT_MAX_WINS];
-	int norder, i;
-	uint32_t fid;
+	pid_t nums[SESSDIR_LAYOUT_MAX_WINS];
+	int nnums;
 
 	if (!tilemgr)
 		return;
 
-	norder = layout_get_order(session, order, SESSDIR_LAYOUT_MAX_WINS);
-	if (norder == 0)
+	nnums = layout_get_nums(session, nums, SESSDIR_LAYOUT_MAX_WINS);
+	if (nnums == 0)
 		return;
 
 	memset(&layout, 0, sizeof(layout));
-	layout.focus = -1;
-
-	fid = tile_focused_id(tilemgr);
-	for (i = 0; i < norder; i++) {
-		if ((uint32_t)order[i] == fid) {
-			layout.focus = i;
-			break;
-		}
-	}
+	layout.focus = layout_num_of(nums, nnums, tile_focused_id(tilemgr));
 
 	root = tile_root(tilemgr);
-	layout.root = screen_export_tree(root, order, norder);
+	layout.root = screen_export_tree(root, nums, nnums);
 
 	sessdir_layout_save_screen(session, &layout);
 	sessdir_tree_free(layout.root);
@@ -3349,6 +4103,41 @@ notice_show(const char *msg)
 		iox_timer_remove(ui_loop, notice_timer_id);
 	notice_timer_id = iox_timer_add(ui_loop, NOTICE_MS, notice_expire,
 	    NULL);
+}
+
+/* A program rang the bell.  If its window is on screen the bell goes to
+ * the outer terminal, which rings it however the user set it up; if the
+ * window is hidden a notice names it instead, as GNU screen does, so a
+ * long job finishing in another window is not missed.  Every attached
+ * client gets this, since each parses the window's output itself. */
+static void
+window_bell(void *ctx)
+{
+	uint32_t id = (uint32_t)(uintptr_t)ctx;
+	struct mconn *mc;
+	char msg[64];
+	int shown;
+
+	if (client_mode == CLIENT_MODE_TURBO && wmgr) {
+		struct wm_window *w = wm_find(wmgr, id);
+
+		shown = w && !w->minimized;
+	} else if (tilemgr) {
+		shown = tile_pane_geometry(tilemgr, id, NULL, NULL, NULL,
+		    NULL) == 0;
+	} else {
+		shown = watching && watched_id == id;
+	}
+	if (shown) {
+		tio_write(STDOUT_FILENO, "\a", 1);
+		return;
+	}
+	mc = mconn_find_by_pid((pid_t)id);
+	if (mc && mc->num >= 0)
+		snprintf(msg, sizeof(msg), "bell in window %d", mc->num);
+	else
+		snprintf(msg, sizeof(msg), "bell in a hidden window");
+	notice_show(msg);
 }
 
 /* parse and run a submitted directive.  on success cmd_msg is left
@@ -4666,6 +5455,186 @@ handle_mouse(struct iox_loop *loop, const struct tkbd_seq *seq)
 
 static char stdin_buf[4096];
 static int stdin_buflen;
+static size_t stdin_osc_hold;	/* tail bytes kept from the key parser: an
+					 * unfinished OSC reply, see stdin_osc_extract() */
+
+/* A kitty graphics reply from the outer terminal, as the APC payload
+ * between ESC _ and ST ("Gi=31,I=7;OK"): hand it to the window whose
+ * command it answers, and keep the id the host assigned to an image
+ * number so the window's store knows what the host calls that image. */
+static void
+stdin_kgfx_reply(const char *data, size_t len)
+{
+	struct kgfx_ctl c;
+	struct client_window *cw;
+	struct mconn *mc;
+	uint32_t win;
+	char out[320];
+	int n;
+
+	kgfx_ctl_parse(data, len, &c);
+	if (c.img && len >= c.ctl_len + 4 &&
+	    strncmp(data + c.ctl_len + 2, "OK", 2) != 0 &&
+	    (win = kgfx_lazy_take(c.img)) != 0) {
+		/* the host dropped an image a lazy replay only re-placed:
+		 * have the image's commands sent again in full */
+		if ((cw = cwin_find(win)) != NULL) {
+			uint32_t grp = win_gfx_group_find(cw, c.img, 0);
+			int i;
+
+			for (i = 0; i < cw->gfx_n; i++)
+				if (cw->gfx[i].grp == grp)
+					cw->gfx[i].lost = 1;
+			gfx_emit_new = 1;
+			need_render = 1;
+		}
+		return;
+	}
+	win = kgfx_pend_take(c.num, c.img);
+	if (!win)
+		return;				/* nobody asked: a stray reply */
+
+	if (c.num && c.img && (cw = cwin_find(win)) != NULL) {
+		int i;
+
+		for (i = 0; i < cw->gfx_n; i++)
+			if (cw->gfx[i].num == c.num && cw->gfx[i].id == 0)
+				cw->gfx[i].id = c.img;
+	}
+
+	mc = mconn_find_by_pid((pid_t)win);
+	if (!mc)
+		return;
+	n = snprintf(out, sizeof(out), "\033_%.*s\033\\", (int)len, data);
+	if (n > 0 && n < (int)sizeof(out))
+		mconn_ipc_send(mc, IPC_MSG_INPUT, out, (uint32_t)n);
+}
+
+/* Longest unfinished terminal reply that is held back from the key parser
+ * while waiting for its terminator.  A color reply is around 25 bytes and a
+ * graphics reply under 40; past this the bytes are not a reply and go to
+ * the key parser after all. */
+#define STDIN_OSC_HOLD_MAX 128
+
+/* Does buf begin a terminal reply: an OSC, ESC ] <digits> ; ..., or a kitty
+ * graphics APC, ESC _ G ..., either ended by ESC \ (an OSC also by BEL),
+ * or a window size report, ESC [ 4|6 ; <digits> ; <digits> t?
+ * Returns the bytes it occupies, 0 if buf does not begin one (an Alt+]
+ * keystroke, say), or -1 if it begins one that has not finished yet.  On
+ * success *plen is the payload length, the bytes after the two-byte
+ * introducer, and *kind is that introducer's second byte. */
+static int
+osc_reply_scan(const char *buf, size_t len, size_t *plen, int *kind)
+{
+	size_t i;
+
+	if (len < 2 || buf[0] != '\033')
+		return 0;
+	*kind = buf[1];
+	if (buf[1] == '_') {
+		if (len == 2)
+			return -1;
+		if (buf[2] != 'G')
+			return 0;
+		i = 3;
+	} else if (buf[1] == ']') {
+		for (i = 2; i < len && buf[i] >= '0' && buf[i] <= '9'; i++)
+			;
+		if (i == len)
+			return -1;
+		if (i == 2 || buf[i] != ';')
+			return 0;
+	} else if (buf[1] == '[') {
+		/* a size report, ESC [ 4|6 ; height ; width t */
+		int fields = 0;
+
+		for (i = 2; i < len; i++) {
+			if (buf[i] == ';')
+				fields++;
+			else if (buf[i] == 't')
+				break;
+			else if (buf[i] < '0' || buf[i] > '9')
+				return 0;
+			if (i == 2 && buf[i] != '4' && buf[i] != '6')
+				return 0;
+			if (i == 3 && buf[i] != ';')
+				return 0;
+		}
+		if (i == len)
+			return -1;
+		if (fields != 2)
+			return 0;
+		*plen = i - 2;
+		return (int)i + 1;
+	} else {
+		return 0;
+	}
+	for (; i < len; i++) {
+		if (buf[i] == '\a' && *kind == ']') {
+			*plen = i - 2;
+			return (int)i + 1;
+		}
+		if (buf[i] == '\033') {
+			if (i + 1 == len)
+				return -1;
+			if (buf[i + 1] == '\\') {
+				*plen = i - 2;
+				return (int)i + 2;
+			}
+			return 0;
+		}
+	}
+	return -1;
+}
+
+/* Pull the terminal's replies out of stdin_buf before the key parser sees
+ * them.  tkbd_parse() knows neither OSC nor APC: it would read a color
+ * reply as Alt+] followed by typed characters, or a graphics reply as
+ * Alt+_ and more, and forward it to the focused window as keystrokes,
+ * where it lands on a shell's command line as "^[]11;rgb:...".
+ *
+ * Complete replies are handled and cut out here: a color reply is learned
+ * (term_color_learn), a size report too (term_cell_learn), and a graphics
+ * reply is routed to the window that asked (stdin_kgfx_reply).  An unfinished one at the tail of the buffer
+ * is withheld from the key parser, but only while that kind of reply is
+ * actually expected, so an ordinary Alt+] or Alt+_ keystroke is never
+ * delayed.  Returns the number of tail bytes to withhold. */
+static size_t
+stdin_osc_extract(void)
+{
+	int i = 0;
+
+	while (i < stdin_buflen) {
+		size_t plen = 0;
+		int n, kind = 0;
+
+		if (stdin_buf[i] != '\033') {
+			i++;
+			continue;
+		}
+		n = osc_reply_scan(stdin_buf + i, (size_t)(stdin_buflen - i),
+		    &plen, &kind);
+		if (n > 0) {
+			if (kind == '_')
+				stdin_kgfx_reply(stdin_buf + i + 2, plen);
+			else if (kind == '[')
+				term_cell_learn(stdin_buf + i + 2, plen);
+			else
+				term_color_learn(stdin_buf + i + 2, plen);
+			memmove(stdin_buf + i, stdin_buf + i + n,
+			    (size_t)(stdin_buflen - i - n));
+			stdin_buflen -= n;
+			continue;
+		}
+		if (n < 0 && stdin_buflen - i <= STDIN_OSC_HOLD_MAX &&
+		    (kind == '_' ? kgfx_pend_n > 0 || kgfx_lazy_expected() :
+		    term_reply_expected()))
+			return (size_t)(stdin_buflen - i);
+		i++;
+	}
+	return 0;
+}
+
 static int in_paste;
 
 /* A lone trailing ESC in the input buffer is ambiguous: it is either the
@@ -5085,7 +6054,8 @@ stdin_drain(struct iox_loop *loop, int force_esc)
 {
 	size_t consumed;
 
-	consumed = tkbd_drain(stdin_buf, (size_t)stdin_buflen, force_esc,
+	consumed = tkbd_drain(stdin_buf,
+	    (size_t)stdin_buflen - stdin_osc_hold, force_esc,
 	    stdin_dispatch_cb, loop);
 
 	/* save leftover bytes for next read */
@@ -5133,14 +6103,10 @@ on_stdin_read(struct iox_loop *loop, int fd, unsigned events, void *arg)
 	}
 	stdin_buflen += (int)n;
 
-	/* independent of tkbd_parse() below: catches a color-query reply the
-	 * outer terminal sends back unprompted by the user. tkbd_parse()
-	 * does not recognize OSC sequences, so these bytes would otherwise
-	 * just be skipped one at a time as unrecognized input; this is a
-	 * parallel look at the same bytes, not a replacement for that scan. */
-	if (stdin_osc_parser)
-		vt_parse_feed(stdin_osc_parser, stdin_buf + stdin_buflen - n,
-		    (size_t)n);
+	/* a color-query reply the outer terminal sends back unprompted by
+	 * the user is routed to its window and kept away from the key
+	 * parser, which would otherwise forward it as typed characters */
+	stdin_osc_hold = stdin_osc_extract();
 
 	stdin_drain(loop, 0);
 	sync_prefix_timer(loop);
@@ -5217,9 +6183,12 @@ client_role_set(uint8_t role)
 		sessdir_token_acquire(session_name, client_id, client_name);
 	else if (role == IPC_ROLE_VIEW)
 		sessdir_token_release();
+	if (role == IPC_ROLE_WRITE)
+		term_colors_send_all();
 	notice_show(role == IPC_ROLE_VIEW
 	    ? "view-only: the keyboard went to another client"
 	    : "you have the keyboard");
+	sync_keybinds_title();		/* the title carries the role */
 	client_roster_update();
 }
 
@@ -5638,7 +6607,7 @@ share_ctl_poll(struct iox_loop *lp)
  * watchable without the people in it knowing.
  */
 
-static char share_indicator_fmt[32] = "share:%ww+%vv";
+static char share_indicator_fmt[32] = "share:%ww+%vv%P";
 
 /* share_resize_negotiate (declared above): whether a read-only client
  * takes part in deciding the window size.
@@ -5685,7 +6654,7 @@ static void
 share_marker_update(void)
 {
 	struct sessdir_client list[SESSDIR_CLIENT_MAX];
-	int n, i, writers = 0, viewers = 0;
+	int n, i, writers = 0, viewers = 0, pending = 0;
 	int was_shared = share_marker[0] != '\0';
 	const char *p;
 	size_t out = 0;
@@ -5719,7 +6688,11 @@ share_marker_update(void)
 		return;		/* alone: nothing to say */
 	}
 	for (i = 0; i < n; i++) {
-		if (strcmp(list[i].role, "write") == 0)
+		/* a client knocking under an "ask" rule is neither: it sees
+		 * nothing yet, and the owner should know it is there */
+		if (list[i].pending)
+			pending++;
+		else if (strcmp(list[i].role, "write") == 0)
 			writers++;
 		else
 			viewers++;
@@ -5748,6 +6721,16 @@ share_marker_update(void)
 		case 'n':
 			out += (size_t)snprintf(share_marker + out,
 			    sizeof(share_marker) - out, "%d", n);
+			break;
+		case 'p':
+			out += (size_t)snprintf(share_marker + out,
+			    sizeof(share_marker) - out, "%d", pending);
+			break;
+		case 'P':		/* the knock, only when there is one */
+			if (pending > 0)
+				out += (size_t)snprintf(share_marker + out,
+				    sizeof(share_marker) - out, "+%d?",
+				    pending);
 			break;
 		case '\0':
 			p--;
@@ -7100,6 +8083,12 @@ net_maybe_roam(struct iox_loop *lp)
 	 * netchan validate and accept the migration (a keepalive ping alone
 	 * would not). */
 	proxy_msg_xsend(rnet, 0, IPC_MSG_NOP, NULL, 0);
+
+	/* a network change often means the machine slept or moved, and the
+	 * terminal may have switched appearance meanwhile: ask again so the
+	 * mservers answer with the colors now in use */
+	term_colors_query();
+	term_cell_px_query();
 }
 
 /* service netchan, then dispatch every complete envelope now buffered.
@@ -7515,6 +8504,10 @@ micro_switch_session(struct iox_loop *loop, const char *name)
 	/* connect to new session's servers */
 	mconn_discover(loop);
 	mconn_sync_winlist();
+	/* the new servers get the colors on connect; ask the terminal again
+	 * so a theme change since startup reaches them too */
+	term_colors_query();
+	term_cell_px_query();
 
 	/* if empty session, spawn a window and re-discover */
 	if (mconn_count == 0) {
@@ -7597,9 +8590,12 @@ micro_switch_session(struct iox_loop *loop, const char *name)
 static int
 mconn_refresh(struct iox_loop *lp)
 {
-	int added;
+	int added, before = mconn_count, changed;
 
 	added = mconn_discover(lp);
+	/* the roster changed if a window came or went; a watch event for
+	 * anything else (a layout save, a title) leaves the screen alone */
+	changed = added > 0 || mconn_count != before + added;
 	mconn_sync_winlist();
 
 	/* resize newly discovered windows to screen content size
@@ -7732,10 +8728,15 @@ mconn_refresh(struct iox_loop *lp)
 				tile_show_window(new_id, cw->vt);
 				tile_sync_focus();
 			}
+			changed = 1;
 		}
 	}
 
-	tile_need_full = 1;
+	/* a full redraw only for a roster change; a window switch saves the
+	 * layout, which trips the watch, and redrawing then would send the
+	 * screen and the kitty images a second time */
+	if (changed)
+		tile_need_full = 1;
 	need_render = 1;
 	need_taskbar = 1;
 	return added;
@@ -7797,6 +8798,7 @@ on_sigwinch(struct iox_loop *loop, int signo, void *arg)
 
 	if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0) {
 		update_content_size(ws.ws_row, ws.ws_col);
+		term_cell_px_query();	/* a font change alters the cell size */
 		render_resize(renderer, content_rows, content_cols);
 
 		if (client_mode == CLIENT_MODE_TURBO) {
@@ -8083,6 +9085,12 @@ cmd_attach_main(int argc, char **argv)
 			    strcmp(val, "1") == 0))
 				altscreen_scrollback = 1;
 
+			/* whether a redraw re-places kitty images the host holds
+			 * or transmits them all again */
+			val = cfg_get(cfg, "attach.graphics-replay");
+			if (val && strcmp(val, "full") == 0)
+				gfx_replay_lazy = 0;
+
 			/* how the presence marker reads, not whether it
 			 * appears: %w writers, %v viewers, %n clients */
 			val = cfg_get(cfg, "share.indicator");
@@ -8125,19 +9133,6 @@ cmd_attach_main(int argc, char **argv)
 		return 1;
 	}
 
-	/* catches the outer terminal's reply to an OSC 10/11 color query
-	 * forwarded on a window's behalf (osc_passthru()); an all-NULL ops
-	 * table means every other escape this sees is a harmless no-op --
-	 * tkbd_parse() sees the same stdin bytes independently for keys. */
-	{
-		static const struct vt_ops osc_only_ops;
-
-		stdin_osc_parser = vt_parse_new(&osc_only_ops, NULL);
-		if (stdin_osc_parser)
-			vt_parse_set_osc_cb(stdin_osc_parser, stdin_osc_reply,
-			    NULL);
-	}
-
 	if (client_mode == CLIENT_MODE_TURBO) {
 		wmgr = wm_new(content_rows, content_cols);
 		if (!wmgr) {
@@ -8158,6 +9153,8 @@ cmd_attach_main(int argc, char **argv)
 	if (client_mode != CLIENT_MODE_MINIMAL)
 		enable_mouse();
 	emit_mode(2004, 1);
+	term_colors_query();
+	term_cell_px_query();
 	tio_flush(STDOUT_FILENO);
 
 	loop = iox_loop_new();
@@ -8371,7 +9368,6 @@ cmd_attach_main(int argc, char **argv)
 	if (sessdir_watch_fd >= 0)
 		sessdir_watch_stop(sessdir_watch_fd);
 	render_free(renderer);
-	vt_parse_free(stdin_osc_parser);
 	cwin_free_all();
 	tile_free(tilemgr);
 	wm_free(wmgr);

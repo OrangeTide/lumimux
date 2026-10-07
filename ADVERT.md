@@ -1,6 +1,6 @@
 # ⚡ lumimux — The Next-Gen Ultra-Lightweight Terminal Multiplexer
 
-> **GNU Screen ergonomics meet modern terminal tech, packaged into a single 330 KB static binary with zero runtime dependencies.**
+> **GNU Screen ergonomics meet modern terminal tech, packaged into a single static binary of under a megabyte with zero runtime dependencies.**
 
 ---
 
@@ -33,8 +33,8 @@ While traditional multiplexers rely on massive, monolithic, single-point-of-fail
   * **Minimal:** A completely transparent, lightweight passthrough mode.
   * **Turbo:** Overlapping terminal windows with mouse-driven drag, resize, minimize, and maximize—inspired by Borland's classic *Turbo Vision*!
   
-* **🖼️ Full SIXEL & DCS Pass-Through**
-  Render complex images, plots, and terminal graphics inline. lumimux automatically forwards SIXEL graphics when a window is focused.
+* **🖼️ Full SIXEL & Kitty Graphics**
+  Render complex images, plots, and terminal graphics inline. lumimux automatically forwards SIXEL and kitty graphics when a window is focused.
   
 * **🖱️ First-Class Mouse Support**
   Navigate your workspace with zero friction. Click tabs on the taskbar to switch windows instantly, drag and resize windows in Turbo Mode, and click interactive buttons or approval prompts directly inside CLI tools (like `claude-cli`).
@@ -54,7 +54,7 @@ While traditional multiplexers rely on massive, monolithic, single-point-of-fail
 
 | Feature | `lumimux` ⚡ | `tmux` 🐙 | `GNU Screen` 📺 |
 | :--- | :---: | :---: | :---: |
-| **Binary Size (musl static)** | **~330 KB** | ~1.5 MB+ | ~1.0 MB+ |
+| **Binary Size (musl static)** | **~850 KB stripped** | ~1.5 MB+ | ~1.0 MB+ |
 | **Process Isolation** | **Per-Window (Micro-server)** | Monolithic (Single daemon) | Monolithic (Single daemon) |
 | **Overlapping Window GUI** | **Yes (Turbo Mode)** | No | No |
 | **Speculative Local Echo** | **Yes (Mosh-style)** | No | No |
@@ -71,8 +71,7 @@ While traditional multiplexers rely on massive, monolithic, single-point-of-fail
 ### 1. Build from Source (C99 compiler & GNU Make)
 ```sh
 make RELEASE=1
-export LUMI_LIBEXEC_PATH=_out/x86_64-linux-gnu/bin
-alias lumi=_out/x86_64-linux-gnu/bin/lumi
+alias lumi=_out/x86_64-linux-gnu/release/bin/lumi
 ```
 
 ### 2. Launch a Named Session
@@ -80,9 +79,10 @@ alias lumi=_out/x86_64-linux-gnu/bin/lumi
 lumi new -s development
 ```
 
-### 3. Attach Over SSH
+### 3. Attach Over SSH or Encrypted Netchan
 ```sh
 lumi attach user@remote-host:development
+lumi attach -n user@remote-host:development    # encrypted roaming
 ```
 
 ### 🔑 Essential Keybindings (Default Prefix: `Ctrl-A`)
@@ -107,13 +107,20 @@ lumi attach user@remote-host:development
                      ^                ^                ^
                      |                |                |
                      +----------------+----------------+
-                                      | Unix Sockets / SSH
-                                      v
-                                 lumi-attach
-                                  (Client)
+                                      |
+                  Unix Sockets / SSH / Encrypted Netchan
+                                      |
+                     +-----+-----+-----v-----+-----+
+                     |     |     |           |     |
+                  client  client client  view-only client
+                (attached,  (shared attach, multiple clients,
+                 roaming)   keyboard handover)
 ```
 
-By decoupling the terminal client (`lumi-attach`) from the shell processes (`lumi-mserver`), lumimux guarantees robustness and keeps your running processes fully isolated.
+By decoupling the terminal client from the shell processes (`lumi-mserver`),
+lumimux guarantees robustness and keeps your running processes fully isolated.
+Multiple clients can attach to the same session with optional view-only mode
+and keyboard handover.
 
 ---
 

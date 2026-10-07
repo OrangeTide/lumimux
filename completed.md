@@ -11,11 +11,12 @@
 - [x] display the terminal size while resizing turbo windows.
       "WxH" overlay centered in content area during WM_DRAG_RESIZING.
 - [x] Multiple windows + session management (libsession).
-      Per-window output subscriptions (WIN_WATCH/UNWATCH), per-window
-      VT state on client, per-window resize protocol (WIN_RESIZE).
+      Per-window output subscriptions (WIN_WATCH/UNWATCH superseded by
+      micro-server architecture), per-window VT state on client, per-window
+      resize protocol (WIN_RESIZE).
 - [x] Config-driven key bindings (libkeys).
       Load defaults from code, override via [keys]/[bind] in lumi.conf.
-- [x] Configuration + terminal translation (libcfg, libtxl, libstatus).
+- [x] Configuration + terminal translation (libcfg, libtxl, libtaskbar).
 - [x] text UI for dialogs, menus, config check boxes.
       libtui widget library: tui_pad cell buffer with blend modes
       (transparent/opaque/color_bg/color_fg_bg), tui_stack 4-layer
@@ -38,7 +39,8 @@
 - [x] Attach UI modes (`lumi attach -m <mode>`, `lumi new -m <mode>`,
       or `[attach] mode = turbo` in lumi.conf).
       Screen (default), turbo (overlapping windows with mouse-driven
-      move/resize/close), minimal (not yet implemented).
+      move/resize/close), minimal mode exists (no status bar, no mouse
+      tracking, no popup menus).
 - [x] Re-architect input and keybinding processing code.
       Moved prefix-pending timeout into libkeys: timeout_pending flag,
       keys_get_timeout() / keys_timeout_expired() API with registered
@@ -58,9 +60,10 @@
       connects to N mserver instances simultaneously via mconn table,
       routes input to the focused mserver, discovers new/dead servers
       via inotify. Monolithic lumi-server and WIN_WATCH/UNWATCH/LIST/
-      OUTPUT/NEW/CLOSE/SELECT IPC message types removed. IPC_MSG_ATTACH_REPLY
-      added so mserver reports VT size on connect. All sub-commands
-      (new, new-window, kill, detach, list, attach) ported to sessdir.
+      OUTPUT/NEW/CLOSE/SELECT IPC message types removed (superseded by
+      per-server connections). IPC_MSG_ATTACH_REPLY added so mserver
+      reports VT size on connect. All sub-commands (new, new-window, kill,
+      detach, list, attach) ported to sessdir.
 - [x] emoji app no longer seems to paste into the focused window.
       Broken after micro-server migration; focus routing via mconn may
       not be wired into the apps menu send path.
@@ -112,7 +115,7 @@
       Binding layers with title_re regex and toggle predicates in libkeys.
       Config via [bind "name"] sections with match-title and toggle.
       attach.c syncs title on focus change via sync_keybinds_title().
-      8+ tests in test_keys.c. Documented in doc/lumi.1.
+      8+ tests in test_keys.c. Documented in doc/lumi.1.in.
 - [x] SIXEL pass-through demo.
       DCS passthrough in attach.c writes raw ESC P ... ESC \ to stdout
       when single pane is focused. DCS accumulation in vt_parse.c with
@@ -145,8 +148,8 @@
       in scrollback mode.
 - [x] Selection constrained to window bounds. Selection highlight and
       text extraction clamped to the visible window column range.
-- [x] Clipboard tool fallback. System clipboard sync tries xclip,
-      xsel, and wl-copy in order.
+- [x] Clipboard tool fallback. System clipboard sync tries wl-copy,
+      xclip, xsel, and pbcopy in order.
 - [x] Runtime mode toggle. Ctrl-A t switches between turbo and screen
       layout modes without detaching.
 - [x] Double-buffered dirty tracking. Tile and WM compositors use
@@ -192,10 +195,11 @@
       byte-at-a-time input. SGR mouse mode (1000+1006 screen, 1002+1006
       turbo). Menu/picker/apps click handling. Manual escape state
       machines removed from all input handlers.
-- [x] Per-window output subscription protocol.
-      WIN_WATCH/WIN_UNWATCH/WIN_OUTPUT. Server streams output only for
-      watched windows, with VT state replay on subscribe. Client drives
-      subscriptions -- server is policy-free about UI modes.
+- [x] Per-window output subscription protocol (superseded).
+      WIN_WATCH/WIN_UNWATCH/WIN_OUTPUT were replaced by direct per-server
+      connections in the micro-server architecture. Each mserver streams
+      output for its own PTY directly to all connected clients. Client
+      drives attachments -- server is policy-free about UI modes.
 - [x] Client-side per-window VT state.
       client_window array with vt_state + vt_parse per server window.
       WIN_OUTPUT routed by 4-byte window ID prefix. cwin_sync reconciles
@@ -238,7 +242,66 @@
       29KB) for new-session shell prompt.
 - [x] Distribution (Phase 10).
       Multi-call binary (336KB vs 663KB for 12 individual binaries).
-      Portable static musl binary (330KB stripped). Installer script
-      (scripts/install.sh). Packaging for debian/rpm/arch. GitHub
-      Actions release workflow produces static binary + .deb + tarball.
-      APT repo via GitHub Pages with GPG signing.
+      Portable static musl binary. Installer script (scripts/install.sh).
+      Packaging for debian/rpm/arch. GitHub Actions release workflow
+      produces static binary + .deb + tarball. APT repo via GitHub Pages
+      with GPG signing.
+- [x] lumi attach hangs and pegs the CPU at 100% with two clients.
+      sessdir_state_open() opened state with O_RDWR but only used flock()
+      and read(); real writes went through a separate temp file and
+      rename(). Closing that write-capable fd raised IN_CLOSE_WRITE on
+      the session directory, and on_sessdir_watch() read state again on
+      every firing, creating an unconditional busy loop from the moment a
+      second client attached. Opening the fd O_RDONLY fixed it; genuine
+      state changes still land via rename().
+- [x] Claude CLI numbered lists inside lumi showed as blank in GNOME terminal.
+      The terminal's OSC 10/11 color query had nowhere to go; osc_passthru
+      forwarded only one-way notification OSCs (9/99/777). The mserver VT
+      now answers OSC 10/11 queries from colors the client reports via
+      IPC_MSG_TERM_COLORS, and osc_passthru forwards only 9/99/777.
+- [x] Detach (ctrl-A d) segfaulted in GNOME terminal, iTerm2, and kitty.
+      cmd_attach_main() freed tilemgr before calling cwin_free_all(),
+      which still walked every client window and called tile_forget_vt()
+      on the now-freed tile manager. Fixed by reordering the frees.
+- [x] Reattaching showed a blank screen; only switching windows brought
+      content back. The saved screen layout stored each pane as an index
+      into the session's window order; unresolvable panes were restored
+      with no VT and composited as blank. Unresolvable panes are now
+      rejected on import (split collapses) and refused on export.
+- [x] Tab bar showed bare window numbers after reattach; names only appeared
+      after something set a title. sync_vt_title() copied an empty VT title
+      over the name read from the session directory on first output. Each
+      window now keeps the name it was discovered under as a fallback.
+- [x] Networked client connections over reliable netchan-v2 (not QUIC).
+      ipc_transport seam, attach client and proxy ported. src/libnet
+      extracted (netchan + nc_udp + nc_crypto + Monocypher) as lu_net.
+      Loss/reorder stress test found and fixed a netchan retransmit bug.
+      netchan ipc_transport impl, non-blocking drain, lumi-net-proxy
+      bridge, and attach -n client. Encryption with per-session PSK,
+      X25519 + XChaCha20-Poly1305, cross-host bootstrap over ssh
+      (attach -n host:session), and roaming with auto-roam on network
+      change.
+- [x] New windows highlighted wrong tab; closing a window did not return order
+      correctly. Fixed by tracking most recently used order; Ctrl-A Ctrl-A
+      bounces to the last used window, while next/prev go in numeric order.
+- [x] Colon (:) line editing redrew and showed repeated characters. Fixed.
+- [x] :title command changed to override the client title; :title with no
+      arguments clears the override.
+- [x] Taskbar title elision when space is limited. Cuts max width in half
+      until all tabs fit, stopping at minimum width of 8.
+- [x] Pop-up menu strobing from backdrop repaint flushing under overlay. Fixed.
+- [x] Renumber feature added, like GNU screen :, leveraging the ,. commands
+      to bump a window number left/right.
+- [x] Clear mouse selection after pasting; erase selection when window scrolls.
+- [x] Keyboard selection, cut, paste while in scrollback mode with hjkl
+      movement, block/line selection modes, etc.
+- [x] Pass through notification pop-ups for programs like Claude on terminals
+      like Kitty.
+- [x] Update argv[0] when spawning internal commands so ps shows the difference
+      between lumi and an mserver session.
+- [x] Selection area left behind when changing windows. Now cleared on focus
+      change, entering/leaving scrollback mode, and moving windows.
+- [x] Input dialog for simple directives like ctrl-A : in screen: setenv
+      VAR="value" to set environment for new windows, title New Title Name
+      to change current window's title.
+- [x] Mac build error: circular _LIBS dependency. Fixed.
