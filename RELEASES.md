@@ -1,5 +1,20 @@
 # lumiMUX Release Notes
 
+## v26.10.2 -- 2026-10-14
+
+### Window numbers survive a swept state file
+
+On macOS a session keeps its state file under `/tmp`, because there is no
+`XDG_RUNTIME_DIR` to hold it, and a tmp-cleaning daemon can delete that
+file while the session is still running. Every window then read an empty
+slot map, and the taskbar showed window 0 on every tab. A session now
+rebuilds its window numbers from the window directories that survive,
+ordered by creation time so the oldest window keeps number 0, and leaves
+an intact map untouched. The rebuild runs whenever a client attaches or a
+window opens or closes.
+
+---
+
 ## v26.10.1 -- 2026-10-06
 
 ### Terminal color queries answered in place

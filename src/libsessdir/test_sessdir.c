@@ -9,6 +9,7 @@
 #include "sessdir_layout.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -531,6 +532,81 @@ test_state_concurrent_add(void)
 		}
 	}
 	CHECK(found == N, "no window is lost to a race");
+	sessdir_state_close(st);
+	printf("ok\n");
+}
+
+/* a tmp cleaner can delete the state file while the session is still
+ * running (macOS keeps it under /tmp, with no XDG_RUNTIME_DIR).  the
+ * window directories and their live server processes survive, so the
+ * stable numbers must be rebuilt from them rather than every window
+ * reading an empty map and showing number 0. */
+static void
+test_state_heal(void)
+{
+	struct sessdir_state *st;
+	pid_t self = getpid(), child;
+	pid_t nums[16];
+	char *sp, path[PATH_MAX];
+	int pfd[2], n, status;
+
+	printf("  state rebuilds from live windows after loss ... ");
+	sessdir_session_create("sth");
+
+	/* a second live window: a child that blocks until released so its
+	 * process stays alive for the rebuild. */
+	if (pipe(pfd) < 0) {
+		printf("skip (pipe failed)\n");
+		return;
+	}
+	child = fork();
+	if (child == 0) {
+		char b;
+
+		close(pfd[1]);
+		(void)!read(pfd[0], &b, 1);
+		_exit(0);
+	}
+	close(pfd[0]);
+
+	/* self's directory is created first, so it is the older window */
+	sessdir_server_create("sth", self);
+	sessdir_server_create("sth", child);
+
+	st = sessdir_state_open("sth");
+	sessdir_state_add_server(st, self);
+	sessdir_state_add_server(st, child);
+	CHECK(sessdir_state_num(st, self) == 0, "self is window 0");
+	CHECK(sessdir_state_num(st, child) == 1, "child is window 1");
+	sessdir_state_close(st);
+
+	/* simulate the sweep: the state file vanishes, the windows remain */
+	sp = sessdir_session_path("sth");
+	snprintf(path, sizeof(path), "%s/state", sp);
+	unlink(path);
+	free(sp);
+
+	st = sessdir_state_open("sth");
+	CHECK(sessdir_state_nums(st, nums, 16) == 0, "state really was lost");
+	CHECK(sessdir_state_heal(st) == 2, "heal restores 2 windows");
+	CHECK(sessdir_state_num(st, self) == 0, "self rebuilt to window 0");
+	CHECK(sessdir_state_num(st, child) == 1, "child rebuilt to window 1");
+	sessdir_state_close(st);
+
+	/* an intact map is authoritative: heal leaves it untouched */
+	st = sessdir_state_open("sth");
+	CHECK(sessdir_state_heal(st) == 0, "intact map is not rebuilt");
+	sessdir_state_close(st);
+
+	/* release the child and let cleanup prune the dead window */
+	close(pfd[1]);
+	waitpid(child, &status, 0);
+	sessdir_cleanup_stale("sth");
+
+	st = sessdir_state_open("sth");
+	n = sessdir_state_nums(st, nums, 16);
+	CHECK(n >= 1 && nums[0] == self, "self keeps window 0");
+	CHECK(sessdir_state_num(st, child) == -1, "dead child is dropped");
 	sessdir_state_close(st);
 	printf("ok\n");
 }
@@ -1210,6 +1286,7 @@ main(void)
 	test_state_persistence();
 	test_state_window_nums();
 	test_state_concurrent_add();
+	test_state_heal();
 
 	/* inotify watch */
 	test_watch();

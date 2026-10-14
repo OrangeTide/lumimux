@@ -364,6 +364,16 @@ sessdir_cleanup_stale(const char *session)
 		}
 	}
 
+	/* a tmp-cleaning daemon can delete the state file while the session
+	 * runs (macOS stores it under /tmp); rebuild it from the surviving
+	 * windows so their stable numbers are not all reported as 0. */
+	if (removed < n) {
+		if (!st)
+			st = sessdir_state_open(session);
+		if (st)
+			sessdir_state_heal(st);
+	}
+
 	sessdir_state_close(st);
 
 	/* clients are pruned on the same pass: every attach and rescan

@@ -6,6 +6,7 @@
 #include "sessdir.h"
 #include "xmalloc.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -343,6 +344,111 @@ nums_trim(struct parse_ctx *ctx)
 		ctx->nnums--;
 }
 
+/* ---- rebuild a lost state file from the live windows ---- */
+
+/* a live window directory recovered from the filesystem, with the
+ * modification time used to restore the original creation order. */
+struct live_win {
+	pid_t	pid;
+	time_t	mtime;
+};
+
+/* order by creation time (oldest first), breaking ties by pid so the
+ * result is deterministic. */
+static int
+live_win_cmp(const void *a, const void *b)
+{
+	const struct live_win *x = a, *y = b;
+
+	if (x->mtime != y->mtime)
+		return x->mtime < y->mtime ? -1 : 1;
+	if (x->pid != y->pid)
+		return x->pid < y->pid ? -1 : 1;
+	return 0;
+}
+
+/* derive the session directory from st->path ("<dir>/state").
+ * returns 0 on success, -1 if it does not fit in dir[]. */
+static int
+session_dir_of(const struct sessdir_state *st, char *dir, size_t dirsz)
+{
+	const char *slash = strrchr(st->path, '/');
+	size_t len;
+
+	if (!slash)
+		return -1;
+	len = (size_t)(slash - st->path);
+	if (len + 1 > dirsz)
+		return -1;
+	memcpy(dir, st->path, len);
+	dir[len] = '\0';
+	return 0;
+}
+
+/* rebuild order/nums in ctx from the live window directories, ordered by
+ * creation time so the oldest window keeps number 0.
+ *
+ * the state file lives under /tmp on platforms with no XDG_RUNTIME_DIR
+ * (macOS), where a tmp-cleaning daemon can sweep it while the session is
+ * still running. the mservers and their sockets survive, so the numbers
+ * can be recovered from the window directories that remain. only windows
+ * whose server process is still alive are restored. returns the count. */
+static int
+heal_from_live(struct sessdir_state *st, struct parse_ctx *ctx)
+{
+	char dir[PATH_MAX];
+	struct live_win wins[64];
+	int nwins = 0, i;
+	DIR *d;
+	struct dirent *ent;
+
+	if (session_dir_of(st, dir, sizeof(dir)) < 0)
+		return 0;
+	d = opendir(dir);
+	if (!d)
+		return 0;
+
+	while ((ent = readdir(d)) != NULL && nwins < 64) {
+		char path[PATH_MAX];
+		struct stat sb;
+		long val;
+		char *end;
+
+		if (ent->d_name[0] == '.')
+			continue;
+		/* window directories are named by the server pid */
+		val = strtol(ent->d_name, &end, 10);
+		if (*end != '\0' || val <= 0)
+			continue;
+		if (!sessdir_server_alive((pid_t)val))
+			continue;
+		if (snprintf(path, sizeof(path), "%s/%s", dir,
+		    ent->d_name) >= (int)sizeof(path))
+			continue;
+		if (stat(path, &sb) < 0)
+			continue;
+		wins[nwins].pid = (pid_t)val;
+		wins[nwins].mtime = sb.st_mtime;
+		nwins++;
+	}
+	closedir(d);
+
+	if (nwins == 0)
+		return 0;
+
+	qsort(wins, (size_t)nwins, sizeof(wins[0]), live_win_cmp);
+
+	ctx->norder = 0;
+	ctx->nnums = 0;
+	for (i = 0; i < nwins; i++) {
+		ctx->order[ctx->norder++] = wins[i].pid;
+		ctx->nums[ctx->nnums++] = wins[i].pid;
+	}
+	if (ctx->focus <= 0 || !sessdir_server_alive(ctx->focus))
+		ctx->focus = wins[0].pid;
+	return nwins;
+}
+
 /* ---- public API ---- */
 
 struct sessdir_state *
@@ -440,17 +546,48 @@ sessdir_state_set_focus(struct sessdir_state *st, pid_t pid)
 }
 
 int
+sessdir_state_heal(struct sessdir_state *st)
+{
+	struct parse_ctx ctx;
+	int n = 0;
+
+	flock(st->lockfd, LOCK_EX);
+	state_parse(st, &ctx);
+	/* only rebuild when the map was lost. an intact map, even one with
+	 * spare slots, is authoritative and must not be reordered. */
+	if (ctx.norder == 0 && ctx.nnums == 0) {
+		n = heal_from_live(st, &ctx);
+		if (n > 0)
+			state_write(st, ctx.focus, ctx.order, ctx.norder,
+			    ctx.nums, ctx.nnums);
+	}
+	flock(st->lockfd, LOCK_UN);
+	return n;
+}
+
+int
 sessdir_state_add_server(struct sessdir_state *st, pid_t pid)
 {
 	struct parse_ctx ctx;
-	int i, slot, rc;
+	int i, slot, rc, healed = 0;
 
 	flock(st->lockfd, LOCK_EX);
 	state_parse(st, &ctx);
 
+	/* if the state file was swept while the session ran, rebuild it from
+	 * the live windows before adding self so every existing window keeps
+	 * its stable number. */
+	if (ctx.norder == 0 && ctx.nnums == 0)
+		healed = heal_from_live(st, &ctx) > 0;
+
 	/* check for duplicate */
 	for (i = 0; i < ctx.norder; i++) {
 		if (ctx.order[i] == pid) {
+			/* self already present: persist the rebuild, if any,
+			 * then leave the map unchanged. */
+			if (healed)
+				state_write(st, ctx.focus, ctx.order,
+				    ctx.norder, ctx.nums, ctx.nnums);
 			flock(st->lockfd, LOCK_UN);
 			return 0;
 		}

@@ -53,6 +53,16 @@ int sessdir_state_set_focus(struct sessdir_state *st, pid_t pid);
  * returns 0 on success, -1 on error. */
 int sessdir_state_add_server(struct sessdir_state *st, pid_t pid);
 
+/* rebuild a lost state file from the live window directories.
+ *
+ * on platforms with no XDG_RUNTIME_DIR (macOS), session state lives under
+ * /tmp, where a tmp-cleaning daemon can delete it while the session is
+ * still running; every window then reads an empty map and shows number 0.
+ * this restores the slot map from the window directories that survive,
+ * ordered by creation time, and only when the map is empty (an intact map
+ * is left untouched). returns the number of windows restored. */
+int sessdir_state_heal(struct sessdir_state *st);
+
 /* remove a server from the window order. the server's stable window
  * number is freed (left as a spare); other windows keep their numbers.
  * if the removed server was focused, focus moves to the next server in
