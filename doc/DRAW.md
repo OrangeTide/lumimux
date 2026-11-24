@@ -314,15 +314,37 @@ Steps 1 through 3a have landed; steps 4 and 5 remain design only.
    all of their per-app signal code, including `edit`'s earlier SIGTSTP one-off.
    Raw mode disables the terminal's own Ctrl-Z (it is a key), so the driver's
    SIGTSTP is one from job control or an explicit `kill -TSTP`.
-4. (Design only) Re-express the pad-stack `tui_backend` on top of `draw_driver`,
-   then migrate attach's overlay apps. libtui_draw implements the backend on a
-   draw surface with test_tui_draw, but attach still uses tui_term_new. Note
-   the model shift: `tui_backend` is per-cell (`cell` called for each changed
-   cell), while `draw_driver` is per-frame, so the pad stack composites into a
-   `draw` surface's grid and then calls `draw_present`, rather than emitting
-   cell by cell.
+4. (Partly done) Re-express the pad-stack `tui_backend` on top of
+   `draw_driver`. libtui_draw implements the backend on a draw surface with
+   test_tui_draw. The model shift is real: `tui_backend` is per-cell (`cell`
+   called for each changed cell), while `draw_driver` is per-frame, so the pad
+   stack composites into a `draw` surface's grid and then calls `draw_present`,
+   rather than emitting cell by cell. Attach's overlays are deliberately not
+   migrated and stay on `tui_term_new`. See "Why attach keeps tui_term" below.
 5. (Design only) Future: a graphical driver that implements `draw_driver` and
    synthesizes `tkbd_seq`.
+
+### Why attach keeps tui_term
+
+Attach is a compositor with its own `librender` shadow: it composites a
+full-screen cell buffer (`tile_screen` in tiled mode, `wm_screen` in turbo
+mode) and hands it to `render_cells_diff`. The overlay stack is a separate
+layer painted on top of that screen through `tui_term`, which writes escapes
+straight to the terminal and keeps no model of screen content. It re-emits its
+whole bounding box every frame, so it never has to agree with attach's shadow,
+and closing an overlay just triggers a full repaint of the screen underneath.
+
+A `draw` surface is the opposite: it owns a full-screen grid with its own
+`librender` shadow, and `draw_present` diffs that grid. Pointing the overlay at
+a draw surface therefore introduces a second shadow. The two desync at the
+overlay open and close handoff, because attach repaints the main screen under
+the overlay without the overlay's shadow knowing, and the next diff emits
+against stale state. The only way to keep one consistent shadow is to route
+attach's entire frame (tiled or turbo compositing, the taskbar, and the
+overlay) through a single surface. That is the compositor port this phase set
+out of scope, so attach stays on `tui_term` until that larger change is taken
+on as its own effort. libtui_draw remains the backend for any future
+full-screen draw-based consumer and for a graphical driver.
 
 ## Mapping from current escapes to libdraw
 

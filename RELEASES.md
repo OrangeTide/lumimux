@@ -1,5 +1,29 @@
 # lumiMUX Release Notes
 
+## v26.11.0 -- 2026-11-24
+
+### Attaching to an empty session leaves the terminal clean
+
+Running `lumi attach` when no server is present used to leave the terminal
+in raw mode with mouse reporting and bracketed paste still on, so the shell
+that followed behaved strangely. Every exit from the attach client now runs
+one teardown path that restores the mouse, bracketed paste, cursor, and
+terminal modes, whether the client stops normally or fails during startup.
+The startup errors are also printed after the terminal is restored, so the
+message ends with a proper newline and the shell prompt returns to the first
+column instead of being indented under the error text.
+
+### Read-only clients and lumi kill
+
+A view-only client that tries to close a window now sees "read-only: cannot
+close a window" rather than a message about the keyboard, which did not fit
+the action. The `lumi kill` command no longer hides a server's refusal: if
+the server declines, the reason it gave is reported instead of a bare
+failure. The owner's own `lumi kill` still works, since reaching the session
+socket already proves ownership.
+
+---
+
 ## v26.10.2 -- 2026-10-14
 
 ### Window numbers survive a swept state file

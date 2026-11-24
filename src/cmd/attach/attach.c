@@ -436,10 +436,14 @@ mconn_ipc_send(struct mconn *mc, uint32_t type,
 		return -1;
 
 	if (client_role != IPC_ROLE_WRITE && msg_mutates(type)) {
-		/* typing is the user's own act, so it is worth a word.  a
-		 * resize or a flow-control nudge is ours, and saying
+		/* a deliberate act by the user is worth a word, and the word
+		 * names the act: killing a window is not typing, so "another
+		 * client has the keyboard" would misread as a non-sequitur.
+		 * a resize or a flow-control nudge is ours, and saying
 		 * anything about those would be noise. */
-		if (type == IPC_MSG_INPUT || type == IPC_MSG_KILL)
+		if (type == IPC_MSG_KILL)
+			notice_show("read-only: cannot close a window");
+		else if (type == IPC_MSG_INPUT)
 			notice_show("read-only: another client has the keyboard");
 		return -1;
 	}
@@ -1979,6 +1983,12 @@ reset_terminal_modes(void)
 
 static int cursor_visible = -1; /* -1 = unknown, 0 = hidden, 1 = shown */
 static void turbo_cursor(int *row, int *col, int *vis);
+
+/* set once the terminal is in raw/application mode (cursor hidden, mouse
+ * and bracketed paste enabled); gates the terminal restore in
+ * attach_cleanup so an early exit before setup does not emit stray
+ * resets, and a restore is never done twice. */
+static int term_setup_done;
 
 /* set outer terminal cursor visibility, emitting only on state change */
 static void
@@ -8862,6 +8872,103 @@ usage(void)
 	    "  -s name     session name (default: 0)\n");
 }
 
+/*
+ * Undo everything cmd_attach_main set up, in reverse order, so every exit
+ * path leaves the terminal and session directory the way we found them.
+ * Each step is guarded or idempotent, so this is safe after a partial
+ * startup and safe to call more than once.  Pass clear_screen nonzero for
+ * the home + erase a clean exit wants; an error exit passes 0 to keep its
+ * message on screen.
+ */
+static void
+attach_cleanup(int clear_screen)
+{
+	/* drop connections, the keyboard lock, and the roster entry */
+	mconn_disconnect_all(NULL);
+	if (session_name) {
+		sessdir_token_release();
+		sessdir_client_unregister(session_name, client_id);
+	}
+
+	/* remote carrier: netchan transport or the SSH-piped proxy */
+	if (remote_netchan) {
+		if (ui_loop && net_service_timer >= 0) {
+			iox_timer_remove(ui_loop, net_service_timer);
+			net_service_timer = -1;
+		}
+		if (rnet) {
+			if (ui_loop && net_registered_fd >= 0)
+				iox_fd_remove(ui_loop, net_registered_fd);
+			net_registered_fd = -1;
+			ipc_transport_free(rnet);	/* closes the UDP fd */
+			rnet = NULL;
+		}
+	} else if (is_remote && rproxy_fd >= 0) {
+		close(rproxy_fd);
+		rproxy_fd = -1;
+		if (rproxy_pid > 0)
+			waitpid(rproxy_pid, NULL, 0);
+	}
+
+	gpm_mouse_shutdown(ui_loop);	/* no-op unless gpm was connected */
+	if (ui_loop) {
+		iox_loop_free(ui_loop);
+		ui_loop = NULL;
+	}
+
+	/* terminal restore: only if we put it into raw/application mode.
+	 * uses txl (cursor, clear) so it must run before txl_free below. */
+	if (term_setup_done) {
+		reset_terminal_modes();
+		emit_mode(2004, 0);
+		tio_flush(STDOUT_FILENO);
+		set_cursor_vis(1);
+		disable_mouse();
+		reset_host_title();
+		if (clear_screen) {
+			const char *clr = txl_str(txl, TXL_CLEAR);
+			char cup[24];
+			int cuplen;
+
+			cuplen = txl_cup(txl, cup, sizeof(cup), 0, 0);
+			if (cuplen > 0)
+				tio_write(STDOUT_FILENO, cup, (size_t)cuplen);
+			if (clr)
+				tio_write(STDOUT_FILENO, clr, strlen(clr));
+			tio_flush(STDOUT_FILENO);
+		}
+		tio_restore(STDIN_FILENO);
+		term_setup_done = 0;
+	}
+
+	if (sessdir_watch_fd >= 0) {
+		sessdir_watch_stop(sessdir_watch_fd);
+		sessdir_watch_fd = -1;
+	}
+
+	render_free(renderer);
+	renderer = NULL;
+	cwin_free_all();
+	tile_free(tilemgr);
+	tilemgr = NULL;
+	wm_free(wmgr);
+	wmgr = NULL;
+	tui_term_free(tb);
+	tb = NULL;
+	txl_free(txl);
+	txl = NULL;
+	if (keybinds) {		/* keys_free does not accept NULL */
+		keys_free(keybinds);
+		keybinds = NULL;
+	}
+	taskbar_free(taskbar);
+	taskbar = NULL;
+	taskbar_free(scrollback_sb);
+	scrollback_sb = NULL;
+	free(session_name);
+	session_name = NULL;
+}
+
 int
 cmd_attach_main(int argc, char **argv)
 {
@@ -9115,6 +9222,7 @@ cmd_attach_main(int argc, char **argv)
 	txl = txl_new(NULL);
 	if (!txl) {
 		log_err("failed to create terminal translation");
+		attach_cleanup(0);
 		return 1;
 	}
 
@@ -9124,12 +9232,14 @@ cmd_attach_main(int argc, char **argv)
 	tb = tui_term_new(txl, STDOUT_FILENO);
 	if (!tb) {
 		log_err("failed to create terminal backend");
+		attach_cleanup(0);
 		return 1;
 	}
 
 	renderer = render_new(content_rows, content_cols, txl);
 	if (!renderer) {
 		log_err("failed to create renderer");
+		attach_cleanup(0);
 		return 1;
 	}
 
@@ -9137,6 +9247,7 @@ cmd_attach_main(int argc, char **argv)
 		wmgr = wm_new(content_rows, content_cols);
 		if (!wmgr) {
 			log_err("failed to create window manager");
+			attach_cleanup(0);
 			return 1;
 		}
 		turbo_need_full = 1;
@@ -9145,6 +9256,7 @@ cmd_attach_main(int argc, char **argv)
 
 	if (tio_raw(STDIN_FILENO) < 0) {
 		log_err("failed to set raw mode");
+		attach_cleanup(0);
 		return 1;
 	}
 
@@ -9156,14 +9268,14 @@ cmd_attach_main(int argc, char **argv)
 	term_colors_query();
 	term_cell_px_query();
 	tio_flush(STDOUT_FILENO);
+	/* terminal is now in raw/application mode; from here every exit
+	 * must restore it, which attach_cleanup does when this is set. */
+	term_setup_done = 1;
 
 	loop = iox_loop_new();
 	ui_loop = loop;
 	if (!loop) {
-		emit_mode(2004, 0);
-		tio_flush(STDOUT_FILENO);
-		disable_mouse();
-		tio_restore(STDIN_FILENO);
+		attach_cleanup(0);	/* cooked mode before reporting */
 		log_err("failed to create event loop");
 		return 1;
 	}
@@ -9195,9 +9307,11 @@ cmd_attach_main(int argc, char **argv)
 		else
 			mconn_discover(loop);
 		if (mconn_count == 0) {
+			/* restore the terminal before reporting, so the
+			 * message prints in cooked mode and its newline
+			 * returns the carriage for the shell prompt */
+			attach_cleanup(0);
 			log_err("no servers in session '%s'", name);
-			iox_loop_free(loop);
-			tio_restore(STDIN_FILENO);
 			return 1;
 		}
 
@@ -9305,78 +9419,15 @@ cmd_attach_main(int argc, char **argv)
 			continue; /* EINTR */
 	}
 
-	/* save layout before teardown */
+	/* save layout before teardown; only a clean exit has one worth
+	 * keeping, so this stays out of attach_cleanup */
 	if (client_mode == CLIENT_MODE_TURBO)
 		turbo_save_layout(name);
 	else if (tilemgr)
 		screen_save_layout(name);
 
-	mconn_disconnect_all(NULL);
-
-	/* give up the keyboard and stop being listed as attached.  the
-	 * lock would be released by process exit anyway, and a roster
-	 * entry whose process is gone is pruned by the next client to
-	 * look, so this is about not making anyone wait for either. */
-	if (session_name) {
-		sessdir_token_release();
-		sessdir_client_unregister(session_name, client_id);
-	}
-
-	/* clean up remote proxy */
-	if (remote_netchan) {
-		if (net_service_timer >= 0) {
-			iox_timer_remove(loop, net_service_timer);
-			net_service_timer = -1;
-		}
-		if (rnet) {
-			if (net_registered_fd >= 0)
-				iox_fd_remove(loop, net_registered_fd);
-			net_registered_fd = -1;
-			ipc_transport_free(rnet);	/* closes the UDP fd */
-			rnet = NULL;
-		}
-	} else if (is_remote && rproxy_fd >= 0) {
-		close(rproxy_fd);
-		rproxy_fd = -1;
-		if (rproxy_pid > 0)
-			waitpid(rproxy_pid, NULL, 0);
-	}
-
-	gpm_mouse_shutdown(loop);
-	iox_loop_free(loop);
-	reset_terminal_modes();
-	emit_mode(2004, 0);
-	tio_flush(STDOUT_FILENO);
-	set_cursor_vis(1);
-	disable_mouse();
-	reset_host_title();
-
-	{
-		const char *clr = txl_str(txl, TXL_CLEAR);
-		char cup[24];
-		int cuplen;
-
-		cuplen = txl_cup(txl, cup, sizeof(cup), 0, 0);
-		if (cuplen > 0)
-			tio_write(STDOUT_FILENO, cup, (size_t)cuplen);
-		if (clr)
-			tio_write(STDOUT_FILENO, clr, strlen(clr));
-		tio_flush(STDOUT_FILENO);
-	}
-
-	tio_restore(STDIN_FILENO);
-	if (sessdir_watch_fd >= 0)
-		sessdir_watch_stop(sessdir_watch_fd);
-	render_free(renderer);
-	cwin_free_all();
-	tile_free(tilemgr);
-	wm_free(wmgr);
-	tui_term_free(tb);
-	txl_free(txl);
-	keys_free(keybinds);
-	taskbar_free(taskbar);
-	taskbar_free(scrollback_sb);
-	free(session_name);
+	/* clear the screen so the shell prompt starts on a fresh display */
+	attach_cleanup(1);
 
 	return 0;
 }

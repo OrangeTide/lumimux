@@ -11,6 +11,7 @@
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #define MAX_SERVERS 64
@@ -28,6 +29,8 @@ cmd_kill_main(int argc, char **argv)
 	pid_t pids[MAX_SERVERS];
 	int n, i, opt;
 	int killed = 0;
+	int denied = 0;
+	char reason[256] = "";
 
 	while ((opt = getopt(argc, argv, "s:")) != -1) {
 		switch (opt) {
@@ -72,17 +75,35 @@ cmd_kill_main(int argc, char **argv)
 			continue;
 		}
 
-		/* wait for OK response */
-		if (ipc_msg_recv(fd, &type, buf, sizeof(buf), &len) == 0 &&
-		    type == IPC_MSG_OK)
-			killed++;
+		/* wait for the reply: OK means the server is stopping, an
+		 * ERROR carries the reason it refused (for example a
+		 * view-only client that may not kill the session).  Keep the
+		 * reason so the user sees why rather than a bare failure. */
+		if (ipc_msg_recv(fd, &type, buf, sizeof(buf), &len) == 0) {
+			if (type == IPC_MSG_OK) {
+				killed++;
+			} else if (type == IPC_MSG_ERROR) {
+				denied++;
+				if (reason[0] == '\0' && len > 0) {
+					size_t n2 = len < sizeof(reason) - 1 ?
+					    len : sizeof(reason) - 1;
+					memcpy(reason, buf, n2);
+					reason[n2] = '\0';
+				}
+			}
+		}
 
 		ipc_close(fd);
 	}
 
 	if (killed == 0) {
-		fprintf(stderr, "lumi-kill: failed to kill session '%s'\n",
-		    name);
+		if (denied)
+			fprintf(stderr, "lumi-kill: refused to kill session "
+			    "'%s': %s\n", name,
+			    reason[0] ? reason : "permission denied");
+		else
+			fprintf(stderr,
+			    "lumi-kill: failed to kill session '%s'\n", name);
 		return 1;
 	}
 

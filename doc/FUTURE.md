@@ -2325,10 +2325,22 @@ than trusting a first-pass draft.
   like the writer, with a " [viewing]" suffix so its role is visible at a
   glance. Built: `sync_host_title` in `attach.c` adds the suffix for a
   view-role client and the title is resynced when the keyboard moves.
-- **`lumi kill` from a viewer.** Denied by role enforcement, but the error
-  needs a clear message rather than silence.
-- **Roster identity.** `user@host` is fine locally. For netchan clients the
-  keystore key name is the more honest identifier.
+- **`lumi kill` from a viewer.** Resolved (2026-11-24): a view-only
+  client that tries to close a window now sees "read-only: cannot close a
+  window" rather than the keyboard-handoff notice meant for typing
+  (`mconn_ipc_send` in `attach.c`). The standalone `lumi kill` command no
+  longer swallows a server refusal: an `IPC_MSG_ERROR` reply is reported
+  with its reason instead of a bare "failed to kill" (`kill.c`). The
+  owner's own `lumi kill` still succeeds, since reaching the 0700
+  session socket already proves ownership.
+- **Roster identity.** Resolved: `user@host` stays the local client's
+  display name, but a netchan client is registered by its keystore key
+  name. The net-proxy rewrites the relayed attach name and the roster
+  entry (`sc.name`/`sc.who`) to the authenticated key
+  (`ipc_transport_netchan_auth_user`), and a remote attach client never
+  self-registers (`client_roster_update` returns early when
+  `is_remote`), so `user@host` cannot leak into a netchan session's
+  roster.
 - **Pending clients in the indicator.** Decided (2026-10-06): counted
   separately, as their own figure in the presence indicator, so the owner
   sees a knock without mistaking it for an admitted viewer; the rate limit
@@ -3674,9 +3686,19 @@ design (surface API, `struct draw_driver` vtable, terminal driver reusing
 in `doc/DRAW.md`. Status: `libdraw` and `libdraw_term` have landed with a
 mock-driven `test_draw` suite, and `edit`, `files`, and `splash` are ported onto
 the surface. The driver also owns SIGWINCH and SIGTSTP and delivers resize and
-suspend as `draw_wait` events, so the apps carry no signal code. Remaining:
-re-express the pad-stack `tui_backend` on `draw_driver` and migrate attach's
-overlay apps, then a graphical driver.
+suspend as `draw_wait` events, so the apps carry no signal code. The pad-stack
+`tui_backend` has also been re-expressed on `draw_driver`: `libtui_draw`
+implements it on a draw surface with `test_tui_draw`.
+
+Attach's overlays are deliberately left on `tui_term` and are not migrated.
+Attach composites its own full-screen cell buffer into one `librender` shadow
+and paints the overlay over the top through `tui_term`, which keeps no model of
+the screen. A draw surface owns a second `librender` shadow, and the two desync
+at the overlay open and close handoff, so a clean migration would require
+routing attach's whole frame through a single surface, which is the compositor
+port this phase set out of scope. The rationale is recorded in `doc/DRAW.md`
+("Why attach keeps tui_term"). Remaining: a graphical driver, and, only if that
+compositor unification is later taken on as its own effort, attach's overlays.
 
 ---
 
